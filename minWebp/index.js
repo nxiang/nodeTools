@@ -19,7 +19,7 @@ console.log('concurrency', concurrency)
 /** 检查文件名是否有_skip标记 */
 function hasSkipMark(filePath) {
   // 匹配 _skip 或 _skip_任意内容
-  return /_skip(_\d+)?\.(png|jpe?g)$/i.test(path.basename(filePath));
+  return /_skip(_\d+)?\.(png|jpe?g|gif)$/i.test(path.basename(filePath));
 }
 
 /** 给文件加_skip标记 */
@@ -55,7 +55,7 @@ async function getAllPicFilePaths(dir) {
       logError('读取文件状态失败，跳过:', filePath, err);
       return;
     }
-    if (stat.isFile() && /\.(png|jpe?g)$/i.test(file)) {
+    if (stat.isFile() && /\.(png|jpe?g|gif)$/i.test(file)) {
       results.push(filePath);
       console.count('找到图片文件');
     } else if (stat.isDirectory()) {
@@ -108,6 +108,7 @@ async function deleteFileByPath(filePath, maxRetries = 3, retryDelay = 1000) {
 
 async function main() {
   const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真';
+  // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[蠢沫沫]\\蠢沫沫 黑天使 [2V] - 副本';
   // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\[HaneAme Collection] - 副本'; // 请替换为你的目标目录
   // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\Haneame 23年4月 新 - 副本'; // 请替换为你的目标目录
   // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\Hane Ame雨波 原创 柴犬學妹波波 - 副本'; // 请替换为你的目标目录
@@ -132,7 +133,7 @@ async function main() {
   await pMap(imgPaths, async (imgPath) => {
     const outputDir = path.dirname(imgPath);
     const ext = path.extname(imgPath).toLowerCase();
-    const outputFile = path.join(outputDir, path.basename(imgPath, ext) + '.webp');
+    let outputFile = path.join(outputDir, path.basename(imgPath, ext) + '.webp');
     try {
       if (fs.existsSync(outputFile)) {
         await deleteFileByPath(imgPath);
@@ -156,21 +157,67 @@ async function main() {
               reductionEffort: 4 // 添加此参数平衡质量和速度
             })
             .toBuffer();
+        } else if (ext === '.gif') {
+          // GIF转换为WebP（精简版，保留有效的动画处理）
+          try {
+            // 获取GIF的元数据
+            const imageInfo = await sharp(buffer).metadata();
+            const frameCount = imageInfo.pages || 1;
+            log(`处理GIF: ${path.basename(imgPath)}, 帧数: ${frameCount}`);
+            
+            // 创建Sharp实例，启用动画模式
+            const sharpInstance = sharp(buffer, {
+              animated: true // 初始化时就启用动画模式
+            });
+            
+            // 使用有效的方法A处理所有GIF
+            webpBuffer = await sharpInstance
+              .toFormat('webp', {
+                quality: 80,
+                effort: 3,
+                animated: true,
+                loop: 0, // 无限循环
+                // 确保正确处理帧的关键参数
+                pageHeight: imageInfo.height,
+                pageWidth: imageInfo.width,
+                // Sharp 0.34.3版本特定参数
+                qualityProfile: 'default',
+                minQuality: 60
+              })
+              .toBuffer();
+            
+            log(`GIF转换完成，WebP大小: ${(webpBuffer.length / 1024).toFixed(2)}KB`);
+          } catch (gifError) {
+            logError('GIF转换出错:', gifError.message);
+            // 降级处理：保留第一帧
+            webpBuffer = await sharp(buffer)
+              .webp({
+                quality: 80,
+                effort: 3
+              })
+              .toBuffer();
+          }
         } else {
           // JPG采用有损压缩
           webpBuffer = await sharp(buffer)
             .webp({
               quality: 80,
               effort: 3, // 降低压缩等级
-              progressive: true // 添加渐进式编码
             })
             .toBuffer();
         }
 
         // 比较压缩前后的文件大小
         if (webpBuffer.length < buffer.length) {
+          if (fs.existsSync(outputFile)) {
+            log(`检测到文件冲突: ${outputFile}`);
+            const timestamp = Date.now();
+            outputFile = path.join(outputDir, `${path.basename(imgPath, ext)}_${timestamp}.webp`);
+            log('已重命名输出文件为:', outputFile);
+          }
           // 写入压缩后的文件
           await fs.promises.writeFile(outputFile, webpBuffer);
+
 
           log('图片已压缩并保存到:', outputFile);
           await deleteFileByPath(imgPath);
