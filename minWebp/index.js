@@ -57,6 +57,7 @@ async function getAllPicFilePaths(dir) {
     }
     if (stat.isFile() && /\.(png|jpe?g)$/i.test(file)) {
       results.push(filePath);
+      console.count('找到图片文件');
     } else if (stat.isDirectory()) {
       try {
         const subResults = await getAllPicFilePaths(filePath);
@@ -106,9 +107,10 @@ async function deleteFileByPath(filePath, maxRetries = 3, retryDelay = 1000) {
 }
 
 async function main() {
+  const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真';
   // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\[HaneAme Collection] - 副本'; // 请替换为你的目标目录
   // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\Haneame 23年4月 新 - 副本'; // 请替换为你的目标目录
-  const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\Hane Ame雨波 原创 柴犬學妹波波 - 副本'; // 请替换为你的目标目录
+  // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\Hane Ame雨波 原创 柴犬學妹波波 - 副本'; // 请替换为你的目标目录
   if (!fs.existsSync(targetDir)) {
     logError('目标目录不存在:', targetDir);
     return;
@@ -150,15 +152,17 @@ async function main() {
             .webp({
               lossless: true,
               quality: 100,
-              effort: 6 // 压缩质量与速度的平衡参数（0-6）
+              effort: 3, // 降低压缩等级以提高速度
+              reductionEffort: 4 // 添加此参数平衡质量和速度
             })
             .toBuffer();
         } else {
           // JPG采用有损压缩
           webpBuffer = await sharp(buffer)
             .webp({
-              quality: 85,
-              effort: 6
+              quality: 80,
+              effort: 3, // 降低压缩等级
+              progressive: true // 添加渐进式编码
             })
             .toBuffer();
         }
