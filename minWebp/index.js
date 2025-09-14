@@ -1,10 +1,9 @@
-import fs from 'fs';
 import os from 'os';
+import fs from 'fs';
 import path from 'path';
 import pMap from 'p-map';
-import imagemin from 'imagemin';
+import sharp from 'sharp';
 import cliProgress from 'cli-progress';
-import imageminWebp from 'imagemin-webp';
 
 function log(...args) {
   console.log(...args, '\n');
@@ -15,6 +14,7 @@ function logError(...args) {
 }
 
 const concurrency = Math.max(os.cpus().length - 1, 1); // 留一个核心给系统
+console.log('concurrency', concurrency)
 
 /** 检查文件名是否有_skip标记 */
 function hasSkipMark(filePath) {
@@ -75,20 +75,40 @@ async function getAllPicFilePaths(dir) {
 /**
  * 根据文件的绝对路径删除文件
  * @param {string} filePath 文件绝对路径
- * @returns {Promise<void>}
+ * @param {number} maxRetries 最大重试次数
+ * @param {number} retryDelay 重试延迟(毫秒)
+ * @returns {Promise<boolean>} 是否成功删除
  */
-async function deleteFileByPath(filePath) {
-  try {
-    await fs.promises.unlink(filePath);
-    log('文件已删除:', filePath);
-  } catch (err) {
-    logError('删除文件时发生错误:', err);
+async function deleteFileByPath(filePath, maxRetries = 3, retryDelay = 1000) {
+  let retries = 0;
+
+  while (retries <= maxRetries) {
+    try {
+      await fs.promises.unlink(filePath);
+      log('文件已删除:', filePath);
+      return true; // 删除成功
+    } catch (err) {
+      if (retries === maxRetries) {
+        logError(`删除文件失败(已重试${retries}次):`, filePath, err);
+        log('警告: 原文件删除失败，可能需要手动清理:', filePath);
+        return false; // 达到最大重试次数，返回失败
+      }
+
+      logError(`删除文件时发生错误，将在${retryDelay}ms后重试(${retries + 1}/${maxRetries}):`, err);
+      retries++;
+
+      // 等待一段时间后重试
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
   }
+
+  return false; // 不应该到达这里，但为了安全返回false
 }
 
 async function main() {
-  const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\[HaneAme Collection] - 副本'; // 请替换为你的目标目录
+  // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\[HaneAme Collection] - 副本'; // 请替换为你的目标目录
   // const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\Haneame 23年4月 新 - 副本'; // 请替换为你的目标目录
+  const targetDir = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真\\[Hane Ame雨波]\\Hane Ame雨波 原创 柴犬學妹波波 - 副本'; // 请替换为你的目标目录
   if (!fs.existsSync(targetDir)) {
     logError('目标目录不存在:', targetDir);
     return;
@@ -117,45 +137,54 @@ async function main() {
         log('文件已存在，结束循环:', outputFile);
         return;
       }
-      let buffer;
+      // 使用sharp库进行图片压缩（不需要外部可执行文件）
       try {
-        buffer = await fs.promises.readFile(imgPath);
-      } catch (readErr) {
-        logError('读取图片失败，可能图片损坏:', imgPath, readErr);
-        return;
-      }
-      let webpBuffer;
-      try {
-        webpBuffer = await imagemin.buffer(buffer, {
-          plugins: [
-            imageminWebp(
-              ext === '.png' ? {
-                lossless: 9
-              } : {
-                quality: 85
-              }
-            )
-          ]
-        });
-      } catch (compressErr) {
-        logError('图片压缩失败:', imgPath, compressErr);
-        return;
-      }
-      // 比较文件大小
-      if (webpBuffer.length < buffer.length) {
-        try {
+        // 直接读取文件到Buffer
+        const buffer = await fs.promises.readFile(imgPath);
+
+        // 根据文件类型设置不同的压缩参数
+        let webpBuffer;
+        if (ext === '.png') {
+          // PNG采用无损压缩
+          webpBuffer = await sharp(buffer)
+            .webp({
+              lossless: true,
+              quality: 100,
+              effort: 6 // 压缩质量与速度的平衡参数（0-6）
+            })
+            .toBuffer();
+        } else {
+          // JPG采用有损压缩
+          webpBuffer = await sharp(buffer)
+            .webp({
+              quality: 85,
+              effort: 6
+            })
+            .toBuffer();
+        }
+
+        // 比较压缩前后的文件大小
+        if (webpBuffer.length < buffer.length) {
+          // 写入压缩后的文件
           await fs.promises.writeFile(outputFile, webpBuffer);
+
           log('图片已压缩并保存到:', outputFile);
           await deleteFileByPath(imgPath);
-        } catch (writeErr) {
-          logError('写入压缩图片失败:', outputFile, writeErr);
-        }
-      } else {
-        try {
-          await markSkipFile(imgPath); // 重命名为_skip
+        } else {
           log('原图比 webp 更小，跳过:', imgPath);
-        } catch (error) {
-          logError('重命名为_skip失败:', imgPath, error);
+          await markSkipFile(imgPath);
+        }
+      } catch (error) {
+        // 错误日志中添加文件名和详细错误信息
+        logError('当前:', path.basename(imgPath), '图片压缩失败:', imgPath, error.message || error);
+        logError('错误分析: 这可能是由于文件访问权限、文件损坏或路径问题导致的。');
+
+        // 标记文件为跳过状态
+        try {
+          await markSkipFile(imgPath);
+          log('标记文件为跳过状态，后续不会再次尝试压缩。');
+        } catch (markErr) {
+          logError('标记为跳过失败:', markErr.message || markErr);
         }
       }
     } catch (error) {
