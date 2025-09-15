@@ -296,8 +296,8 @@ async function main() {
           // 写入压缩后的文件
           await fs.promises.writeFile(outputFile, webpBuffer);
 
-
-          log('图片已压缩并保存到:', outputFile);
+          const savedSpaceMB = ((buffer.length - webpBuffer.length) / (1024 * 1024)).toFixed(2);
+          log(`图片已压缩并保存到: ${outputFile}, 节省空间: ${savedSpaceMB}MB`);
           await deleteFileByPath(imgPath);
         } else {
           log('原图比 webp 更小，跳过:', imgPath);
