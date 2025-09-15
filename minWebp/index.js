@@ -13,7 +13,7 @@ function logError(...args) {
   console.error(...args, '\n');
 }
 
-const concurrency = Math.max(os.cpus().length - 1, 1); // 留一个核心给系统
+const concurrency = Math.floor(os.cpus().length * 1.2); // 比CPU核心数稍高
 console.log('concurrency', concurrency)
 
 /** 检查文件名是否有_skip标记 */
@@ -42,34 +42,112 @@ async function markSkipFile(filePath) {
  * @param {string} dir 绝对路径
  * @returns {string[]} 文件绝对路径数组
  */
-async function getAllPicFilePaths(dir) {
-  let results = [];
-  const list = await fs.promises.readdir(dir);
-  await pMap(list, async (file) => {
-    const filePath = path.join(dir, file);
-    if (hasSkipMark(filePath)) return;
-    let stat;
-    try {
-      stat = await fs.promises.stat(filePath);
-    } catch (err) {
-      logError('读取文件状态失败，跳过:', filePath, err);
-      return;
-    }
-    if (stat.isFile() && /\.(png|jpe?g|gif)$/i.test(file)) {
-      results.push(filePath);
-      console.count('找到图片文件');
-    } else if (stat.isDirectory()) {
-      try {
-        const subResults = await getAllPicFilePaths(filePath);
+// async function getAllPicFilePaths(dir) {
+//   let results = [];
+//   const list = await fs.promises.readdir(dir);
+//   await pMap(list, async (file) => {
+//     const filePath = path.join(dir, file);
+//     if (hasSkipMark(filePath)) return;
+//     let stat;
+//     try {
+//       stat = await fs.promises.stat(filePath);
+//     } catch (err) {
+//       logError('读取文件状态失败，跳过:', filePath, err);
+//       return;
+//     }
+//     if (stat.isFile() && /\.(png|jpe?g|gif)$/i.test(file)) {
+//       results.push(filePath);
+//       console.count('找到图片文件');
+//     } else if (stat.isDirectory()) {
+//       try {
+//         const subResults = await getAllPicFilePaths(filePath);
 
-        results = results.concat(subResults);
-      } catch (err) {
-        logError('递归子目录失败，跳过:', filePath, err);
-      }
+//         results = results.concat(subResults);
+//       } catch (err) {
+//         logError('递归子目录失败，跳过:', filePath, err);
+//       }
+//     }
+//   }, {
+//     concurrency
+//   }); // 可根据实际情况调整并发数
+//   return results;
+// }
+
+/**
+ * 高效获取指定目录下所有图片的绝对路径
+ * @param {string} dir 绝对路径
+ * @returns {string[]} 文件绝对路径数组
+ */
+async function getAllPicFilePaths(dir) {
+  const results = [];
+  const queue = [dir]; // 使用队列代替递归，避免调用栈溢出
+
+  // 创建一个Set用于去重（处理可能的链接等情况）
+  const visitedDirs = new Set([dir]);
+
+  // 使用更高的并发度用于文件扫描
+  const scanConcurrency = Math.max(concurrency * 2, 8);
+
+  while (queue.length > 0) {
+    // 每次处理一批目录，而不是单个目录
+    const currentDirs = queue.splice(0, Math.min(queue.length, scanConcurrency));
+
+    // 并发处理多个目录
+    const dirResults = await Promise.all(
+      currentDirs.map(async (currentDir) => {
+        try {
+          const entries = await fs.promises.readdir(currentDir, {
+            withFileTypes: true
+          });
+          const subDirs = [];
+          const files = [];
+
+          // 一次遍历完成文件分类
+          for (const entry of entries) {
+            const fullPath = path.join(currentDir, entry.name);
+
+            if (hasSkipMark(fullPath)) continue;
+
+            if (entry.isDirectory()) {
+              if (!visitedDirs.has(fullPath)) {
+                visitedDirs.add(fullPath);
+                subDirs.push(fullPath);
+              }
+            } else if (entry.isFile() && /\.(png|jpe?g|gif)$/i.test(entry.name)) {
+              files.push(fullPath);
+            }
+          }
+
+          return {
+            files,
+            subDirs
+          };
+        } catch (err) {
+          logError('读取目录失败，跳过:', currentDir, err);
+          return {
+            files: [],
+            subDirs: []
+          };
+        }
+      })
+    );
+
+    // 合并结果
+    for (const {
+        files,
+        subDirs
+      } of dirResults) {
+      results.push(...files);
+      queue.push(...subDirs);
     }
-  }, {
-    concurrency
-  }); // 可根据实际情况调整并发数
+
+    // 每处理100个文件才输出一次进度，减少日志开销
+    if (results.length % 100 === 0) {
+      console.log(`已找到 ${results.length} 个图片文件`);
+    }
+  }
+
+  console.log(`总共找到 ${results.length} 个图片文件`);
   return results;
 }
 
@@ -121,7 +199,7 @@ async function main() {
   log('待处理图片数量:', imgPaths.length);
   // 初始化进度条
   const bar = new cliProgress.SingleBar({
-    format: '压缩进度 |{bar}| {percentage}% | {value}/{total} | 当前: {filename}',
+    format: '压缩进度 |{bar}| {percentage}% | {value}/{total} | 当前: {filename}\n',
     barCompleteChar: '\u2588',
     barIncompleteChar: '\u2591',
     hideCursor: true
@@ -164,12 +242,12 @@ async function main() {
             const imageInfo = await sharp(buffer).metadata();
             const frameCount = imageInfo.pages || 1;
             log(`处理GIF: ${path.basename(imgPath)}, 帧数: ${frameCount}`);
-            
+
             // 创建Sharp实例，启用动画模式
             const sharpInstance = sharp(buffer, {
               animated: true // 初始化时就启用动画模式
             });
-            
+
             // 使用有效的方法A处理所有GIF
             webpBuffer = await sharpInstance
               .toFormat('webp', {
@@ -185,7 +263,7 @@ async function main() {
                 minQuality: 60
               })
               .toBuffer();
-            
+
             log(`GIF转换完成，WebP大小: ${(webpBuffer.length / 1024).toFixed(2)}KB`);
           } catch (gifError) {
             logError('GIF转换出错:', gifError.message);
