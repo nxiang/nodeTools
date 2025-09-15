@@ -197,6 +197,10 @@ async function main() {
   const startTime = Date.now(); // 记录开始时间
   const imgPaths = await getAllPicFilePaths(targetDir);
   log('待处理图片数量:', imgPaths.length);
+
+  // 添加累计节省空间统计变量
+  let totalSavedSpaceMB = 0;
+
   // 初始化进度条
   const bar = new cliProgress.SingleBar({
     format: '压缩进度 |{bar}| {percentage}% | {value}/{total} | 当前: {filename}\n',
@@ -297,7 +301,11 @@ async function main() {
           await fs.promises.writeFile(outputFile, webpBuffer);
 
           const savedSpaceMB = ((buffer.length - webpBuffer.length) / (1024 * 1024)).toFixed(2);
-          log(`图片已压缩并保存到: ${outputFile}, 节省空间: ${savedSpaceMB}MB`);
+
+          // 更新累计节省空间
+          totalSavedSpaceMB += parseFloat(savedSpaceMB);
+
+          log(`图片已压缩并保存到: ${outputFile}\n节省空间: ${savedSpaceMB}MB，累计节省空间：${totalSavedSpaceMB.toFixed(2)}MB`);
           await deleteFileByPath(imgPath);
         } else {
           log('原图比 webp 更小，跳过:', imgPath);
