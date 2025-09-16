@@ -13,7 +13,8 @@ function logError(...args) {
   console.error(...args, '\n');
 }
 
-const concurrency = Math.floor(os.cpus().length * 1.2); // 比CPU核心数稍高
+// const concurrency = Math.floor(os.cpus().length * 1.2); // 比CPU核心数稍高
+const concurrency = Math.floor(os.cpus().length * 3);
 console.log('concurrency', concurrency)
 
 /** 检查文件名是否有_skip标记 */
