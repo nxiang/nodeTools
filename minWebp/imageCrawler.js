@@ -14,18 +14,21 @@ const pipeline = promisify(stream.pipeline);
 // 创建下载目录（在crawlWebsite函数中动态创建）
 let downloadDir;
 
-async function downloadImage(url, filename) {
+async function downloadImage(url, filename, directoryName = null) {
   try {
     // 清理文件名
     const cleanFilename = filename.replace(/[<>:"\/\\|?*]/g, '_')
       .replace(/\s+/g, '_')
       .substring(0, 100);
 
+    // 确定目标目录 - 优先使用传入的directoryName参数
+    const targetDir = directoryName ? path.join(process.cwd(), 'downloaded_images', directoryName) : downloadDir;
+    
     // 先检查文件是否已存在（在发起网络请求前）
     // 由于扩展名未知，检查所有可能的扩展名
     const possibleExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
     for (const ext of possibleExtensions) {
-      const filePath = path.join(downloadDir, `${cleanFilename}.${ext}`);
+      const filePath = path.join(targetDir, `${cleanFilename}.${ext}`);
       if (fs.existsSync(filePath)) {
         console.log(`✓ 文件已存在，跳过下载: ${cleanFilename}.${ext}`);
         return true;
@@ -81,7 +84,7 @@ async function downloadImage(url, filename) {
       else if (contentType.includes('webp')) extension = 'webp';
     }
 
-    const filePath = path.join(downloadDir, `${cleanFilename}.${extension}`);
+    const filePath = path.join(targetDir, `${cleanFilename}.${extension}`);
 
     // 写入文件
     const writer = fs.createWriteStream(filePath);
@@ -96,7 +99,7 @@ async function downloadImage(url, filename) {
   }
 }
 
-async function crawlWebsite(targetUrl) {
+async function crawlWebsite(targetUrl, customDirName = null) {
   try {
     console.log(`开始爬取: ${targetUrl}`);
 
@@ -158,8 +161,11 @@ async function crawlWebsite(targetUrl) {
       .replace(/\s+/g, ' ')
       .trim();
     
-    // 创建以页面标题命名的下载目录
-    downloadDir = path.join(process.cwd(), 'downloaded_images', cleanPageTitle);
+    // 优先使用传入的自定义目录名，如果没有则使用页面标题
+    const dirName = customDirName || cleanPageTitle;
+    
+    // 创建下载目录
+    downloadDir = path.join(process.cwd(), 'downloaded_images', dirName);
     if (!fs.existsSync(downloadDir)) {
       fs.mkdirSync(downloadDir, {
         recursive: true
@@ -212,7 +218,7 @@ async function crawlWebsite(targetUrl) {
       const chunk = downloadTasks.slice(i, i + concurrencyLimit);
       const chunkPromises = chunk.map(async (task) => {
         console.log(`开始下载第 ${task.index}/${images.length} 张图片: ${task.filename}`);
-        const success = await downloadImage(task.url, task.filename);
+        const success = await downloadImage(task.url, task.filename, dirName);
         return { success, index: task.index };
       });
       
@@ -239,14 +245,16 @@ async function crawlWebsite(targetUrl) {
 async function main() {
   // 请替换为您的目标网址
   const targetUrl = process.argv[2] || 'https://example.com';
+  // 获取自定义目录名参数
+  const customDirName = process.argv[3] || null;
 
   if (!targetUrl || targetUrl === 'https://example.com') {
     console.log('请提供目标网址作为参数:');
-    console.log('node imageCrawler.js https://your-target-website.com');
+    console.log('node imageCrawler.js https://your-target-website.com [custom-directory-name]');
     return;
   }
 
-  await crawlWebsite(targetUrl);
+  await crawlWebsite(targetUrl, customDirName);
 }
 
 // 运行程序
