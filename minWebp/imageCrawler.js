@@ -210,26 +210,39 @@ async function crawlWebsite(targetUrl, customDirName = null) {
       downloadTasks.push({ url: fullImageUrl, filename: title, index: i + 1 });
     }
 
-    // 并发下载控制（限制并发数为5）
+    // 并发下载控制（限制并发数为5，不阻塞式）
     const concurrencyLimit = 5;
     const results = [];
     
-    for (let i = 0; i < downloadTasks.length; i += concurrencyLimit) {
-      const chunk = downloadTasks.slice(i, i + concurrencyLimit);
-      const chunkPromises = chunk.map(async (task) => {
-        console.log(`开始下载第 ${task.index}/${images.length} 张图片: ${task.filename}`);
-        const success = await downloadImage(task.url, task.filename, dirName);
-        return { success, index: task.index };
-      });
+    // 创建一个并发控制器
+    async function processWithConcurrency(tasks, limit) {
+      const results = [];
+      const executing = new Set();
       
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-      
-      // 批次之间添加短暂延迟
-      if (i + concurrencyLimit < downloadTasks.length) {
-        await new Promise(resolve => setTimeout(resolve, 500));
+      for (const task of tasks) {
+        // 如果当前并发数达到限制，等待其中一个完成
+        if (executing.size >= limit) {
+          await Promise.race(executing);
+        }
+        
+        // 创建下载任务
+        const promise = (async () => {
+          console.log(`开始下载第 ${task.index}/${images.length} 张图片: ${task.filename}`);
+          const success = await downloadImage(task.url, task.filename, dirName);
+          executing.delete(promise);
+          return { success, index: task.index };
+        })();
+        
+        executing.add(promise);
+        results.push(promise);
       }
+      
+      return Promise.all(results);
     }
+    
+    // 执行并发下载
+    const downloadResults = await processWithConcurrency(downloadTasks, concurrencyLimit);
+    results.push(...downloadResults);
     
     // 统计成功数量
     successCount = results.filter(result => result.success).length;
