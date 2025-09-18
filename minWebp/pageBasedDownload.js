@@ -1,81 +1,10 @@
-import axios from 'axios';
 import * as cheerio from 'cheerio';
 import {
+  getPageWithRetry,
+  findNextPageUrl,
+  ensureFullUrl,
   crawlWebsite
-} from './imageCrawler.js';
-
-/**
- * 获取页面内容（带重试机制）
- */
-async function getPageWithRetry(url, retries = 5) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'zh-CN,zh;q=0.8,en-US;q=0.5,en;q=0.3',
-          'Accept-Encoding': 'gzip, deflate',
-          'Connection': 'keep-alive',
-        },
-        timeout: 60000
-      });
-      return response;
-    } catch (error) {
-      if (attempt === retries) {
-        throw error;
-      }
-      console.warn(`第 ${attempt} 次请求失败，${retries - attempt} 次重试剩余:`, error.message);
-      await new Promise(resolve => setTimeout(resolve, 5000));
-    }
-  }
-}
-
-/**
- * 查找下一页URL
- */
-function findNextPageUrl($, currentPageUrl) {
-  // 查找当前页的li元素（类名为current）
-  const currentLi = $('.current');
-
-  if (!currentLi.length) {
-    console.log('未找到当前页标记（类名为current的li元素）');
-    return null;
-  }
-
-  // 获取下一个兄弟li元素
-  const nextLi = currentLi.next('li');
-
-  if (!nextLi.length) {
-    console.log('没有找到下一页，可能是最后一页');
-    return null;
-  }
-
-  // 获取下一个兄弟li元素中的a标签href属性
-  const nextLink = nextLi.find('a');
-
-  if (!nextLink.length) {
-    console.log('下一页li元素中没有找到a标签');
-    return null;
-  }
-
-  const nextUrl = nextLink.attr('href');
-
-  if (!nextUrl) {
-    console.log('下一页a标签没有href属性');
-    return null;
-  }
-
-  // 确保URL是完整的
-  if (!nextUrl.startsWith('http')) {
-    // 从当前页面URL获取基础URL
-    const currentUrl = new URL(currentPageUrl);
-    const baseUrl = currentUrl.origin;
-    return new URL(nextUrl, baseUrl).href;
-  }
-
-  return nextUrl;
-}
+} from './utils.js';
 
 /**
  * 分页下载主函数 
@@ -127,11 +56,8 @@ async function pageBasedDownload(listPageUrl, firstCustomDirName = null) {
         }
 
         // 确保URL是完整的
-        let fullUrl = href;
-        if (!href.startsWith('http')) {
-          const baseUrl = new URL(currentPageUrl).origin;
-          fullUrl = new URL(href, baseUrl).href;
-        }
+        let fullUrl = ensureFullUrl(href, currentPageUrl);
+
 
         // 获取项目名（item-link下的item-link-text类元素的文本内容）
         const projectName = $(link).find('.item-link-text').text().trim() || `项目_${i + 1}`;
