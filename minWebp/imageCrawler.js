@@ -272,3 +272,6 @@ async function main() {
 
 // 运行程序
 main().catch(console.error);
+
+// 导出函数供其他模块使用
+export { downloadImage, crawlWebsite };
