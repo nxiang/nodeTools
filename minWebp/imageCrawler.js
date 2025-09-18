@@ -14,7 +14,7 @@ const pipeline = promisify(stream.pipeline);
 // 创建下载目录（在crawlWebsite函数中动态创建）
 let downloadDir;
 
-async function downloadImage(url, filename, directoryName = null) {
+async function downloadImage(url, filename, directoryName = null, firstCustomDirName = null) {
   try {
     // 清理文件名
     const cleanFilename = filename.replace(/[<>:"\/\\|?*]/g, '_')
@@ -22,8 +22,8 @@ async function downloadImage(url, filename, directoryName = null) {
       .substring(0, 100);
 
     // 确定目标目录 - 优先使用传入的directoryName参数
-    const targetDir = directoryName ? path.join(process.cwd(), 'downloaded_images', directoryName) : downloadDir;
-    
+    const targetDir = directoryName ? path.join(process.cwd(), firstCustomDirName || 'downloaded_images', directoryName) : downloadDir;
+
     // 先检查文件是否已存在（在发起网络请求前）
     // 由于扩展名未知，检查所有可能的扩展名
     const possibleExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
@@ -37,7 +37,7 @@ async function downloadImage(url, filename, directoryName = null) {
 
     let response;
     let retries = 3;
-    
+
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         response = await axios({
@@ -48,14 +48,14 @@ async function downloadImage(url, filename, directoryName = null) {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
           },
           timeout: 60000,
-          httpsAgent: new https.Agent({ 
+          httpsAgent: new https.Agent({
             keepAlive: true,
             maxSockets: 10,
             maxFreeSockets: 5,
             timeout: 60000,
             freeSocketTimeout: 30000
           }),
-          httpAgent: new http.Agent({ 
+          httpAgent: new http.Agent({
             keepAlive: true,
             maxSockets: 10,
             maxFreeSockets: 5,
@@ -99,14 +99,14 @@ async function downloadImage(url, filename, directoryName = null) {
   }
 }
 
-async function crawlWebsite(targetUrl, customDirName = null) {
+async function crawlWebsite(targetUrl, customDirName = null, firstCustomDirName = null) {
   try {
     console.log(`开始爬取: ${targetUrl}`);
 
     // 获取网页内容（添加重试机制）
     let response;
     let retries = 5; // 增加重试次数
-    
+
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         response = await axios.get(targetUrl, {
@@ -118,14 +118,14 @@ async function crawlWebsite(targetUrl, customDirName = null) {
             'Connection': 'keep-alive',
           },
           timeout: 60000,
-          httpsAgent: new https.Agent({ 
+          httpsAgent: new https.Agent({
             keepAlive: true,
             maxSockets: 10,
             maxFreeSockets: 5,
             timeout: 60000,
             freeSocketTimeout: 30000
           }),
-          httpAgent: new http.Agent({ 
+          httpAgent: new http.Agent({
             keepAlive: true,
             maxSockets: 10,
             maxFreeSockets: 5,
@@ -160,12 +160,12 @@ async function crawlWebsite(targetUrl, customDirName = null) {
     const cleanPageTitle = cleanedTitle.replace(/[<>:"\/\\|?*]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    
+
     // 优先使用传入的自定义目录名，如果没有则使用页面标题
     const dirName = customDirName || cleanPageTitle;
-    
+
     // 创建下载目录
-    downloadDir = path.join(process.cwd(), 'downloaded_images', dirName);
+    downloadDir = path.join(process.cwd(), firstCustomDirName || 'downloaded_images', dirName);
     if (!fs.existsSync(downloadDir)) {
       fs.mkdirSync(downloadDir, {
         recursive: true
@@ -182,11 +182,11 @@ async function crawlWebsite(targetUrl, customDirName = null) {
       return;
     }
 
-        let successCount = 0;
+    let successCount = 0;
 
     // 准备图片下载任务
     const downloadTasks = [];
-    
+
     for (let i = 0; i < images.length; i++) {
       const img = $(images[i]);
       const imageUrl = img.attr('data-original');
@@ -207,43 +207,50 @@ async function crawlWebsite(targetUrl, customDirName = null) {
       }
 
       // 添加到下载任务列表
-      downloadTasks.push({ url: fullImageUrl, filename: title, index: i + 1 });
+      downloadTasks.push({
+        url: fullImageUrl,
+        filename: title,
+        index: i + 1
+      });
     }
 
     // 并发下载控制（限制并发数为5，不阻塞式）
     const concurrencyLimit = 5;
     const results = [];
-    
+
     // 创建一个并发控制器
     async function processWithConcurrency(tasks, limit) {
       const results = [];
       const executing = new Set();
-      
+
       for (const task of tasks) {
         // 如果当前并发数达到限制，等待其中一个完成
         if (executing.size >= limit) {
           await Promise.race(executing);
         }
-        
+
         // 创建下载任务
         const promise = (async () => {
           console.log(`开始下载第 ${task.index}/${images.length} 张图片: ${task.filename}`);
-          const success = await downloadImage(task.url, task.filename, dirName);
+          const success = await downloadImage(task.url, task.filename, dirName, firstCustomDirName);
           executing.delete(promise);
-          return { success, index: task.index };
+          return {
+            success,
+            index: task.index
+          };
         })();
-        
+
         executing.add(promise);
         results.push(promise);
       }
-      
+
       return Promise.all(results);
     }
-    
+
     // 执行并发下载
     const downloadResults = await processWithConcurrency(downloadTasks, concurrencyLimit);
     results.push(...downloadResults);
-    
+
     // 统计成功数量
     successCount = results.filter(result => result.success).length;
 
@@ -274,4 +281,7 @@ async function main() {
 main().catch(console.error);
 
 // 导出函数供其他模块使用
-export { downloadImage, crawlWebsite };
+export {
+  downloadImage,
+  crawlWebsite
+};
