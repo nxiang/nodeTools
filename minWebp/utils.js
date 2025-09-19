@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import fs from 'fs';
@@ -8,9 +9,41 @@ import https from 'https';
 import http from 'http';
 
 /**
- * 获取页面内容（带重试机制）
+ * 获取页面内容（带重试机制和HTML缓存）
  */
 export async function getPageWithRetry(url, retries = 5) {
+  // 创建HTML缓存目录
+  const htmlCacheDir = path.join(process.cwd(), 'downloaded_images_html');
+  if (!fs.existsSync(htmlCacheDir)) {
+    fs.mkdirSync(htmlCacheDir, { recursive: true });
+  }
+
+  // 生成URL的hash值作为缓存文件名
+  const urlHash = crypto.createHash('md5').update(url).digest('hex');
+  const cacheFilePath = path.join(htmlCacheDir, `${urlHash}.html`);
+
+  // 检查缓存文件是否存在
+  if (fs.existsSync(cacheFilePath)) {
+    try {
+      console.log(`✓ 从缓存读取HTML: ${url}`);
+      const cachedHtml = fs.readFileSync(cacheFilePath, 'utf8');
+      // 返回模拟的response对象
+      return {
+        data: cachedHtml,
+        status: 200,
+        statusText: 'OK',
+        headers: {
+          'content-type': 'text/html'
+        },
+        config: {},
+        request: {}
+      };
+    } catch (error) {
+      console.warn(`读取缓存文件失败: ${error.message}`);
+    }
+  }
+
+  // 缓存不存在或读取失败，进行网络请求
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await axios.get(url, {
@@ -37,6 +70,15 @@ export async function getPageWithRetry(url, retries = 5) {
           freeSocketTimeout: 30000
         })
       });
+      
+      // 将HTML内容保存到缓存文件
+      try {
+        fs.writeFileSync(cacheFilePath, response.data, 'utf8');
+        console.log(`✓ HTML已缓存到: ${cacheFilePath}`);
+      } catch (cacheError) {
+        console.warn(`保存缓存文件失败: ${cacheError.message}`);
+      }
+      
       return response;
     } catch (error) {
       if (attempt === retries) {
