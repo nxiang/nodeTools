@@ -131,7 +131,7 @@ async function pageBasedDownload(listPageUrl, firstCustomDirName = null) {
         pageCount++;
 
         // 添加延迟，避免请求过于频繁
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise(resolve => setTimeout(resolve, 500));
       } else {
         console.log('没有找到下一页，爬取结束');
         currentPageUrl = null;
@@ -154,14 +154,15 @@ async function main() {
   const listPageUrl = process.argv[2];
 
   // 获取自定义目录名参数 - 从listPageUrl以反斜杠分隔的最后一个全为数字的字符串
-  let firstCustomDirName = 'downloaded_images';
+  // let firstCustomDirName = 'downloaded_images';
+  let firstCustomDirName = '\\\\DXP4800PLUS-BE5\\personal_folder\\视频\\成人内容\\写真';
   if (listPageUrl) {
     const urlParts = listPageUrl.split('/');
     // 从后往前查找第一个不全为数字的部分
     for (let i = urlParts.length - 1; i >= 0; i--) {
       const part = decodeURIComponent(urlParts[i].trim());
       if (part && !/^\d+$/.test(part)) {
-        firstCustomDirName += `_${part}`;
+        firstCustomDirName += `\\[${part}]`;
         break;
       }
     }

@@ -11,9 +11,17 @@ import http from 'http';
 /**
  * 获取页面内容（带重试机制和HTML缓存）
  */
-export async function getPageWithRetry(url, retries = 5) {
+export async function getPageWithRetry(url, retries = 5, firstCustomDirName = null) {
   // 创建HTML缓存目录
-  const htmlCacheDir = path.join(process.cwd(), 'downloaded_images_html');
+  let htmlCacheDir;
+  if (firstCustomDirName && path.isAbsolute(firstCustomDirName)) {
+    // 如果firstCustomDirName是绝对路径，直接使用它作为基础目录
+    htmlCacheDir = path.join(firstCustomDirName, '.html');
+  } else {
+    // 否则使用原来的逻辑
+    htmlCacheDir = path.join(process.cwd(), firstCustomDirName || '.html');
+  }
+  
   if (!fs.existsSync(htmlCacheDir)) {
     fs.mkdirSync(htmlCacheDir, { recursive: true });
   }
@@ -179,7 +187,14 @@ export async function downloadImage(url, filename, directoryName = null, firstCu
     const cleanedFilename = cleanFilename(filename);
 
     // 确定目标目录 - 优先使用传入的directoryName参数
-    const targetDir = directoryName ? path.join(process.cwd(), firstCustomDirName || 'downloaded_images', directoryName) : path.join(process.cwd(), firstCustomDirName || 'downloaded_images');
+    let targetDir;
+    if (firstCustomDirName && path.isAbsolute(firstCustomDirName)) {
+      // 如果firstCustomDirName是绝对路径，直接使用它作为基础目录
+      targetDir = directoryName ? path.join(firstCustomDirName, directoryName) : firstCustomDirName;
+    } else {
+      // 否则使用原来的逻辑
+      targetDir = directoryName ? path.join(process.cwd(), firstCustomDirName || 'downloaded_images', directoryName) : path.join(process.cwd(), firstCustomDirName || 'downloaded_images');
+    }
 
     // 先检查文件是否已存在（在发起网络请求前）
     // 由于扩展名未知，检查所有可能的扩展名
@@ -264,7 +279,7 @@ export async function crawlWebsite(targetUrl, customDirName = null, firstCustomD
     console.log(`开始爬取: ${targetUrl}`);
 
     // 获取网页内容（使用utils中的重试机制）
-    const response = await getPageWithRetry(targetUrl);
+    const response = await getPageWithRetry(targetUrl, 5, firstCustomDirName);
 
     const $ = cheerio.load(response.data);
 
@@ -276,7 +291,14 @@ export async function crawlWebsite(targetUrl, customDirName = null, firstCustomD
     const dirName = customDirName || cleanedPageTitle;
 
     // 创建下载目录
-    const downloadDir = path.join(process.cwd(), firstCustomDirName || 'downloaded_images', dirName);
+    let downloadDir;
+    if (firstCustomDirName && path.isAbsolute(firstCustomDirName)) {
+      // 如果firstCustomDirName是绝对路径，直接使用它作为基础目录
+      downloadDir = path.join(firstCustomDirName, dirName);
+    } else {
+      // 否则使用原来的逻辑
+      downloadDir = path.join(process.cwd(), firstCustomDirName || 'downloaded_images', dirName);
+    }
     if (!fs.existsSync(downloadDir)) {
       fs.mkdirSync(downloadDir, {
         recursive: true
