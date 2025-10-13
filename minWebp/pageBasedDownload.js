@@ -18,7 +18,7 @@ async function pageBasedDownload(listPageUrl, firstCustomDirName = null) {
     let totalDownloadedPages = 0;
 
     // 获取第一页内容以设置初始pageCount
-    const firstResponse = await getPageWithRetry(currentPageUrl);
+    const firstResponse = await getPageWithRetry(currentPageUrl, 5, firstCustomDirName, false);
     const $first = cheerio.load(firstResponse.data);
 
     // 获取类名current的文本作为pageCount初始值
@@ -32,7 +32,7 @@ async function pageBasedDownload(listPageUrl, firstCustomDirName = null) {
       console.log(`当前页面URL: ${currentPageUrl}`);
 
       // 获取当前页面内容
-      const response = await getPageWithRetry(currentPageUrl);
+      const response = await getPageWithRetry(currentPageUrl, 5, firstCustomDirName, false);
       const $ = cheerio.load(response.data);
 
       // 提取所有item-link类的a标签href属性

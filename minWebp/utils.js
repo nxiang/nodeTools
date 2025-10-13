@@ -11,43 +11,46 @@ import http from 'http';
 /**
  * 获取页面内容（带重试机制和HTML缓存）
  */
-export async function getPageWithRetry(url, retries = 5, firstCustomDirName = null) {
-  // 创建HTML缓存目录
-  let htmlCacheDir;
-  if (firstCustomDirName && path.isAbsolute(firstCustomDirName)) {
-    // 如果firstCustomDirName是绝对路径，直接使用它作为基础目录
-    htmlCacheDir = path.join(firstCustomDirName, '.html');
-  } else {
-    // 否则使用原来的逻辑
-    htmlCacheDir = path.join(process.cwd(), firstCustomDirName || '.html');
-  }
-  
-  if (!fs.existsSync(htmlCacheDir)) {
-    fs.mkdirSync(htmlCacheDir, { recursive: true });
-  }
+export async function getPageWithRetry(url, retries = 5, firstCustomDirName = null, useCache = true) {
+  // 只有在useCache为true时才使用缓存功能
+  if (useCache) {
+    // 创建HTML缓存目录
+    let htmlCacheDir;
+    if (firstCustomDirName && path.isAbsolute(firstCustomDirName)) {
+      // 如果firstCustomDirName是绝对路径，直接使用它作为基础目录
+      htmlCacheDir = path.join(firstCustomDirName, '.html');
+    } else {
+      // 否则使用原来的逻辑
+      htmlCacheDir = path.join(process.cwd(), firstCustomDirName || '.html');
+    }
+    
+    if (!fs.existsSync(htmlCacheDir)) {
+      fs.mkdirSync(htmlCacheDir, { recursive: true });
+    }
 
-  // 生成URL的hash值作为缓存文件名
-  const urlHash = crypto.createHash('md5').update(url).digest('hex');
-  const cacheFilePath = path.join(htmlCacheDir, `${urlHash}.html`);
+    // 生成URL的hash值作为缓存文件名
+    const urlHash = crypto.createHash('md5').update(url).digest('hex');
+    const cacheFilePath = path.join(htmlCacheDir, `${urlHash}.html`);
 
-  // 检查缓存文件是否存在
-  if (fs.existsSync(cacheFilePath)) {
-    try {
-      console.log(`✓ 从缓存读取HTML: ${url}`);
-      const cachedHtml = fs.readFileSync(cacheFilePath, 'utf8');
-      // 返回模拟的response对象
-      return {
-        data: cachedHtml,
-        status: 200,
-        statusText: 'OK',
-        headers: {
-          'content-type': 'text/html'
-        },
-        config: {},
-        request: {}
-      };
-    } catch (error) {
-      console.warn(`读取缓存文件失败: ${error.message}`);
+    // 检查缓存文件是否存在
+    if (fs.existsSync(cacheFilePath)) {
+      try {
+        console.log(`✓ 从缓存读取HTML: ${url}`);
+        const cachedHtml = fs.readFileSync(cacheFilePath, 'utf8');
+        // 返回模拟的response对象
+        return {
+          data: cachedHtml,
+          status: 200,
+          statusText: 'OK',
+          headers: {
+            'content-type': 'text/html'
+          },
+          config: {},
+          request: {}
+        };
+      } catch (error) {
+        console.warn(`读取缓存文件失败: ${error.message}`);
+      }
     }
   }
 
@@ -79,12 +82,33 @@ export async function getPageWithRetry(url, retries = 5, firstCustomDirName = nu
         })
       });
       
-      // 将HTML内容保存到缓存文件
-      try {
-        fs.writeFileSync(cacheFilePath, response.data, 'utf8');
-        console.log(`✓ HTML已缓存到: ${cacheFilePath}`);
-      } catch (cacheError) {
-        console.warn(`保存缓存文件失败: ${cacheError.message}`);
+      // 只有在useCache为true时才保存缓存文件
+      if (useCache) {
+        // 创建HTML缓存目录
+        let htmlCacheDir;
+        if (firstCustomDirName && path.isAbsolute(firstCustomDirName)) {
+          // 如果firstCustomDirName是绝对路径，直接使用它作为基础目录
+          htmlCacheDir = path.join(firstCustomDirName, '.html');
+        } else {
+          // 否则使用原来的逻辑
+          htmlCacheDir = path.join(process.cwd(), firstCustomDirName || '.html');
+        }
+        
+        if (!fs.existsSync(htmlCacheDir)) {
+          fs.mkdirSync(htmlCacheDir, { recursive: true });
+        }
+
+        // 生成URL的hash值作为缓存文件名
+        const urlHash = crypto.createHash('md5').update(url).digest('hex');
+        const cacheFilePath = path.join(htmlCacheDir, `${urlHash}.html`);
+        
+        // 将HTML内容保存到缓存文件
+        try {
+          fs.writeFileSync(cacheFilePath, response.data, 'utf8');
+          console.log(`✓ HTML已缓存到: ${cacheFilePath}`);
+        } catch (cacheError) {
+          console.warn(`保存缓存文件失败: ${cacheError.message}`);
+        }
       }
       
       return response;
