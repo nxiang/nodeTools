@@ -108,7 +108,7 @@ async function main() {
   // 使用并发控制处理所有文件夹
   await processWithConcurrency(
     bracketNames,
-    5, // 并发数为5
+    2, // 并发数为5
     async (name, current, total) => {
       console.log(`\n[${current}/${total}] 开始处理文件夹: [${name}]`);
       try {
