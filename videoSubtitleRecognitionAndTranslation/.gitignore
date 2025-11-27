@@ -1,5 +1,6 @@
 vosk-models/
 *.ass
+*.mkv
 *.mp4
 .html
 temp

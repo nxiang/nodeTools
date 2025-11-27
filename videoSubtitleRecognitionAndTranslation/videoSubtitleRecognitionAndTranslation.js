@@ -101,11 +101,10 @@ class VideoSubtitleRecognitionAndTranslation {
             
             // 针对日语音频优化处理
             if (sourceLang === 'ja') {
-                // 日语音频处理优化
+                // 日语音频处理优化 - 合并到一个-af参数中
                 ffmpegArgs.push(
-                    '-af', 'highpass=f=80,lowpass=f=8000', // 高通和低通滤波
-                    '-compression_level', '10',            // 提高压缩级别
-                    '-af', 'volume=1.5'                    // 音量增强
+                    '-af', 'highpass=f=80,lowpass=f=8000,volume=1.5', // 合并音频滤镜
+                    '-compression_level', '10'            // 提高压缩级别
                 );
             }
             
@@ -200,7 +199,29 @@ class VideoSubtitleRecognitionAndTranslation {
     }
 
     /**
-     * 语音识别 - 流式处理版本
+     * 获取音频文件时长（秒）
+     */
+    async getAudioDuration(audioPath) {
+        return new Promise((resolve, reject) => {
+            try {
+                const durationOutput = execSync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`, {
+                    encoding: 'utf8',
+                    stdio: ['ignore', 'pipe', 'ignore']
+                });
+                const duration = parseFloat(durationOutput.trim());
+                resolve(duration);
+            } catch (error) {
+                console.warn('⚠️  无法获取音频时长，使用默认估算:', error.message);
+                // 如果无法获取时长，使用文件大小估算（假设16kHz 16bit单声道）
+                const stats = fs.statSync(audioPath);
+                const estimatedDuration = stats.size / (16000 * 2); // 16kHz * 2 bytes per sample
+                resolve(estimatedDuration);
+            }
+        });
+    }
+
+    /**
+     * 语音识别 - 流式处理版本（改进的实时识别）
      */
     async speechRecognition(audioPath, options = {}) {
         console.log('🎤 开始语音识别（流式处理）...');
@@ -221,19 +242,27 @@ class VideoSubtitleRecognitionAndTranslation {
         
         console.log(`📊 音频文件大小: ${(fileSize / (1024 * 1024)).toFixed(2)}MB`);
         
-        const allSegments = [];
-        let totalAudioDuration = 0;
-        let processedBytes = 0;
+        // 获取音频实际时长
+        const audioDuration = await this.getAudioDuration(audioPath);
+        console.log(`⏱️  音频实际时长: ${audioDuration.toFixed(2)}秒`);
         
-        // 创建识别器实例 - 针对日语优化参数
+        const allSegments = [];
+        let processedBytes = 0;
+        let lastPartialText = '';
+        let lastPartialTime = 0;
+        let segmentBuffer = [];
+        let segmentCount = 0; // 添加segmentCount变量定义
+        const segmentThreshold = 1.2; // 降低静音检测阈值到1.2秒，提高时间精度
+        
+        // 创建识别器实例
         const rec = new vosk.Recognizer({ 
             model: model, 
             sampleRate: sampleRate,
-            beam: 0.3,           // 降低beam值提高准确性
-            lattice_beam: 0.03,  // 降低lattice_beam提高准确性
-            maxActive: 1000,     // 增加maxActive提高识别能力
-            maxAlternatives: 1,  // 启用备选结果
-            word_confidence: true // 启用词置信度
+            beam: 0.1,
+            lattice_beam: 0.01,
+            maxActive: 5000,
+            maxAlternatives: 5,
+            word_confidence: true
         });
         
         // 创建流式读取器
@@ -241,57 +270,83 @@ class VideoSubtitleRecognitionAndTranslation {
             highWaterMark: 64 * 1024 // 64KB 块大小
         });
         
+        // 实时保存间隔计数器
+        let saveCounter = 0;
+        const saveInterval = 5; // 每5个片段保存一次
+        
         return new Promise((resolve, reject) => {
-            // 实时保存计时器和计数器
-            let lastSaveTime = Date.now();
-            const saveInterval = 5000; // 每5秒保存一次
-            let saveCounter = 0;
-            
             audioStream.on('data', (chunk) => {
                 try {
                     rec.acceptWaveform(chunk);
                     processedBytes += chunk.length;
                     const progress = ((processedBytes / fileSize) * 100).toFixed(2);
                     
-                    // 实时显示进度
-                    process.stdout.write(`\r🔄 语音识别进度: ${progress}%`);
-                    
-                    // 获取部分结果用于进度显示，但不保存到最终结果
-                    const partialResult = rec.partialResult();
-                    if (partialResult && partialResult.partial) {
-                        // 仅用于显示当前识别进度，不保存到最终结果以避免重复
-                        const partialText = partialResult.partial.trim();
-                        if (partialText) {
-                            // 显示当前识别的文本（仅用于进度显示）
-                            if (partialText.length > 30) {
-                                process.stdout.write(` (${partialText.substring(0, 30)}...)`);
-                            } else {
-                                process.stdout.write(` (${partialText})`);
-                            }
-                        }
+                    // 实时显示进度 - 限制频率避免性能问题
+                    if (processedBytes % (fileSize / 100) === 0) { // 每1%更新一次
+                        process.stdout.write(`\r🔄 语音识别进度: ${progress}%`);
                     }
                     
-                    // 优化实时保存：每10秒或每处理5MB数据时保存一次，减少文件操作频率
-                    const currentTime = Date.now();
-                    if (currentTime - lastSaveTime >= 10000 || processedBytes % (5 * 1024 * 1024) < chunk.length) {
-                        // 获取当前已识别的最终结果（避免部分结果重复）
-                        const currentResult = rec.finalResult();
-                        if (currentResult && typeof currentResult === 'object' && currentResult.text) {
-                            const currentText = currentResult.text.trim();
-                            if (currentText) {
-                                // 处理当前结果
-                                const currentSegments = this.processRecognitionResult(currentText, 0);
-                                const uniqueSegments = this.removeDuplicateSegments(currentSegments);
+                    // 获取部分结果用于实时显示
+                    const partialResult = rec.partialResult();
+                    if (partialResult && partialResult.partial) {
+                        const currentText = partialResult.partial.trim();
+                        
+                        if (currentText && currentText.length > 0) {
+                            // 计算当前音频时间 - 基于实际时长和字节比例
+                            const currentTime = (processedBytes / fileSize) * audioDuration;
+                            
+                            // 检查是否有新内容
+                            if (currentText !== lastPartialText) {
+                                // 文本发生变化，可能是新内容
+                                const timeDiff = currentTime - lastPartialTime;
                                 
-                                // 保存当前进度和结果
-                                this.saveSegmentsToDisk(uniqueSegments, audioPath, {
-                                    processedBytes: processedBytes,
-                                    totalBytes: fileSize,
-                                    isPartial: true
-                                });
+                                // 降低静音检测阈值，提高时间精度
+                                if (timeDiff > segmentThreshold && lastPartialText.length > 3) {
+                                    // 静音时间较长，认为是句子结束
+                                    console.log(`\n🎯 检测到句子结束 (${currentTime.toFixed(2)}s): ${lastPartialText.substring(0, 50)}...`);
+                                    
+                                    // 保存当前句子到缓冲区
+                                    if (lastPartialText.length > 5) {
+                                        const segment = {
+                                            text: lastPartialText,
+                                            start: lastPartialTime,
+                                            end: currentTime,
+                                            confidence: this.calculateJapaneseConfidence(lastPartialText)
+                                        };
+                                        
+                                        // 过滤低质量片段
+                                        if (segment.confidence > 0.4) {
+                                            segmentBuffer.push(segment);
+                                            segmentCount++;
+                                            
+                                            // 实时保存到磁盘 - 提高保存频率
+                                            saveCounter++;
+                                            if (saveCounter >= saveInterval) {
+                                                this.saveSegmentsToDisk(segmentBuffer, audioPath, {
+                                                    processedBytes: processedBytes,
+                                                    totalBytes: fileSize,
+                                                    isPartial: true
+                                                });
+                                                saveCounter = 0;
+                                                
+                                                // 显示保存状态
+                                                process.stdout.write(` 💾 已保存 ${segmentBuffer.length} 个片段`);
+                                            }
+                                        } else {
+                                            console.log(`⚠️  跳过低质量片段 (置信度: ${segment.confidence.toFixed(2)}): ${lastPartialText.substring(0, 30)}...`);
+                                        }
+                                    }
+                                }
                                 
-                                saveCounter++;
-                                lastSaveTime = currentTime;
+                                lastPartialText = currentText;
+                                lastPartialTime = currentTime;
+                            }
+                            
+                            // 显示当前识别的文本
+                            if (currentText.length > 30) {
+                                process.stdout.write(` (${currentText.substring(0, 30)}...)`);
+                            } else {
+                                process.stdout.write(` (${currentText})`);
                             }
                         }
                     }
@@ -311,13 +366,25 @@ class VideoSubtitleRecognitionAndTranslation {
                         const finalText = finalResult.text.trim();
                         
                         if (finalText) {
-                            // 处理最终结果（只使用最终结果，避免重复）
-                            const segments = this.processRecognitionResult(finalText, 0);
-                            
-                            // 去重处理：移除重复或相似的片段
+                            // 处理最终结果，使用实际音频时长
+                            const segments = this.processRecognitionResult(finalText, 0, audioDuration);
                             const uniqueSegments = this.removeDuplicateSegments(segments);
                             allSegments.push(...uniqueSegments);
                         }
+                    }
+                    
+                    // 处理缓冲区中的实时片段
+                    if (segmentBuffer.length > 0) {
+                        console.log(`\n📝 处理实时识别片段: ${segmentBuffer.length} 个`);
+                        segmentBuffer.forEach((segment, index) => {
+                            // 使用实际检测到的时间戳，而不是重新计算
+                            const processedSegments = [{
+                                text: segment.text,
+                                start: segment.start,
+                                end: segment.end
+                            }];
+                            allSegments.push(...processedSegments);
+                        });
                     }
                     
                     // 最终保存到磁盘
@@ -349,53 +416,87 @@ class VideoSubtitleRecognitionAndTranslation {
             });
         });
     }
-    
+
     /**
      * 处理识别结果 - 针对日语优化
      */
-    processRecognitionResult(text, startTime) {
-        const segments = [];
+    processRecognitionResult(text, startTime, audioDuration = null) {
+        if (!text || text.trim().length === 0) {
+            return [];
+        }
         
-        try {
-            // 日语特有的分割规则
-            const sentences = text.split(/[。！？.!?、，,]/);
-            
-            // 日语语速通常比中文快，调整时长估算
-            const avgWordsPerSecond = 3; // 日语平均语速较快
-            let currentTime = startTime;
+        // 验证audioDuration参数
+        if (audioDuration !== null && (isNaN(audioDuration) || audioDuration <= 0)) {
+            console.warn('⚠️  音频时长参数无效，使用基于语速的估算');
+            audioDuration = null;
+        }
+        
+        // 预处理文本，提高识别质量
+        const processedText = this.preprocessJapaneseText(text);
+        
+        const segments = [];
+        let currentTime = startTime;
+        
+        // 改进的日语分割规则：更智能的句子分割
+        const sentenceDelimiters = /[。！？.!?]+/;
+        const sentences = processedText.split(sentenceDelimiters).filter(s => s.trim().length > 0);
+        
+        // 如果提供了音频时长，基于实际时长分配时间
+        if (audioDuration && audioDuration > 0) {
+            const totalCharacters = sentences.reduce((sum, sentence) => sum + sentence.trim().length, 0);
             
             sentences.forEach(sentence => {
-                const trimmedSentence = sentence.trim();
-                if (trimmedSentence) {
-                    // 日语文本长度计算（考虑假名和汉字混合）
-                    const textLength = trimmedSentence.length;
-                    
-                    // 日语语速调整：假名较多的句子语速较快
-                    const kanaRatio = (trimmedSentence.match(/[\u3040-\u309F\u30A0-\u30FF]/g) || []).length / textLength;
-                    const speedFactor = kanaRatio > 0.7 ? 1.2 : 1.0; // 假名多则语速快
-                    
-                    const duration = Math.max(1, textLength / (avgWordsPerSecond * speedFactor));
-                    
-                    const segment = {
-                        text: trimmedSentence,
-                        start: currentTime,
-                        end: currentTime + duration,
-                        confidence: this.calculateJapaneseConfidence(trimmedSentence)
-                    };
-                    
-                    segments.push(segment);
-                    currentTime += duration;
-                }
+                const sentenceText = sentence.trim();
+                if (sentenceText.length === 0) return;
+                
+                // 基于字符比例分配时间，但限制最小和最大时长
+                const proportion = sentenceText.length / totalCharacters;
+                const duration = Math.max(1.0, Math.min(10.0, audioDuration * proportion)); // 限制在1-10秒之间
+                
+                const segment = {
+                    start: currentTime,
+                    end: currentTime + duration,
+                    text: sentenceText,
+                    confidence: this.calculateJapaneseConfidence(sentenceText)
+                };
+                
+                segments.push(segment);
+                currentTime += duration;
             });
+        } else {
+            // 如果没有音频时长，使用改进的基于语速的估算方法
+            const avgWordsPerSecond = 4; // 提高日语平均语速到4字/秒
             
-        } catch (error) {
-            // 降级处理
-            const duration = Math.max(2, text.length / 3);
-            segments.push({
-                text: text,
-                start: startTime,
-                end: startTime + duration,
-                confidence: 0.5
+            sentences.forEach(sentence => {
+                const sentenceText = sentence.trim();
+                if (sentenceText.length === 0) return;
+                
+                // 计算假名比例，调整语速
+                const hiraganaCount = (sentenceText.match(/[\u3040-\u309F]/g) || []).length;
+                const katakanaCount = (sentenceText.match(/[\u30A0-\u30FF]/g) || []).length;
+                const kanjiCount = (sentenceText.match(/[\u4E00-\u9FAF]/g) || []).length;
+                const totalJapaneseChars = hiraganaCount + katakanaCount + kanjiCount;
+                
+                let speedFactor = 1.0;
+                if (totalJapaneseChars > 0) {
+                    const kanaRatio = (hiraganaCount + katakanaCount) / totalJapaneseChars;
+                    // 假名比例高时语速较快，汉字比例高时语速较慢
+                    speedFactor = 0.8 + (kanaRatio * 0.4);
+                }
+                
+                // 基于字符数和语速计算时长，限制合理范围
+                const textLength = sentenceText.length;
+                const duration = Math.max(1.0, Math.min(8.0, textLength / (avgWordsPerSecond * speedFactor)));
+                
+                const segment = {
+                    start: currentTime,
+                    end: currentTime + duration,
+                    text: sentenceText,
+                    confidence: this.calculateJapaneseConfidence(sentenceText)
+                };
+                
+                segments.push(segment);
+                currentTime += duration;
             });
         }
         
@@ -486,12 +587,18 @@ class VideoSubtitleRecognitionAndTranslation {
         
         let processed = text;
         
-        // 移除常见的识别错误
-        processed = processed.replace(/\s+/g, ' '); // 标准化空格
+        // 移除常见的识别错误和噪声
+        processed = processed.replace(/[\s\n\r]+/g, ' '); // 标准化所有空白字符
         processed = processed.replace(/[、，]/g, '、'); // 统一日语逗号
+        
+        // 移除常见的无意义字符和噪声
+        processed = processed.replace(/[\u0000-\u001F\u007F-\u009F]/g, ''); // 移除控制字符
+        processed = processed.replace(/[^\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF\w\s、。！？.!?]/g, ''); // 移除非日语字符
         
         // 修正常见的日语识别错误
         const correctionMap = {
+            'ん': 'ん',
+            'ン': 'ン',
             'は': 'は',
             'が': 'が', 
             'を': 'を',
@@ -501,7 +608,12 @@ class VideoSubtitleRecognitionAndTranslation {
             'も': 'も',
             'か': 'か',
             'ね': 'ね',
-            'よ': 'よ'
+            'よ': 'よ',
+            'え': 'え',
+            'お': 'お',
+            'あ': 'あ',
+            'い': 'い',
+            'う': 'う'
         };
         
         // 简单的字符修正
@@ -510,34 +622,41 @@ class VideoSubtitleRecognitionAndTranslation {
             processed = processed.replace(new RegExp(wrong, 'g'), correct);
         });
         
+        // 移除重复的假名（如"んんん"）
+        processed = processed.replace(/([\u3040-\u309F\u30A0-\u30FF])\1{2,}/g, '$1$1');
+        
         return processed.trim();
     }
     
     /**
-     * 检查日语文本是否重复
+     * 检查日语文本是否重复 - 改进版本
      */
     isJapaneseDuplicate(text1, text2) {
         if (!text1 || !text2) return false;
         
-        // 直接包含关系
-        if (text1.includes(text2) || text2.includes(text1)) {
-            return true;
-        }
+        // 如果文本完全相同，直接返回true
+        if (text1 === text2) return true;
         
-        // 高度相似（Jaccard相似度）
-        if (this.calculateTextSimilarity(text1, text2) > 0.8) {
-            return true;
-        }
+        // 如果文本长度差异太大，不认为是重复
+        const lengthRatio = Math.min(text1.length, text2.length) / Math.max(text1.length, text2.length);
+        if (lengthRatio < 0.6) return false;
         
-        // 日语特有的重复模式检查
-        const japaneseParticles = ['は', 'が', 'を', 'に', 'で', 'と', 'も'];
-        const hasSameParticles = japaneseParticles.some(particle => 
-            text1.includes(particle) && text2.includes(particle)
-        );
+        // 计算Jaccard相似度（针对日语优化）
+        const set1 = new Set(text1.split(''));
+        const set2 = new Set(text2.split(''));
+        const intersection = new Set([...set1].filter(x => set2.has(x)));
+        const union = new Set([...set1, ...set2]);
+        const similarity = intersection.size / union.size;
         
-        // 如果包含相同的助词且长度相似，可能重复
-        if (hasSameParticles && Math.abs(text1.length - text2.length) <= 5) {
-            return this.calculateTextSimilarity(text1, text2) > 0.6;
+        // 提高相似度阈值到0.85
+        if (similarity > 0.85) {
+            // 检查是否有相同的日语助词
+            const japaneseParticles = ['は', 'が', 'を', 'に', 'で', 'と', 'も', 'か', 'ね', 'よ'];
+            const hasCommonParticles = japaneseParticles.some(particle => 
+                text1.includes(particle) && text2.includes(particle)
+            );
+            
+            return hasCommonParticles;
         }
         
         return false;
@@ -572,22 +691,8 @@ class VideoSubtitleRecognitionAndTranslation {
             // 保存进度信息（用于断点续传）
             const progressFile = path.join(tempDir, `${videoName}_progress.json`);
             
-            // 如果是部分保存，只更新进度信息，不生成新的片段文件
+            // 如果是部分保存，同时更新进度信息和片段文件
             if (options.isPartial) {
-                const progressInfo = {
-                    totalSegments: segments.length,
-                    lastUpdate: new Date().toISOString(),
-                    segmentsFile: segmentsFile,
-                    processedBytes: options.processedBytes || 0,
-                    totalBytes: options.totalBytes || 0,
-                    isPartial: true
-                };
-                
-                // 只保存进度信息，显示实时进度
-                fs.writeFileSync(progressFile, JSON.stringify(progressInfo, null, 2));
-                process.stdout.write(` 💾 进度已保存 (${progressInfo.processedBytes}/${progressInfo.totalBytes} bytes)`);
-            } else {
-                // 最终保存：合并所有历史数据并保存
                 let allSegments = [];
                 
                 // 如果已有片段文件，读取并合并历史数据
@@ -602,14 +707,67 @@ class VideoSubtitleRecognitionAndTranslation {
                 }
                 
                 // 合并新片段（去重处理）
+                let newSegmentsCount = 0;
                 segments.forEach(newSegment => {
                     const isDuplicate = allSegments.some(existingSegment => 
-                        this.isJapaneseDuplicate(newSegment.text, existingSegment.text)
+                        this.isJapaneseDuplicate(newSegment.text, existingSegment.text) ||
+                        (Math.abs(existingSegment.start - newSegment.start) < 0.5 && 
+                         Math.abs(existingSegment.end - newSegment.end) < 0.5)
                     );
                     if (!isDuplicate) {
                         allSegments.push(newSegment);
+                        newSegmentsCount++;
                     }
                 });
+                
+                // 按时间戳排序
+                allSegments.sort((a, b) => a.start - b.start);
+                
+                const progressInfo = {
+                    totalSegments: allSegments.length,
+                    lastUpdate: new Date().toISOString(),
+                    segmentsFile: segmentsFile,
+                    processedBytes: options.processedBytes || 0,
+                    totalBytes: options.totalBytes || 0,
+                    isPartial: true
+                };
+                
+                // 实时保存片段文件和进度信息
+                fs.writeFileSync(segmentsFile, JSON.stringify(allSegments, null, 2));
+                fs.writeFileSync(progressFile, JSON.stringify(progressInfo, null, 2));
+                process.stdout.write(` 💾 实时保存 ${allSegments.length} 个片段 (新增 ${newSegmentsCount} 个)`);
+            } else {
+                // 最终保存：合并所有历史数据并保存
+                let allSegments = [];
+                
+                // 如果已有片段文件，读取并合并历史数据
+                if (fs.existsSync(segmentsFile)) {
+                    try {
+                        const existingData = fs.readFileSync(segmentsFile, 'utf8');
+                        const existingSegments = JSON.parse(existingData);
+                        allSegments = existingSegments;
+                        console.log(`📂 加载历史片段: ${existingSegments.length} 个`);
+                    } catch (error) {
+                        console.warn('⚠️  读取历史片段文件失败，将创建新文件:', error.message);
+                    }
+                }
+                
+                // 合并新片段（去重处理）
+                let newSegmentsCount = 0;
+                segments.forEach(newSegment => {
+                    const isDuplicate = allSegments.some(existingSegment => 
+                        this.isJapaneseDuplicate(newSegment.text, existingSegment.text) ||
+                        (Math.abs(existingSegment.start - newSegment.start) < 0.5 && 
+                         Math.abs(existingSegment.end - newSegment.end) < 0.5)
+                    );
+                    if (!isDuplicate) {
+                        allSegments.push(newSegment);
+                        newSegmentsCount++;
+                    }
+                });
+                
+                // 按时间戳排序
+                allSegments.sort((a, b) => a.start - b.start);
                 
                 // 保存合并后的完整片段和进度信息
                 const progressInfo = {
@@ -623,7 +781,7 @@ class VideoSubtitleRecognitionAndTranslation {
                 
                 fs.writeFileSync(segmentsFile, JSON.stringify(allSegments, null, 2));
                 fs.writeFileSync(progressFile, JSON.stringify(progressInfo, null, 2));
-                console.log(`\n💾 最终保存识别结果: ${allSegments.length} 个片段（合并历史数据）`);
+                console.log(`\n💾 最终保存识别结果: ${allSegments.length} 个片段（新增 ${newSegmentsCount} 个）`);
             }
             
         } catch (error) {
@@ -632,7 +790,7 @@ class VideoSubtitleRecognitionAndTranslation {
     }
 
     /**
-     * 翻译文本
+     * 翻译文本 - 改进版本
      */
     async translateText(text, sourceLang, targetLang) {
         try {
@@ -641,10 +799,33 @@ class VideoSubtitleRecognitionAndTranslation {
                 return '';
             }
             
+            // 预处理文本，提高翻译质量
+            const processedText = this.preprocessJapaneseText(text);
+            
+            // 检查文本质量，过滤低质量文本
+            const confidence = this.calculateJapaneseConfidence(processedText);
+            if (confidence < 0.5) {
+                console.log(`⚠️  跳过低质量文本翻译 (置信度: ${confidence.toFixed(2)}): ${processedText.substring(0, 30)}...`);
+                return '';
+            }
+            
+            // 检查文本长度，过滤过短或过长的文本
+            if (processedText.length < 3) {
+                console.log(`⚠️  跳过过短文本翻译: ${processedText}`);
+                return '';
+            }
+            
+            if (processedText.length > 200) {
+                console.log(`⚠️  文本过长，截断处理: ${processedText.substring(0, 50)}...`);
+                // 截断过长的文本
+                const truncatedText = processedText.substring(0, 200);
+                return await this.baiduTranslate(truncatedText, sourceLang, targetLang);
+            }
+            
             // 使用百度翻译API
-            console.log(`🌐 开始翻译片段: ${text.substring(0, 30)}${text.length > 30 ? '...' : ''}`);
-            const translated = await this.baiduTranslate(text, sourceLang, targetLang);
-            console.log(`✅ 翻译成功: ${text.substring(0, 20)}${text.length > 20 ? '...' : ''} -> ${translated.substring(0, 20)}${translated.length > 20 ? '...' : ''}`);
+            console.log(`🌐 开始翻译片段 (置信度: ${confidence.toFixed(2)}): ${processedText.substring(0, 30)}${processedText.length > 30 ? '...' : ''}`);
+            const translated = await this.baiduTranslate(processedText, sourceLang, targetLang);
+            console.log(`✅ 翻译成功: ${processedText.substring(0, 20)}${processedText.length > 20 ? '...' : ''} -> ${translated.substring(0, 20)}${translated.length > 20 ? '...' : ''}`);
             return translated;
         } catch (error) {
             console.error(`❌ 翻译失败: ${error.message}`);
@@ -652,7 +833,7 @@ class VideoSubtitleRecognitionAndTranslation {
             if (error.message.includes('58001')) {
                 console.error(`   提示: 请检查语言代码是否正确，百度API使用'jp'而非'ja'表示日语`);
             }
-            return text; // 失败时返回原文
+            return ''; // 失败时返回空字符串，避免显示错误翻译
         }
     }
     
@@ -745,8 +926,8 @@ class VideoSubtitleRecognitionAndTranslation {
     applyJapaneseGrammarRules(text) {
         let result = text;
         
-        // 处理常见的日语语法结构
-        result = result.replace(/(\w+)は/g, '$1');
+        // 处理常见的日语语法结构 - 使用更合适的正则表达式
+        result = result.replace(/([\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+)は/g, '$1');
         result = result.replace(/が/g, '');
         result = result.replace(/を/g, '');
         result = result.replace(/に/g, '在');
