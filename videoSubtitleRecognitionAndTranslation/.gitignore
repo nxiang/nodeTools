@@ -1,5 +1,6 @@
 vosk-models/
 *.ass
+*.srt
 *.mkv
 *.mp4
 .html
