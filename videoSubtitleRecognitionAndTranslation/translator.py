@@ -62,7 +62,10 @@ def load_translation_cache():
     return _translation_cache
 
 def save_translation_cache(cache=None):
-    """保存翻译缓存到文件（会自动使用视频特定的缓存文件）"""
+    """保存翻译缓存到文件（会自动使用视频特定的缓存文件）
+    
+    支持无参数调用，此时会保存全局缓存
+    """
     global _translation_cache
     
     try:
@@ -85,25 +88,44 @@ def save_translation_cache(cache=None):
         print(f"❌ 保存翻译缓存失败: {e}")
         return False
 
-def baidu_translate(text, adult_content=False):
+def baidu_translate(text, adult_content=False, max_retries=3):
     """使用百度翻译API翻译文本"""
     global _translation_cache
     
+    # 标准缓存键格式
+    cache_key = f"jp:zh:{text}"
+    
     # 检查缓存
-    if text in _translation_cache:
-        cached_result = _translation_cache[text]
-        print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
-        return cached_result
+    if cache_key in _translation_cache:
+        cached_result = _translation_cache[cache_key]
+        # 处理不同格式的缓存数据
+        if isinstance(cached_result, dict) and 'response_result' in cached_result and 'trans_result' in cached_result['response_result']:
+            if cached_result['response_result']['trans_result']:
+                result = cached_result['response_result']['trans_result'][0].get('dst', '')
+                print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
+                return result
+        elif isinstance(cached_result, str):
+            print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
+            return cached_result
+        elif isinstance(cached_result, dict) and 'result' in cached_result:
+            print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
+            return cached_result['result']
     
     # 获取配置
     baidu_config = get_baidu_config()
     system_config = get_system_config()
     
+    # 使用指定的重试次数或系统配置中的重试次数
+    retry_count = max_retries if max_retries > 0 else system_config['max_retries']
+    
     # 成人内容处理：使用专业术语词典
     if adult_content:
         translated_text = process_adult_content(text)
         if translated_text != text:  # 如果有替换
-            _translation_cache[text] = translated_text
+            _translation_cache[cache_key] = {
+                'request_params': {'q': text, 'from': 'jp', 'to': 'zh'},
+                'response_result': {'from': 'jp', 'to': 'zh', 'trans_result': [{'src': text, 'dst': translated_text}]}
+            }
             return translated_text
     
     # 准备翻译API参数（适配新的API端点）
@@ -148,11 +170,10 @@ def baidu_translate(text, adult_content=False):
         request_method = 'get'
     
     # 发送请求（带重试机制）
-    max_retries = system_config['max_retries']
     retry_delay = system_config['retry_delay']
     api_success = False
     
-    for retry in range(max_retries):
+    for retry in range(retry_count):
         try:
             if request_method == 'post':
                 response = requests.post(url, data=data, headers=headers, timeout=10)
@@ -186,8 +207,11 @@ def baidu_translate(text, adult_content=False):
             if api_success:
                 print(f"🌐 翻译成功: {text[:20]}{'...' if len(text) > 20 else ''} -> {translated_text[:20]}{'...' if len(translated_text) > 20 else ''}")
                 
-                # 存入缓存
-                _translation_cache[text] = translated_text
+                # 存入缓存 - 使用一致的缓存格式
+                _translation_cache[cache_key] = {
+                    'request_params': {'q': text, 'from': 'jp', 'to': 'zh'},
+                    'response_result': {'from': 'jp', 'to': 'zh', 'trans_result': [{'src': text, 'dst': translated_text}]}
+                }
                 return translated_text
             
         except Exception as e:
@@ -197,7 +221,7 @@ def baidu_translate(text, adult_content=False):
     # 如果所有重试都失败，返回带标记的原文
     print(f"⚠️ 翻译失败，使用原文: {text}")
     translated_text = f"[翻译失败] {text}"
-    _translation_cache[text] = translated_text
+    _translation_cache[cache_key] = translated_text
     return translated_text
 
 def process_adult_content(text):

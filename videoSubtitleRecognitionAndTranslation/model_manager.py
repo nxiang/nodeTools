@@ -111,7 +111,7 @@ def setup_whisper_model(model_size='medium'):
         raise e
 
 def auto_select_model(video_path, user_model_size='medium'):
-    """根据视频时长自动选择模型大小"""
+    """根据视频时长自动选择模型大小（如果用户未指定则自动选择）"""
     try:
         import subprocess
         
@@ -132,16 +132,21 @@ def auto_select_model(video_path, user_model_size='medium'):
             else:  # 超过30分钟
                 recommended = 'large'
             
-            # 尊重用户明确指定的模型，如果用户指定了模型，则使用用户指定的
+            # 验证用户模型是否有效
             model_sizes = ['tiny', 'base', 'small', 'medium', 'large']
-            user_index = model_sizes.index(user_model_size) if user_model_size in model_sizes else 2
-            recommended_index = model_sizes.index(recommended) if recommended in model_sizes else 2
+            if user_model_size not in model_sizes:
+                print(f"⚠️  指定的模型 '{user_model_size}' 无效，使用推荐模型 '{recommended}'")
+                return recommended
             
-            # 如果用户指定了模型，优先使用用户指定的
-            print(f"📊 视频时长 {duration:.1f}秒，使用用户指定的 {user_model_size} 模型")
-            return user_model_size
+            print(f"📊 视频时长 {duration:.1f}秒，使用指定的 {user_model_size} 模型")
         
     except Exception as e:
-        print(f"⚠️  无法获取视频时长，使用默认模型: {e}")
+        print(f"⚠️  无法获取视频时长: {e}")
+        
+        # 验证用户模型是否有效
+        model_sizes = ['tiny', 'base', 'small', 'medium', 'large']
+        if user_model_size not in model_sizes:
+            print(f"⚠️  指定的模型 '{user_model_size}' 无效，使用默认模型 'medium'")
+            return 'medium'
     
     return user_model_size

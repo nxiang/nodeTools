@@ -180,12 +180,6 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     # 生成字幕文件（与视频文件同名且在同一目录）
     subtitle_path = get_same_dir_subtitle_path(video_path)
     
-    # 检查是否有错误状态的进度文件
-    if progress and 'error' in progress:
-        print(f"🔄 检测到上次中断的进度，继续处理...")
-        print(f"   错误信息: {progress.get('error', '未知错误')}")
-        print(f"   错误时间: {progress.get('error_time', '未知时间')}")
-    
     # 保存语音识别结果到进度文件
     progress_data = {
         'transcription_result': result,
@@ -196,7 +190,6 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
         'transcription_completed': True
     }
     save_progress(video_path, progress_data)
-    print(f"💾 语音识别进度已保存: {get_progress_file_path(video_path)}")
     
     if enable_translation:
         success = generate_bilingual_subtitle_file(video_path, result, enable_translation=True, 
@@ -223,11 +216,11 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
             if enable_translation:
                 from translator import baidu_translate
                 chinese_text = baidu_translate(japanese_text)
-                print(f"   {i+1}. 日语: {japanese_text}")
-                print(f"      中文: {chinese_text}")
+                print(f"   {i+1}. 日语: {japanese_text[:40]}{'...' if len(japanese_text) > 40 else ''}")
+                print(f"      中文: {chinese_text[:40]}{'...' if len(chinese_text) > 40 else ''}")
                 time.sleep(0.2)  # 避免请求过快
             else:
-                print(f"   {i+1}. 日语: {japanese_text}")
+                print(f"   {i+1}. 日语: {japanese_text[:40]}{'...' if len(japanese_text) > 40 else ''}")
     
     # 字幕合并到视频
     if merge_to_video and success:
@@ -250,29 +243,22 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
                 print("⚠️ 字幕合并失败，保留独立的字幕文件")
         else:
             print("❌ FFmpeg未安装，无法合并字幕到视频")
-            print("💡 请安装FFmpeg或使用外部播放器加载字幕文件")
     
     # 不再清理音频文件，保留用于断点续传
     if 'audio_path' in locals() and os.path.exists(audio_path):
-        print(f"💾 音频文件已保留: {audio_path}，用于后续断点续传")
-    else:
-        print("📝 未找到音频文件")
+        print("💾 音频文件已保留，用于后续断点续传")
     
     # 进度文件管理
     progress_file = get_progress_file_path(video_path)
-    if clean_progress:
-        # 清理进度文件
-        if os.path.exists(progress_file):
-            try:
-                os.remove(progress_file)
-                print("🧹 进度文件已清理")
-            except Exception as e:
-                print(f"⚠️ 无法清理进度文件: {e}")
-    else:
+    if clean_progress and os.path.exists(progress_file):
+        try:
+            os.remove(progress_file)
+            print("🧹 进度文件已清理")
+        except Exception as e:
+            print(f"⚠️ 无法清理进度文件: {e}")
+    elif os.path.exists(progress_file):
         # 默认保留进度文件以便断点续传
-        if os.path.exists(progress_file):
-            print(f"📁 进度文件已保留: {progress_file}")
-            print("💡 如需清理进度文件，请使用 --clean-progress 参数或手动删除")
+        print("📁 进度文件已保留，用于后续断点续传")
     
     print_section_header("处理完成")
     print_success("视频字幕处理已完成！")
@@ -322,9 +308,12 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         # 程序结束时保存翻译缓存
-        from translator import save_translation_cache, load_translation_cache, set_current_video_name
-        # 确保当前视频名称已设置
-        if 'video_path' in locals():
-            set_current_video_name(video_path)
-        cache_data = load_translation_cache()
-        save_translation_cache(cache_data)
+        try:
+            # 确保当前视频名称已设置
+            if 'video_path' in locals():
+                set_current_video_name(video_path)
+            # 保存缓存（使用全局缓存，避免重复加载）
+            from translator import save_translation_cache
+            save_translation_cache()
+        except Exception as e:
+            print(f"⚠️ 保存翻译缓存失败: {e}")

@@ -5,29 +5,25 @@
 
 import os
 import time
+import numpy as np
+import wave
+import contextlib
+import threading
 from datetime import datetime
 from pathlib import Path
 
-# 全局翻译缓存（在主模块中定义）
-_translation_cache = {}
-
 # 导入自定义模块
-from translator import save_translation_cache, load_translation_cache, set_current_video_name, baidu_translate
+from translator import save_translation_cache, load_translation_cache, set_current_video_name, baidu_translate, batch_translate
 from progress_manager import save_progress, load_progress, get_progress_file_path
 
-# 程序启动时加载翻译缓存
+# 使用translator模块中的缓存
 _translation_cache = load_translation_cache()
 
 def transcribe_with_whisper(model, audio_path, model_size='medium'):
     """使用Whisper进行语音识别"""
     print(f"🎤 使用Whisper {model_size}模型进行日语识别...")
     
-    # 导入必要的库
-    import numpy as np
-    import wave
-    import contextlib
-    import threading
-    import time
+    # 已在文件顶部导入必要的库
     
     try:
         # 获取音频文件时长（用于信息显示，但不再用于估计进度百分比）
@@ -130,7 +126,7 @@ def transcribe_with_whisper(model, audio_path, model_size='medium'):
         print(f"\n❌ 语音识别异常: {e}")
         return None
 
-# 翻译缓存函数已在顶部导入
+# 翻译相关函数已在顶部导入
 
 def generate_bilingual_subtitle_file(video_path, transcription_result, 
                                    enable_translation=True, adult_content=False, progress=None):
@@ -199,8 +195,7 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
     MAX_CHARS_PER_BATCH = 5000  # 进一步增加批次大小，合并更多文本以提高语义连贯性
     separator = "<>"  # 使用<>作为分隔符
     
-    # 导入翻译函数
-    from translator import batch_translate, check_translation_quality, baidu_translate
+    # batch_translate已在顶部导入
     
     # 生成双语SRT格式字幕
     i = start_index
@@ -323,7 +318,7 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                                     'trans_result': [{'src': japanese_text, 'dst': api_translated[text_idx]}]
                                 }
                             }
-                            print(f"✅ 批量翻译填充: 日语'{japanese_text}' -> 中文'{api_translated[text_idx]}'")
+                            print(f"✅ 批量翻译填充: 日语'{japanese_text[:30]}{'...' if len(japanese_text) > 30 else ''}' -> 中文'{api_translated[text_idx][:30]}{'...' if len(api_translated[text_idx]) > 30 else ''}'")
                         
                         print(f"✅ 批量翻译成功: 处理了{len(uncached_texts)}个文本，保持了语义连贯性")
                         print(f"🔄 批量翻译策略: 保持对话语义连贯性，优化翻译质量")
@@ -350,7 +345,7 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                                         'trans_result': [{'src': japanese_text, 'dst': api_translated[text_idx]}]
                                     }
                                 }
-                                print(f"✅ 使用批量翻译部分结果: {japanese_text[:30]}... -> {api_translated[text_idx][:30]}...")
+                                print(f"✅ 使用批量翻译部分结果: {japanese_text[:30]}{'...' if len(japanese_text) > 30 else ''} -> {api_translated[text_idx][:30]}{'...' if len(api_translated[text_idx]) > 30 else ''}")
                             else:
                                 # 对于超出部分，使用单独翻译
                                 try:
@@ -361,14 +356,14 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                                     chinese_text = chinese_text.replace(separator, '')
                                     batch_chinese_texts[idx] = chinese_text
                                     # 使用baidu_translate函数已经保存了正确格式的缓存，这里不需要重复保存
-                                    print(f"✅ 单独翻译: {japanese_text[:30]}... -> {chinese_text[:30]}...")
+                                    # 精简日志输出
                                 except Exception as inner_e:
                                     print(f"❌ 单独翻译失败: {japanese_text[:30]}... - {inner_e}")
                                     batch_chinese_texts[idx] = "[翻译失败]"
                 except Exception as e:
                     # 批量翻译异常，尝试使用单独翻译
                     print(f"⚠️ 批量翻译异常: {e}")
-                    print(f"📊 降级到单独翻译，确保功能正常")
+                    print(f"📊 降级到单独翻译")
                     
                     # 使用单独翻译
                     for idx in uncached_indices:
@@ -381,20 +376,20 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                             chinese_text = chinese_text.replace(separator, '')
                             batch_chinese_texts[idx] = chinese_text
                             # 使用baidu_translate函数已经保存了正确格式的缓存，这里不需要重复保存
-                            print(f"✅ 单独翻译: {japanese_text[:30]}... -> {chinese_text[:30]}...")
+                            # 精简日志输出
                         except Exception as inner_e:
                             print(f"❌ 单独翻译失败: {japanese_text[:30]}... - {inner_e}")
                             batch_chinese_texts[idx] = "[翻译失败]"
             else:
                 # 所有文本都在缓存中
-                print(f"✅ 全部使用缓存: {cached_count}/{len(batch_japanese_texts)}")
-                print(f"📝 注意: 缓存内容可能不如批量翻译保持语义连贯性")
+                if batch_count == 0:
+                    print(f"✅ 全部使用缓存，开始生成字幕")
                 # 确保batch_chinese_texts已正确初始化
                 if not batch_chinese_texts:
                     batch_chinese_texts = [_translation_cache.get(f"jp:zh:{text}", "") for text in batch_japanese_texts]
             
-            # 批量翻译完成后保存缓存
-            if len(_translation_cache) > 0:
+            # 减少缓存保存频率
+            if len(_translation_cache) % 100 == 0 and len(_translation_cache) > 0:
                 save_translation_cache(_translation_cache)
             
             # 处理每个翻译结果
@@ -406,11 +401,7 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                 
                 if valid_indices[idx] != -1 and valid_indices[idx] < len(batch_chinese_texts):
                     chinese_text = batch_chinese_texts[valid_indices[idx]]
-                    
-                    # 直接使用批量翻译结果，不进行质量检查
-                    print(f"✅ 使用批量翻译结果: {chinese_text}")
-                    
-                    print(f"📊 当前缓存条目数: {len(_translation_cache)}")
+                    # 移除详细的翻译结果日志
                 else:
                     chinese_text = ""  # 空文本处理
                 
@@ -462,7 +453,6 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
             }
             
             # 尝试保存进度，如果失败则继续处理（不中断流程）
-            from progress_manager import save_progress
             save_success = save_progress(video_path, progress_data)
             if not save_success:
                 print(f"⚠️ 警告：进度保存失败，继续处理当前批次")
@@ -497,10 +487,8 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
         }
         
         # 确保最终进度保存成功
-        from progress_manager import save_progress
         final_save_success = save_progress(video_path, final_progress_data)
         if final_save_success:
-            from progress_manager import get_progress_file_path
             print(f"💾 最终进度文件已保存: {get_progress_file_path(video_path)}")
         else:
             print(f"⚠️ 警告：最终进度保存失败，但字幕文件已生成")
