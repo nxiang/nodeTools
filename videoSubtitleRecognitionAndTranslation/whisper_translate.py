@@ -365,7 +365,7 @@ def replace_adult_terms(text):
 
 # 翻译缓存字典
 _translation_cache = {}
-_translation_cache_file = "translation_cache.json"
+_translation_cache_file = "temp/translation_cache.json"
 
 # 尝试加载缓存文件
 try:
@@ -516,6 +516,7 @@ def baidu_translate(text, from_lang='jp', to_lang='zh', max_retries=3):
     
     return text
 
+
 def check_translation_quality(translated_text, original_text=None):
     """检查翻译质量，返回True表示质量良好，False表示需要重试"""
     # 如果翻译结果为空，说明翻译失败
@@ -537,11 +538,167 @@ def check_translation_quality(translated_text, original_text=None):
     
     return True
 
+
+def batch_translate(texts, separator="<>"):
+    """批量翻译文本，使用指定分隔符连接多个文本进行一次翻译请求
+    优化版本：在批量翻译前后都检查缓存，最大化复用API响应结果"""
+    if not texts:
+        return []
+    
+    # 首先检查每个文本是否已在缓存中，如果是则直接使用缓存结果
+    cached_results = []
+    uncached_texts = []
+    uncached_indices = []
+    
+    for i, text in enumerate(texts):
+        if not text or len(text.strip()) < 2:
+            # 空文本或过短文本直接返回原值
+            cached_results.append((i, text))
+            continue
+        
+        # 生成缓存键
+        cache_key = f"jp:zh:{text}"
+        
+        # 检查缓存
+        if cache_key in _translation_cache:
+            cached_result = _translation_cache[cache_key]
+            print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
+            cached_results.append((i, cached_result))
+        else:
+            uncached_texts.append(text)
+            uncached_indices.append(i)
+    
+    # 如果所有文本都在缓存中，直接返回结果
+    if not uncached_texts:
+        print(f"📊 批量翻译统计: 全部{len(texts)}个文本均使用缓存，无需API调用")
+        # 按原始顺序排列结果
+        result_dict = dict(cached_results)
+        return [result_dict[i] for i in range(len(texts))]
+    
+    print(f"🔄 批量翻译请求: {len(uncached_texts)}个未缓存文本片段，总长度: {len(separator.join(uncached_texts))}字符")
+    print(f"📊 缓存命中率: {len(cached_results)}/{len(texts)} ({len(cached_results)/len(texts)*100:.1f}%)")
+    
+    # 使用更可靠的分隔符连接未缓存的文本
+    batch_text = separator.join(uncached_texts)
+    
+    # 调用百度翻译API
+    batch_result = baidu_translate(batch_text, max_retries=5)
+    
+    # 根据分隔符分割翻译结果
+    translated_texts = batch_result.split(separator)
+    
+    # 处理分割结果不匹配的情况
+    if len(translated_texts) != len(uncached_texts):
+        print(f"⚠️  批量翻译结果分割不匹配，原始: {len(uncached_texts)}，翻译: {len(translated_texts)}")
+        print(f"🔍 原始文本: {batch_text[:100]}...")
+        print(f"🔍 翻译结果: {batch_result[:100]}...")
+        
+        # 改进的分割失败处理：尝试多种分割策略
+        if len(translated_texts) == 1:
+            # 如果只有一个结果，可能是分隔符被翻译API处理了
+            print("🔄 分隔符可能被API处理，尝试按换行符分割...")
+            translated_texts = batch_result.split('\n')
+            
+            # 如果分割后数量仍然不匹配，使用智能分割
+            if len(translated_texts) != len(uncached_texts):
+                print("🔄 使用智能分割策略...")
+                # 基于原文长度比例进行智能分割
+                translated_texts = smart_split_translation(batch_result, uncached_texts)
+        
+        # 如果智能分割仍然失败，回退到逐个翻译
+        if len(translated_texts) != len(uncached_texts):
+            print("🔄 分割策略失败，回退到逐个翻译...")
+            individual_translations = []
+            for text in uncached_texts:
+                translated = baidu_translate(text, max_retries=3)
+                individual_translations.append(translated)
+            translated_texts = individual_translations
+    else:
+        print(f"✅ 批量翻译分割成功: {len(translated_texts)}个结果完美匹配")
+    
+    # 组合缓存结果和新翻译结果
+    result_dict = dict(cached_results)
+    for i, (original_index, translated_text) in enumerate(zip(uncached_indices, translated_texts)):
+        result_dict[original_index] = translated_text
+        # 记录每个翻译结果的详细信息
+        original_text = texts[original_index]
+        print(f"   📝 翻译结果 {i+1}/{len(uncached_texts)}: ")
+        print(f"     原文: {original_text}")
+        print(f"     翻译: {translated_text}")
+    
+    # 按原始顺序排列结果
+    final_results = [result_dict[i] for i in range(len(texts))]
+    
+    print(f"📊 批量翻译完成: 总计{len(texts)}个文本，缓存命中{len(cached_results)}个，API翻译{len(uncached_texts)}个")
+    
+    return final_results
+
+def smart_split_translation(translated_text, original_texts):
+    """智能分割翻译结果，基于原文长度比例进行分割"""
+    if not translated_text or not original_texts:
+        return []
+    
+    # 计算原文总长度
+    total_original_length = sum(len(text) for text in original_texts)
+    if total_original_length == 0:
+        return [translated_text] * len(original_texts)
+    
+    # 基于原文长度比例进行分割
+    split_results = []
+    current_pos = 0
+    
+    for i, original_text in enumerate(original_texts):
+        if i == len(original_texts) - 1:
+            # 最后一个文本，取剩余所有内容
+            split_results.append(translated_text[current_pos:].strip())
+        else:
+            # 基于比例计算分割位置
+            ratio = len(original_text) / total_original_length
+            split_pos = int(len(translated_text) * ratio)
+            
+            # 寻找合适的分割点（标点符号附近）
+            actual_split_pos = find_best_split_point(translated_text, current_pos + split_pos)
+            
+            split_results.append(translated_text[current_pos:actual_split_pos].strip())
+            current_pos = actual_split_pos
+    
+    return split_results
+
+def find_best_split_point(text, target_pos):
+    """在目标位置附近寻找最佳分割点（标点符号附近）"""
+    if target_pos >= len(text):
+        return len(text)
+    
+    # 标点符号列表
+    punctuation = ['。', '！', '？', '，', '；', '：', '.', '!', '?', ',', ';', ':', '、']
+    
+    # 在目标位置附近寻找标点符号
+    search_range = min(50, len(text) - target_pos)  # 搜索范围限制
+    
+    # 向后搜索
+    for i in range(target_pos, min(target_pos + search_range, len(text))):
+        if text[i] in punctuation:
+            return i + 1  # 在标点符号后分割
+    
+    # 向前搜索
+    for i in range(target_pos, max(0, target_pos - search_range), -1):
+        if text[i] in punctuation:
+            return i + 1  # 在标点符号后分割
+    
+    # 如果找不到标点符号，在空格处分割
+    for i in range(target_pos, min(target_pos + search_range, len(text))):
+        if text[i] == ' ':
+            return i + 1
+    
+    # 如果都找不到，返回目标位置
+    return target_pos
+
 def generate_bilingual_subtitle_file(transcription_result, output_path, video_path=None, adult_content=False):
     """生成双语字幕文件（日语+中文，支持断点续传和实时进度显示）"""
     print("📝 生成双语字幕文件...")
     print("🌐 使用百度翻译API翻译日语到中文...")
     print("🎨 字幕样式: 日语(12号金色) + 中文(16号白色)")
+    print("⚡ 启用优化的批量翻译功能，最大化复用API响应结果")
     
     try:
         segments = transcription_result.get('segments', [])
@@ -588,62 +745,138 @@ def generate_bilingual_subtitle_file(transcription_result, output_path, video_pa
         # 显示进度条初始化
         print("📊 翻译进度: [" + " " * 50 + "] 0%")
         
+        # 批量翻译设置
+        MAX_CHARS_PER_BATCH = 5000  # 百度翻译API限制6000字符，设置5000留有余地
+        separator = "<>"  # 批量翻译分隔符
+        
         # 生成双语SRT格式字幕
-        for i in range(start_index, total_segments):
-            segment = segments[i]
-            start_time = format_time(segment['start'])
-            end_time = format_time(segment['end'])
-            japanese_text = segment['text'].strip()
+        i = start_index
+        while i < total_segments:
+            # 准备批量翻译的文本（基于字符数限制）
+            batch_segments = []
+            batch_japanese_texts = []
+            valid_indices = []
+            current_char_count = 0
             
-            if japanese_text:  # 只处理非空文本
-                # 使用百度翻译API翻译日语到中文（带重试机制）
-                chinese_text = baidu_translate(japanese_text, max_retries=5)
+            # 收集不超过字符限制的文本
+            for j in range(i, total_segments):
+                segment = segments[j]
+                japanese_text = segment['text'].strip()
                 
-                # 检查翻译质量，如果翻译失败则重试
-                if not check_translation_quality(chinese_text, japanese_text):
-                    print(f"⚠️  翻译质量不佳，重试片段 {i+1}...")
-                    chinese_text = baidu_translate(japanese_text, max_retries=3)
+                # 计算添加这个文本后可能的总字符数（包括分隔符）
+                segment_char_count = len(japanese_text)
+                if batch_japanese_texts:  # 如果不是第一个元素，需要加上分隔符
+                    segment_char_count += len(separator)
                 
-                # 添加延迟避免请求过快
-                time.sleep(0.3)
+                # 检查是否超过字符限制
+                if current_char_count + segment_char_count > MAX_CHARS_PER_BATCH:
+                    break
                 
-                srt_content += f"{i+1}\n"
-                srt_content += f"{start_time} --> {end_time}\n"
-                srt_content += f"<font size=\"12\" color=\"#FFD700\">{japanese_text}</font>\n"
-                srt_content += f"<font size=\"16\" color=\"#FFFFFF\">{chinese_text}</font>\n\n"
+                # 添加到批次
+                batch_segments.append(segment)
+                if japanese_text:  # 只处理非空文本
+                    batch_japanese_texts.append(japanese_text)
+                    valid_indices.append(len(batch_japanese_texts) - 1)
+                else:
+                    valid_indices.append(-1)  # 标记为空文本
                 
-                # 实时进度显示
-                progress_percent = int((i + 1) / total_segments * 100)
-                progress_bar_length = int(progress_percent / 2)
-                progress_bar = "█" * progress_bar_length + " " * (50 - progress_bar_length)
-                print(f"\r📊 翻译进度: [{progress_bar}] {progress_percent}% ({i+1}/{total_segments})", end="", flush=True)
+                # 更新字符计数
+                current_char_count += segment_char_count
+            
+            # 计算当前批次的结束索引
+            batch_end = i + len(batch_segments)
+            
+            # 执行批量翻译
+            if batch_japanese_texts:
+                print(f"\n📦 批量翻译批次 {i//len(batch_segments)+1}: 处理{len(batch_segments)}个片段")
+                batch_chinese_texts = batch_translate(batch_japanese_texts, separator)
                 
-                # 实时保存进度到磁盘（每翻译1个片段保存一次）
-                if video_path:
-                    # 构建完整的进度数据，包含所有必要信息
-                    progress_data = {
-                        'video_path': video_path,
-                        'output_path': output_path,
-                        'last_translated_index': i + 1,
-                        'srt_content': srt_content,
-                        'total_segments': total_segments,
-                        'progress_percent': progress_percent,
-                        'last_save_time': datetime.now().isoformat(),
-                        'transcription_result': transcription_result,  # 保存完整的识别结果以便恢复
-                        'status': 'translating',
-                        'current_segment': {
-                            'index': i + 1,
-                            'japanese_text': japanese_text,
-                            'chinese_text': chinese_text,
-                            'start_time': start_time,
-                            'end_time': end_time
-                        }
-                    }
+                # 处理每个翻译结果
+                for idx, segment in enumerate(batch_segments):
+                    global_index = i + idx
+                    start_time = format_time(segment['start'])
+                    end_time = format_time(segment['end'])
+                    japanese_text = segment['text'].strip()
                     
-                    # 尝试保存进度，如果失败则继续处理（不中断流程）
-                    save_success = save_progress(video_path, progress_data)
-                    if not save_success:
-                        print(f"⚠️ 警告：进度保存失败，继续处理片段 {i+1}")
+                    if valid_indices[idx] != -1 and valid_indices[idx] < len(batch_chinese_texts):
+                        chinese_text = batch_chinese_texts[valid_indices[idx]]
+                        
+                        # 检查翻译质量
+                        if not check_translation_quality(chinese_text, japanese_text):
+                            print(f"⚠️  翻译质量不佳，单独重试片段 {global_index+1}...")
+                            print(f"📊 单独翻译统计: 第{global_index+1}个片段质量检查失败，启动单独翻译")
+                            
+                            # 生成缓存键
+                            cache_key = f"jp:zh:{japanese_text}"
+                            
+                            # 检查缓存
+                            if cache_key in _translation_cache:
+                                chinese_text = _translation_cache[cache_key]
+                                print(f"✅ 使用缓存的翻译结果")
+                                print(f"📊 单独翻译统计: 第{global_index+1}个片段使用缓存，跳过API调用")
+                            else:
+                                # 使用百度翻译API
+                                print(f"🌐 开始API翻译: 第{global_index+1}个片段")
+                                chinese_text = baidu_translate(japanese_text, max_retries=3)
+                                
+                                # 保存到缓存
+                                _translation_cache[cache_key] = chinese_text
+                                print(f"✅ 翻译完成")
+                                print(f"📊 单独翻译统计: 第{global_index+1}个片段API翻译成功")
+                            
+                            print(f"🌐 翻译: {chinese_text}")
+                            print(f"📊 当前缓存条目数: {len(_translation_cache)}")
+                    else:
+                        chinese_text = ""  # 空文本处理
+                    
+                    srt_content += f"{global_index+1}\n"
+                    srt_content += f"{start_time} --> {end_time}\n"
+                    srt_content += f"<font size=\"12\" color=\"#FFD700\">{japanese_text}</font>\n"
+                    srt_content += f"<font size=\"16\" color=\"#FFFFFF\">{chinese_text}</font>\n\n"
+            else:
+                # 处理空批次（只有空文本）
+                for idx, segment in enumerate(batch_segments):
+                    global_index = i + idx
+                    start_time = format_time(segment['start'])
+                    end_time = format_time(segment['end'])
+                    japanese_text = segment['text'].strip()
+                    
+                    srt_content += f"{global_index+1}\n"
+                    srt_content += f"{start_time} --> {end_time}\n"
+                    srt_content += f"<font size=\"12\" color=\"#FFD700\">{japanese_text}</font>\n"
+                    srt_content += f"<font size=\"16\" color=\"#FFFFFF\"></font>\n\n"
+            
+            # 更新进度
+            i = batch_end
+            
+            # 实时进度显示
+            progress_percent = int(i / total_segments * 100)
+            progress_bar_length = int(progress_percent / 2)
+            progress_bar = "█" * progress_bar_length + " " * (50 - progress_bar_length)
+            print(f"\r📊 翻译进度: [{progress_bar}] {progress_percent}% ({i}/{total_segments})", end="", flush=True)
+            
+            # 添加延迟避免请求过快
+            time.sleep(0.5)
+            
+            # 实时保存进度到磁盘（每批保存一次）
+            if video_path:
+                # 构建完整的进度数据，包含所有必要信息
+                progress_data = {
+                    'video_path': video_path,
+                    'output_path': output_path,
+                    'last_translated_index': i,
+                    'srt_content': srt_content,
+                    'total_segments': total_segments,
+                    'progress_percent': progress_percent,
+                    'last_save_time': datetime.now().isoformat(),
+                    'transcription_result': transcription_result,  # 保存完整的识别结果以便恢复
+                    'status': 'translating'
+                }
+                
+                # 尝试保存进度，如果失败则继续处理（不中断流程）
+                save_success = save_progress(video_path, progress_data)
+                if not save_success:
+                    print(f"⚠️ 警告：进度保存失败，继续处理当前批次")
         
         # 完成进度显示
         print(f"\r📊 翻译进度: [" + "█" * 50 + "] 100% ({total_segments}/{total_segments})")
@@ -683,7 +916,7 @@ def generate_bilingual_subtitle_file(transcription_result, output_path, video_pa
         
         print(f"✅ 双语字幕文件已生成: {output_path}")
         return True
-        
+    
     except Exception as e:
         print(f"\n❌ 生成字幕文件失败: {e}")
         # 保存错误进度以便恢复
@@ -1073,9 +1306,9 @@ if __name__ == "__main__":
     # 命令行参数解析
     parser = argparse.ArgumentParser(description='视频字幕识别与翻译工具')
     parser.add_argument('video_path', nargs='?', help='视频文件路径')
-    parser.add_argument('--test', action='store_true', help='测试模式（仅处理前10%内容）')
-    parser.add_argument('--model', default='medium', choices=['tiny', 'base', 'small', 'medium', 'large'], 
-                       help='Whisper模型大小（默认：medium）')
+    parser.add_argument('--test', action='store_true', help='测试模式（仅处理前10%%内容）')
+    parser.add_argument('--model', default='medium', choices=['tiny', 'base', 'small', 'medium', 'large'],
+                        help='Whisper模型大小（默认：medium）')
     parser.add_argument('--no-translate', action='store_true', help='仅识别不翻译')
     parser.add_argument('--output-dir', help='输出目录')
     parser.add_argument('--adult', action='store_true', help='成人内容模式（优化专业术语翻译）')
