@@ -1,4 +1,5 @@
 vosk-models/
+__pycache__/
 *.ass
 *.srt
 *.mkv
