@@ -28,6 +28,7 @@ def setup_whisper_model(model_size='medium'):
     os.environ['WHISPER_CACHE_DIR'] = cache_dir
     
     print(f"📥 加载Whisper {model_size}模型...")
+    print(f"🔍 正在使用明确指定的模型：{model_size}")
     
     # 预期的模型文件大小（字节）- 更新为实际大小
     expected_sizes = {
@@ -131,17 +132,14 @@ def auto_select_model(video_path, user_model_size='medium'):
             else:  # 超过30分钟
                 recommended = 'large'
             
-            # 如果用户指定的模型比推荐的小，使用用户指定的
+            # 尊重用户明确指定的模型，如果用户指定了模型，则使用用户指定的
             model_sizes = ['tiny', 'base', 'small', 'medium', 'large']
             user_index = model_sizes.index(user_model_size) if user_model_size in model_sizes else 2
             recommended_index = model_sizes.index(recommended) if recommended in model_sizes else 2
             
-            if user_index < recommended_index:
-                print(f"⚠️  视频时长 {duration:.1f}秒 建议使用 {recommended} 模型，但将使用用户指定的 {user_model_size} 模型")
-                return user_model_size
-            else:
-                print(f"📊 视频时长 {duration:.1f}秒，自动选择 {recommended} 模型")
-                return recommended
+            # 如果用户指定了模型，优先使用用户指定的
+            print(f"📊 视频时长 {duration:.1f}秒，使用用户指定的 {user_model_size} 模型")
+            return user_model_size
         
     except Exception as e:
         print(f"⚠️  无法获取视频时长，使用默认模型: {e}")
