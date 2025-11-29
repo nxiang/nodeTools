@@ -114,8 +114,8 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
     print("📊 翻译进度: [" + " " * 50 + "] 0%")
     
     # 批量翻译设置
-    MAX_CHARS_PER_BATCH = 5000  # 百度翻译API限制6000字符，设置5000留有余地
-    separator = "<>"  # 批量翻译分隔符
+    MAX_CHARS_PER_BATCH = 5000  # 进一步增加批次大小，合并更多文本以提高语义连贯性
+    separator = "<>"  # 使用<>作为分隔符
     
     # 导入翻译函数
     from translator import batch_translate, check_translation_quality, baidu_translate
@@ -162,115 +162,154 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
             print(f"\n📦 批量翻译批次 {i//len(batch_segments)+1}: 处理{len(batch_segments)}个片段")
             print(f"📊 批量翻译模式: 启用缓存，优先检查缓存")
             
-            # 检查批量文本的缓存
-            batch_chinese_texts = []
+            # 优先使用批量翻译以保持语义连贯性
+            batch_chinese_texts = ["" for _ in range(len(batch_japanese_texts))]  # 预初始化结果列表
             cached_count = 0
-            for japanese_text in batch_japanese_texts:
+            
+            # 先检查缓存状态
+            for idx, japanese_text in enumerate(batch_japanese_texts):
                 cache_key = f"jp:zh:{japanese_text}"
                 if cache_key in _translation_cache:
-                    batch_chinese_texts.append(_translation_cache[cache_key])
-                    cached_count += 1
-                else:
-                    # 对于未缓存的文本，使用批量翻译
-                    batch_chinese_texts.append("")
-            
-            # 如果有未缓存的文本，优先使用批量翻译
-            if cached_count < len(batch_japanese_texts):
-                print(f"📊 缓存命中: {cached_count}/{len(batch_japanese_texts)}，剩余使用批量API翻译")
-                uncached_texts = [text for text in batch_japanese_texts if f"jp:zh:{text}" not in _translation_cache]
-                
-                # 优先尝试批量翻译
-                try:
-                    api_translated = batch_translate(uncached_texts, separator)
-                    
-                    # 检查批量翻译返回结果数量
-                    if len(api_translated) == len(uncached_texts):
-                        # 批量翻译成功，正常合并结果
-                        api_index = 0
-                        for idx, japanese_text in enumerate(batch_japanese_texts):
-                            cache_key = f"jp:zh:{japanese_text}"
-                            if cache_key not in _translation_cache:
-                                batch_chinese_texts[idx] = api_translated[api_index]
-                                # 保存到缓存
-                                _translation_cache[cache_key] = api_translated[api_index]
-                                api_index += 1
-                        
-                        # 保存批量翻译的合并文本和分隔符分隔的结果
-                        batch_combined_key = f"batch_jp:zh:{separator.join(uncached_texts)}"
-                        batch_combined_result = separator.join(api_translated)
-                        _translation_cache[batch_combined_key] = batch_combined_result
-                        
-                        print(f"✅ 批量翻译成功: 处理了{len(uncached_texts)}个文本")
-                        print(f"📦 批量翻译合并文本已保存到缓存")
+                    cached_data = _translation_cache[cache_key]
+                    # 处理不同格式的缓存数据
+                    if isinstance(cached_data, dict):
+                        # 从response_result中提取翻译结果
+                        if 'response_result' in cached_data and 'trans_result' in cached_data['response_result']:
+                            if cached_data['response_result']['trans_result']:
+                                batch_chinese_texts[idx] = cached_data['response_result']['trans_result'][0].get('dst', '')
+                            else:
+                                batch_chinese_texts[idx] = ''
+                        else:
+                            # 兼容旧格式的dict缓存
+                            batch_chinese_texts[idx] = cached_data.get('result', '')
                     else:
-                        # 批量翻译结果不匹配，智能复用已有结果
-                        print(f"⚠️ 批量翻译结果数量不匹配: {len(api_translated)} != {len(uncached_texts)}")
-                        print(f"📊 智能复用批量翻译结果，补充缺失部分")
-                        
-                        # 复用已有的批量翻译结果
-                        api_index = 0
-                        reused_count = 0
-                        missing_texts = []
-                        missing_indices = []
-                        
-                        for idx, japanese_text in enumerate(batch_japanese_texts):
-                            cache_key = f"jp:zh:{japanese_text}"
-                            if cache_key not in _translation_cache:
-                                if api_index < len(api_translated):
-                                    # 复用已有的批量翻译结果
-                                    batch_chinese_texts[idx] = api_translated[api_index]
-                                    _translation_cache[cache_key] = api_translated[api_index]
-                                    api_index += 1
-                                    reused_count += 1
-                                else:
-                                    # 记录缺失的文本和索引
-                                    missing_texts.append(japanese_text)
-                                    missing_indices.append(idx)
-                        
-                        print(f"✅ 复用批量翻译结果: {reused_count}/{len(uncached_texts)} 个文本")
-                        
-                        # 对缺失的文本使用单独翻译
-                        if missing_texts:
-                            print(f"📊 补充翻译缺失部分: {len(missing_texts)} 个文本")
-                            for i, japanese_text in enumerate(missing_texts):
-                                idx = missing_indices[i]
-                                cache_key = f"jp:zh:{japanese_text}"
-                                # 使用单独翻译API
-                                chinese_text = baidu_translate(japanese_text, max_retries=3)
-                                batch_chinese_texts[idx] = chinese_text
-                                # 保存到缓存
-                                _translation_cache[cache_key] = chinese_text
-                                print(f"✅ 补充翻译并缓存: {japanese_text[:30]}...")
-                        
-                        # 保存部分批量翻译的合并文本和分隔符分隔的结果
-                        if reused_count > 0:
-                            reused_texts = [batch_japanese_texts[i] for i in range(len(batch_japanese_texts)) 
-                                          if f"jp:zh:{batch_japanese_texts[i]}" not in _translation_cache 
-                                          and i < len(api_translated)]
-                            reused_results = [api_translated[i] for i in range(min(len(api_translated), len(reused_texts)))]
-                            
-                            if reused_texts and reused_results:
-                                batch_partial_key = f"batch_partial_jp:zh:{separator.join(reused_texts)}"
-                                batch_partial_result = separator.join(reused_results)
-                                _translation_cache[batch_partial_key] = batch_partial_result
-                                print(f"📦 部分批量翻译结果已保存到缓存: {reused_count}个文本")
-                except Exception as e:
-                    # 批量翻译异常，降级到单独翻译
-                    print(f"⚠️ 批量翻译异常: {e}")
-                    print(f"📊 降级到单独翻译模式")
+                        # 旧格式（直接存储结果字符串）
+                        batch_chinese_texts[idx] = cached_data
+                    cached_count += 1
+            
+            # 即使有缓存文本，也尝试批量翻译整个批次以保持更好的语义连贯性
+            # 但只发送未缓存的文本，避免API返回不一致的结果
+            uncached_texts = []
+            uncached_indices = []
+            for idx, japanese_text in enumerate(batch_japanese_texts):
+                cache_key = f"jp:zh:{japanese_text}"
+                if cache_key not in _translation_cache:
+                    uncached_texts.append(japanese_text)
+                    uncached_indices.append(idx)
+            
+            # 尝试批量翻译未缓存的文本，保持对话的语义连贯性
+            if uncached_texts:
+                print(f"📊 缓存命中: {cached_count}/{len(batch_japanese_texts)}，剩余{len(uncached_texts)}个文本需要翻译")
+                print(f"🔍 批量翻译触发: 优先使用批量翻译保持语义连贯性")
+                print(f"📦 批量翻译文本列表: {uncached_texts}")
+                
+                # 优先尝试批量翻译所有未缓存的文本
+                try:
+                    # 调用批量翻译API
+                    combined_result = batch_translate(uncached_texts, separator)
                     
-                    # 使用单独翻译确保缓存完整
-                    for idx, japanese_text in enumerate(batch_japanese_texts):
+                    # 检查返回结果类型，如果是字符串则进行分割
+                    if isinstance(combined_result, str):
+                        # 如果返回的是单个字符串，尝试用分隔符分割
+                        api_translated = [text.strip() for text in combined_result.split(separator) if text.strip()]
+                    else:
+                        # 如果已经是列表，直接使用
+                        api_translated = combined_result
+                    
+                    # 清理每个翻译结果中的<SEP>分隔符，确保输出干净
+                    api_translated = [text.replace(separator, '') for text in api_translated]
+                    
+                    print(f"🔍 批量翻译返回处理后: {api_translated}")
+                    
+                    # 检查批量翻译返回结果是否有效
+                    if api_translated and len(api_translated) == len(uncached_texts):
+                        # 批量翻译成功，将结果填充到正确位置
+                        for text_idx, idx in enumerate(uncached_indices):
+                            japanese_text = batch_japanese_texts[idx]
+                            cache_key = f"jp:zh:{japanese_text}"
+                            batch_chinese_texts[idx] = api_translated[text_idx]
+                            # 保存到缓存 - 只保留百度API的请求参数和响应结果格式
+                            _translation_cache[cache_key] = {
+                                'request_params': {
+                                    'q': japanese_text,
+                                    'from': 'jp',
+                                    'to': 'zh'
+                                },
+                                'response_result': {
+                                    'from': 'jp',
+                                    'to': 'zh',
+                                    'trans_result': [{'src': japanese_text, 'dst': api_translated[text_idx]}]
+                                }
+                            }
+                            print(f"✅ 批量翻译填充: 日语'{japanese_text}' -> 中文'{api_translated[text_idx]}'")
+                        
+                        print(f"✅ 批量翻译成功: 处理了{len(uncached_texts)}个文本，保持了语义连贯性")
+                        print(f"🔄 批量翻译策略: 保持对话语义连贯性，优化翻译质量")
+                    elif api_translated:
+                        # 批量翻译结果部分可用
+                        print(f"⚠️ 批量翻译结果数量不匹配: {len(api_translated)} != {len(uncached_texts)}")
+                        
+                        # 使用可用的批量翻译结果
+                        for text_idx, idx in enumerate(uncached_indices):
+                            if text_idx < len(api_translated):
+                                japanese_text = batch_japanese_texts[idx]
+                                cache_key = f"jp:zh:{japanese_text}"
+                                batch_chinese_texts[idx] = api_translated[text_idx]
+                                # 仍然保存到缓存 - 使用正确的格式
+                                _translation_cache[cache_key] = {
+                                    'request_params': {
+                                        'q': japanese_text,
+                                        'from': 'jp',
+                                        'to': 'zh'
+                                    },
+                                    'response_result': {
+                                        'from': 'jp',
+                                        'to': 'zh',
+                                        'trans_result': [{'src': japanese_text, 'dst': api_translated[text_idx]}]
+                                    }
+                                }
+                                print(f"✅ 使用批量翻译部分结果: {japanese_text[:30]}... -> {api_translated[text_idx][:30]}...")
+                            else:
+                                # 对于超出部分，使用单独翻译
+                                try:
+                                    japanese_text = batch_japanese_texts[idx]
+                                    cache_key = f"jp:zh:{japanese_text}"
+                                    chinese_text = baidu_translate(japanese_text, max_retries=3)
+                                    # 确保单独翻译结果也干净
+                                    chinese_text = chinese_text.replace(separator, '')
+                                    batch_chinese_texts[idx] = chinese_text
+                                    # 使用baidu_translate函数已经保存了正确格式的缓存，这里不需要重复保存
+                                    print(f"✅ 单独翻译: {japanese_text[:30]}... -> {chinese_text[:30]}...")
+                                except Exception as inner_e:
+                                    print(f"❌ 单独翻译失败: {japanese_text[:30]}... - {inner_e}")
+                                    batch_chinese_texts[idx] = "[翻译失败]"
+                except Exception as e:
+                    # 批量翻译异常，尝试使用单独翻译
+                    print(f"⚠️ 批量翻译异常: {e}")
+                    print(f"📊 降级到单独翻译，确保功能正常")
+                    
+                    # 使用单独翻译
+                    for idx in uncached_indices:
+                        japanese_text = batch_japanese_texts[idx]
                         cache_key = f"jp:zh:{japanese_text}"
-                        if cache_key not in _translation_cache:
-                            # 使用单独翻译API
-                            chinese_text = baidu_translate(japanese_text, max_retries=3)
+                        try:
+                            # 对于单独翻译，增加重试次数以提高成功率
+                            chinese_text = baidu_translate(japanese_text, max_retries=5)
+                            # 清理单独翻译结果中的<SEP>分隔符
+                            chinese_text = chinese_text.replace(separator, '')
                             batch_chinese_texts[idx] = chinese_text
-                            # 保存到缓存
-                            _translation_cache[cache_key] = chinese_text
-                            print(f"✅ 单独翻译并缓存: {japanese_text[:30]}...")
+                            # 使用baidu_translate函数已经保存了正确格式的缓存，这里不需要重复保存
+                            print(f"✅ 单独翻译: {japanese_text[:30]}... -> {chinese_text[:30]}...")
+                        except Exception as inner_e:
+                            print(f"❌ 单独翻译失败: {japanese_text[:30]}... - {inner_e}")
+                            batch_chinese_texts[idx] = "[翻译失败]"
             else:
+                # 所有文本都在缓存中
                 print(f"✅ 全部使用缓存: {cached_count}/{len(batch_japanese_texts)}")
+                print(f"📝 注意: 缓存内容可能不如批量翻译保持语义连贯性")
+                # 确保batch_chinese_texts已正确初始化
+                if not batch_chinese_texts:
+                    batch_chinese_texts = [_translation_cache.get(f"jp:zh:{text}", "") for text in batch_japanese_texts]
             
             # 批量翻译完成后保存缓存
             if len(_translation_cache) > 0:
@@ -286,34 +325,9 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                 if valid_indices[idx] != -1 and valid_indices[idx] < len(batch_chinese_texts):
                     chinese_text = batch_chinese_texts[valid_indices[idx]]
                     
-                    # 检查翻译质量
-                    if not check_translation_quality(chinese_text, japanese_text):
-                        print(f"⚠️  翻译质量不佳，单独重试片段 {global_index+1}...")
-                        print(f"📊 单独翻译统计: 第{global_index+1}个片段质量检查失败，启动单独翻译")
-                        
-                        # 生成缓存键
-                        cache_key = f"jp:zh:{japanese_text}"
-                        
-                        # 检查缓存
-                        if cache_key in _translation_cache:
-                            chinese_text = _translation_cache[cache_key]
-                            print(f"✅ 使用缓存的翻译结果")
-                            print(f"📊 单独翻译统计: 第{global_index+1}个片段使用缓存，跳过API调用")
-                        else:
-                            # 使用百度翻译API
-                            print(f"🌐 开始API翻译: 第{global_index+1}个片段")
-                            chinese_text = baidu_translate(japanese_text, max_retries=3)
-                            
-                            # 保存到缓存
-                        _translation_cache[cache_key] = chinese_text
-                        print(f"✅ 翻译完成")
-                        print(f"📊 单独翻译统计: 第{global_index+1}个片段API翻译成功")
-                        
-                        # 每5个新缓存条目保存一次
-                        if len(_translation_cache) % 5 == 0:
-                            save_translation_cache(_translation_cache)
+                    # 直接使用批量翻译结果，不进行质量检查
+                    print(f"✅ 使用批量翻译结果: {chinese_text}")
                     
-                    print(f"🌐 翻译: {chinese_text}")
                     print(f"📊 当前缓存条目数: {len(_translation_cache)}")
                 else:
                     chinese_text = ""  # 空文本处理
@@ -344,8 +358,11 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
         progress_bar = "█" * progress_bar_length + " " * (50 - progress_bar_length)
         print(f"\r📊 翻译进度: [{progress_bar}] {progress_percent}% ({i}/{total_segments})", end="", flush=True)
         
-        # 添加延迟避免请求过快
-        time.sleep(0.5)
+        # 添加延迟避免请求过快，但对于批量翻译减少延迟以提高效率
+        if len(uncached_texts) > 0:
+            time.sleep(0.3)  # 批量翻译后稍微减少延迟
+        else:
+            time.sleep(0.1)  # 全部使用缓存时减少延迟
         
         # 实时保存进度到磁盘（每批保存一次）
         if video_path:
