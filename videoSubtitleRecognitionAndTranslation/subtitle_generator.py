@@ -11,8 +11,9 @@ from pathlib import Path
 # 全局翻译缓存（在主模块中定义）
 _translation_cache = {}
 
-# 导入翻译缓存函数
-from translator import save_translation_cache, load_translation_cache
+# 导入自定义模块
+from translator import save_translation_cache, load_translation_cache, set_current_video_name, baidu_translate
+from progress_manager import save_progress, load_progress, get_progress_file_path
 
 # 程序启动时加载翻译缓存
 _translation_cache = load_translation_cache()
@@ -52,12 +53,16 @@ def transcribe_with_whisper(model, audio_path, model_size='medium'):
         print(f"❌ 语音识别异常: {e}")
         return None
 
-# 导入翻译缓存函数
-from translator import save_translation_cache, load_translation_cache
+# 翻译缓存函数已在顶部导入
 
 def generate_bilingual_subtitle_file(video_path, transcription_result, 
                                    enable_translation=True, adult_content=False, progress=None):
     """生成双语字幕文件"""
+    # 获取当前时间作为开始处理时间
+    start_time = time.time()
+    print(f"🔄 开始生成双语字幕，视频路径: {video_path}")
+    # 确保设置了当前视频名称
+    set_current_video_name(video_path)
     
     if not transcription_result or 'segments' not in transcription_result:
         print("❌ 无效的识别结果")
@@ -423,8 +428,11 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
         else:
             print(f"⚠️ 警告：最终进度保存失败，但字幕文件已生成")
     
-    # 翻译完成后保存缓存
+    # 翻译完成后保存缓存（使用视频特定的缓存文件）
     if len(_translation_cache) > 0:
+        # 确保设置了当前视频名称
+        if video_path:
+            set_current_video_name(video_path)
         save_translation_cache(_translation_cache)
     
     print(f"✅ 双语字幕文件已生成: {output_path}")

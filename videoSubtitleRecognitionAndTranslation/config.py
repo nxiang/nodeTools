@@ -7,9 +7,9 @@ import os
 
 # 百度翻译API配置
 BAIDU_TRANSLATE_CONFIG = {
-    'appid': '20240426002033339',
-    'key': '3Y7J9v9J9v9J9v9J',
-    'url': 'https://fanyi-api.baidu.com/api/trans/vip/translate'
+    'appid': '20251126002506386',
+    'key': 'C0qK4IqU_KXjun3PhRum',
+    'url': 'https://fanyi-api.baidu.com/ait/api/aiTextTranslate'
 }
 
 # 成人内容专业术语词典

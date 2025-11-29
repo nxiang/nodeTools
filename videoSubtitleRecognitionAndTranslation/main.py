@@ -141,8 +141,9 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     temp_dir = "temp"
     os.makedirs(temp_dir, exist_ok=True)
     
-    # 加载翻译缓存
-    from translator import load_translation_cache
+    # 设置当前视频名称并加载翻译缓存
+    from translator import load_translation_cache, set_current_video_name
+    set_current_video_name(video_path)
     global _translation_cache
     _translation_cache = load_translation_cache()
     print(f"💾 翻译缓存已加载，当前缓存条目数: {len(_translation_cache)}")
@@ -155,12 +156,19 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
         print("✅ 使用已保存的语音识别结果，跳过识别阶段")
         result = progress['transcription_result']
     else:
-        # 提取音频
-        audio_path = os.path.join(temp_dir, "audio.wav")
-        # 测试模式下只提取前60秒音频
-        segment_duration = 60 if test_mode else None
-        if not extract_audio_segment(video_path, audio_path, segment_duration=segment_duration):
-            return
+        # 提取音频（使用视频名称作为音频文件名，便于缓存和断点续传）
+        video_name = Path(video_path).stem
+        audio_path = os.path.join(temp_dir, f"{video_name}_audio.wav")
+        
+        # 检查是否已有音频文件，避免重复提取
+        if os.path.exists(audio_path):
+            print(f"✅ 发现已存在的音频文件: {audio_path}，跳过提取步骤")
+        else:
+            # 测试模式下只提取前60秒音频
+            segment_duration = 60 if test_mode else None
+            if not extract_audio_segment(video_path, audio_path, segment_duration=segment_duration):
+                return
+            print(f"💾 音频文件已保存: {audio_path}，用于后续断点续传")
         
         # 使用Whisper进行语音识别（CPU模式，支持进度显示和断点续传）
         model = setup_whisper_model(selected_model_size)
@@ -244,16 +252,11 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
             print("❌ FFmpeg未安装，无法合并字幕到视频")
             print("💡 请安装FFmpeg或使用外部播放器加载字幕文件")
     
-    # 清理临时文件
-    try:
-        # 检查audio_path变量是否存在且文件存在
-        if 'audio_path' in locals() and os.path.exists(audio_path):
-            os.remove(audio_path)
-            print("🧹 临时文件已清理")
-        else:
-            print("📝 无临时音频文件需要清理")
-    except Exception as e:
-        print(f"⚠️ 清理临时文件时出错: {e}")
+    # 不再清理音频文件，保留用于断点续传
+    if 'audio_path' in locals() and os.path.exists(audio_path):
+        print(f"💾 音频文件已保留: {audio_path}，用于后续断点续传")
+    else:
+        print("📝 未找到音频文件")
     
     # 进度文件管理
     progress_file = get_progress_file_path(video_path)
@@ -319,6 +322,9 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         # 程序结束时保存翻译缓存
-        from translator import save_translation_cache, load_translation_cache
+        from translator import save_translation_cache, load_translation_cache, set_current_video_name
+        # 确保当前视频名称已设置
+        if 'video_path' in locals():
+            set_current_video_name(video_path)
         cache_data = load_translation_cache()
         save_translation_cache(cache_data)
