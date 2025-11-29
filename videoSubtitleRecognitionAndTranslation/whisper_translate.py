@@ -541,45 +541,28 @@ def check_translation_quality(translated_text, original_text=None):
 
 def batch_translate(texts, separator="<>"):
     """批量翻译文本，使用指定分隔符连接多个文本进行一次翻译请求
-    优化版本：在批量翻译前后都检查缓存，最大化复用API响应结果"""
+    禁用缓存版本：批量翻译功能不检查缓存，直接进行API翻译"""
     if not texts:
         return []
     
-    # 首先检查每个文本是否已在缓存中，如果是则直接使用缓存结果
-    cached_results = []
-    uncached_texts = []
-    uncached_indices = []
+    # 过滤空文本
+    valid_texts = []
+    valid_indices = []
     
     for i, text in enumerate(texts):
-        if not text or len(text.strip()) < 2:
-            # 空文本或过短文本直接返回原值
-            cached_results.append((i, text))
-            continue
-        
-        # 生成缓存键
-        cache_key = f"jp:zh:{text}"
-        
-        # 检查缓存
-        if cache_key in _translation_cache:
-            cached_result = _translation_cache[cache_key]
-            print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
-            cached_results.append((i, cached_result))
-        else:
-            uncached_texts.append(text)
-            uncached_indices.append(i)
+        if text and len(text.strip()) >= 2:
+            valid_texts.append(text)
+            valid_indices.append(i)
     
-    # 如果所有文本都在缓存中，直接返回结果
-    if not uncached_texts:
-        print(f"📊 批量翻译统计: 全部{len(texts)}个文本均使用缓存，无需API调用")
-        # 按原始顺序排列结果
-        result_dict = dict(cached_results)
-        return [result_dict[i] for i in range(len(texts))]
+    # 如果没有有效文本，直接返回空结果
+    if not valid_texts:
+        return [""] * len(texts)
     
-    print(f"🔄 批量翻译请求: {len(uncached_texts)}个未缓存文本片段，总长度: {len(separator.join(uncached_texts))}字符")
-    print(f"📊 缓存命中率: {len(cached_results)}/{len(texts)} ({len(cached_results)/len(texts)*100:.1f}%)")
+    print(f"🔄 批量翻译请求: {len(valid_texts)}个文本片段，总长度: {len(separator.join(valid_texts))}字符")
+    print(f"📊 批量翻译模式: 禁用缓存，直接进行API翻译")
     
-    # 使用更可靠的分隔符连接未缓存的文本
-    batch_text = separator.join(uncached_texts)
+    # 使用分隔符连接所有文本
+    batch_text = separator.join(valid_texts)
     
     # 调用百度翻译API
     batch_result = baidu_translate(batch_text, max_retries=5)
@@ -588,8 +571,8 @@ def batch_translate(texts, separator="<>"):
     translated_texts = batch_result.split(separator)
     
     # 处理分割结果不匹配的情况
-    if len(translated_texts) != len(uncached_texts):
-        print(f"⚠️  批量翻译结果分割不匹配，原始: {len(uncached_texts)}，翻译: {len(translated_texts)}")
+    if len(translated_texts) != len(valid_texts):
+        print(f"⚠️  批量翻译结果分割不匹配，原始: {len(valid_texts)}，翻译: {len(translated_texts)}")
         print(f"🔍 原始文本: {batch_text[:100]}...")
         print(f"🔍 翻译结果: {batch_result[:100]}...")
         
@@ -600,36 +583,43 @@ def batch_translate(texts, separator="<>"):
             translated_texts = batch_result.split('\n')
             
             # 如果分割后数量仍然不匹配，使用智能分割
-            if len(translated_texts) != len(uncached_texts):
+            if len(translated_texts) != len(valid_texts):
                 print("🔄 使用智能分割策略...")
                 # 基于原文长度比例进行智能分割
-                translated_texts = smart_split_translation(batch_result, uncached_texts)
+                translated_texts = smart_split_translation(batch_result, valid_texts)
         
         # 如果智能分割仍然失败，回退到逐个翻译
-        if len(translated_texts) != len(uncached_texts):
+        if len(translated_texts) != len(valid_texts):
             print("🔄 分割策略失败，回退到逐个翻译...")
             individual_translations = []
-            for text in uncached_texts:
+            for text in valid_texts:
                 translated = baidu_translate(text, max_retries=3)
                 individual_translations.append(translated)
             translated_texts = individual_translations
     else:
         print(f"✅ 批量翻译分割成功: {len(translated_texts)}个结果完美匹配")
     
-    # 组合缓存结果和新翻译结果
-    result_dict = dict(cached_results)
-    for i, (original_index, translated_text) in enumerate(zip(uncached_indices, translated_texts)):
+    # 构建结果字典
+    result_dict = {}
+    
+    # 处理有效文本的翻译结果
+    for i, (original_index, translated_text) in enumerate(zip(valid_indices, translated_texts)):
         result_dict[original_index] = translated_text
         # 记录每个翻译结果的详细信息
         original_text = texts[original_index]
-        print(f"   📝 翻译结果 {i+1}/{len(uncached_texts)}: ")
+        print(f"   📝 翻译结果 {i+1}/{len(valid_texts)}: ")
         print(f"     原文: {original_text}")
         print(f"     翻译: {translated_text}")
+    
+    # 处理空文本或过短文本
+    for i in range(len(texts)):
+        if i not in result_dict:
+            result_dict[i] = texts[i] if texts[i] else ""
     
     # 按原始顺序排列结果
     final_results = [result_dict[i] for i in range(len(texts))]
     
-    print(f"📊 批量翻译完成: 总计{len(texts)}个文本，缓存命中{len(cached_results)}个，API翻译{len(uncached_texts)}个")
+    print(f"📊 批量翻译完成: 总计{len(texts)}个文本，API翻译{len(valid_texts)}个")
     
     return final_results
 
@@ -789,6 +779,7 @@ def generate_bilingual_subtitle_file(transcription_result, output_path, video_pa
             # 执行批量翻译
             if batch_japanese_texts:
                 print(f"\n📦 批量翻译批次 {i//len(batch_segments)+1}: 处理{len(batch_segments)}个片段")
+                print(f"📊 批量翻译模式: 禁用缓存，直接进行API翻译")
                 batch_chinese_texts = batch_translate(batch_japanese_texts, separator)
                 
                 # 处理每个翻译结果
