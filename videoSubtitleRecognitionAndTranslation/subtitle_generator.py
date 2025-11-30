@@ -19,118 +19,73 @@ from progress_manager import save_progress, load_progress, get_progress_file_pat
 # 使用translator模块中的缓存
 _translation_cache = load_translation_cache()
 
-def transcribe_with_whisper(model, audio_path, model_size='medium'):
+def transcribe_with_whisper(model, audio_path, model_size='medium', verbose=False):
     """使用Whisper进行语音识别"""
     # 记录开始时间
     transcribe_start_time = time.time()
-    print(f"🎤 使用Whisper {model_size}模型进行日语识别...")
+    
+    # 根据verbose参数控制输出
+    if verbose is not None:
+        print(f"🎤 使用Whisper {model_size}模型进行日语识别...")
     
     # 已在文件顶部导入必要的库
     
     try:
-        # 获取音频文件时长（用于信息显示，但不再用于估计进度百分比）
+        # 获取音频文件时长（用于信息显示）
         audio_duration = 0
         try:
             with contextlib.closing(wave.open(audio_path, 'r')) as f:
                 frames = f.getnframes()
                 rate = f.getframerate()
                 audio_duration = frames / float(rate)
-                print(f"🎵 音频时长: {audio_duration:.2f}秒")
+                if verbose is not None:
+                    print(f"🎵 音频时长: {audio_duration:.2f}秒")
         except Exception as e:
-            print(f"⚠️ 无法获取音频时长: {e}")
-        
-        # 使用线程来显示实时活动指示器，不再显示不准确的进度百分比
-        stop_event = threading.Event()
-        
-        def activity_thread():
-            start_time = time.time()
-            # 动画字符，用于显示活动状态
-            activity_chars = ["◐", "◑", "◒", "◓", "◔", "◕"]
-            char_index = 0
-            
-            # 加载状态信息
-            status_messages = [
-                "正在加载音频数据...",
-                "正在分析音频特征...",
-                "正在进行语音识别...",
-                "正在处理识别结果..."
-            ]
-            status_index = 0
-            status_update_time = 0
-            
-            while not stop_event.is_set():
-                elapsed = time.time() - start_time
-                char_index = (char_index + 1) % len(activity_chars)
-                
-                # 每5秒更新一次状态信息
-                if elapsed - status_update_time > 5:
-                    status_index = (status_index + 1) % len(status_messages)
-                    status_update_time = elapsed
-                
-                # 显示加载动画和状态信息
-                bar_length = 50
-                # 使用波浪形进度条来表示活动状态
-                wave_position = int(elapsed * 2) % bar_length
-                bar = " " * (wave_position - 2) + activity_chars[char_index] * 3 + " " * (bar_length - wave_position - 1)
-                
-                # 显示经过时间，让用户了解处理持续时间
-                minutes, seconds = divmod(int(elapsed), 60)
-                
-                print(f"\r🔄 处理中 {bar} {status_messages[status_index]} ({minutes:02d}:{seconds:02d})", end="", flush=True)
-                time.sleep(0.2)  # 每200毫秒更新一次，更流畅的动画效果
-        
-        # 启动活动线程
-        thread = threading.Thread(target=activity_thread)
-        thread.daemon = True
-        thread.start()
+            if verbose is not None:
+                print(f"⚠️ 无法获取音频时长: {e}")
         
         try:
-            # 执行语音识别（不使用不支持的progress_callback参数）
-            result = model.transcribe(audio_path, language='ja')
-            
-            # 停止活动线程
-            stop_event.set()
-            thread.join(timeout=0.5)
-            
-            # 完成时显示确认信息，不再显示百分比
-            print(f"\r✅ 语音识别处理完成 [{'█' * 50}]"),
+            # 执行语音识别，使用verbose参数控制输出详细程度
+            # 如果verbose为None，则传递None给model.transcribe
+            result = model.transcribe(audio_path, language='ja', fp16=False, verbose=verbose)
             
             # 验证识别结果
             if result and 'segments' in result and len(result['segments']) > 0:
-                print(f"✅ 语音识别完成: {len(result['segments'])} 个片段")
-                
-                # 显示识别结果摘要
-                total_duration = sum(segment['end'] - segment['start'] for segment in result['segments'])
-                print(f"📊 识别结果摘要:")
-                print(f"   识别片段数: {len(result['segments'])}")
-                print(f"   总识别时长: {total_duration:.2f}秒")
-                
-                # 显示前5个片段示例
-                print(f"📋 前5个片段示例:")
-                for i, segment in enumerate(result['segments'][:5]):
-                    text = segment['text'].strip()
-                    if len(text) > 50:
-                        text = text[:47] + "..."
-                    print(f"   {i+1}. [{format_time(segment['start'])}] {text}")
-                
-                # 记录结束时间并计算总耗时
-                transcribe_end_time = time.time()
-                transcribe_total_time = transcribe_end_time - transcribe_start_time
-                print(f"⏱️ 语音识别耗时: {transcribe_total_time:.2f}秒")
+                if verbose is not None:
+                    print(f"✅ 语音识别完成: {len(result['segments'])} 个片段")
+                    
+                    # 显示识别结果摘要
+                    total_duration = sum(segment['end'] - segment['start'] for segment in result['segments'])
+                    print(f"📊 识别结果摘要:")
+                    print(f"   识别片段数: {len(result['segments'])}")
+                    print(f"   总识别时长: {total_duration:.2f}秒")
+                    
+                    # 显示前5个片段示例
+                    print(f"📋 前5个片段示例:")
+                    for i, segment in enumerate(result['segments'][:5]):
+                        text = segment['text'].strip()
+                        if len(text) > 50:
+                            text = text[:47] + "..."
+                        print(f"   {i+1}. [{format_time(segment['start'])}] {text}")
+                    
+                    # 记录结束时间并计算总耗时
+                    transcribe_end_time = time.time()
+                    transcribe_total_time = transcribe_end_time - transcribe_start_time
+                    print(f"⏱️ 语音识别耗时: {transcribe_total_time:.2f}秒")
                 
                 return result
             else:
-                print("❌ 语音识别失败：无有效片段")
+                if verbose is not None:
+                    print("❌ 语音识别失败：无有效片段")
                 return None
         except Exception as e:
-            # 发生异常时停止活动线程
-            stop_event.set()
-            thread.join(timeout=0.5)
-            print(f"\r❌ 处理中断")
+            if verbose is not None:
+                print(f"❌ 处理中断")
             raise e
             
     except Exception as e:
-        print(f"\n❌ 语音识别异常: {e}")
+        if verbose is not None:
+            print(f"\n❌ 语音识别异常: {e}")
         return None
 
 # 翻译相关函数已在顶部导入

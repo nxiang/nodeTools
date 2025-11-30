@@ -82,7 +82,7 @@ def merge_subtitle_to_video(video_path, subtitle_path, output_path=None, subtitl
         return False
 
 def main(video_path=None, test_mode=None, model_size='medium', enable_translation=True, 
-         output_dir=None, adult_content=False, merge_to_video=False, clean=False, optimize_low_speech=False):
+         output_dir=None, adult_content=False, merge_to_video=False, clean=False, optimize_low_speech=False, verbose=False):
     """主函数"""
     
     # 记录总处理时间开始
@@ -245,7 +245,7 @@ def main(video_path=None, test_mode=None, model_size='medium', enable_translatio
         model = setup_whisper_model(selected_model_size)
         # 记录语音识别开始时间
         recognition_start_time = time.time()
-        result = transcribe_with_whisper(model, audio_path, selected_model_size)
+        result = transcribe_with_whisper(model, audio_path, selected_model_size, verbose=verbose)
         # 记录语音识别完成时间
         time_stats['speech_recognition'] = time.time() - recognition_start_time
         print(f"⏱️  语音识别耗时: {time_stats['speech_recognition']:.2f}秒")
@@ -379,6 +379,8 @@ if __name__ == "__main__":
     parser.add_argument('--clean', action='store_true', help='清理temp目录下除视频文件外的所有文件')
     parser.add_argument('--optimize-low-speech', action='store_true', help='针对低语音量场景优化处理速度（例如2小时视频但说话很少）')
     parser.add_argument('--time-offset', type=float, default=0.0, help='字幕时间偏移（秒），正值表示字幕延迟，负值表示字幕提前')
+    parser.add_argument('--verbose', '-v', action='store_true', help='显示详细的处理信息')
+    parser.add_argument('--quiet', '-q', action='store_true', help='不显示进度条，仅显示错误和最终结果')
     
     args = parser.parse_args()
     
@@ -392,6 +394,12 @@ if __name__ == "__main__":
         print("💡  请安装FFmpeg：https://ffmpeg.org/download.html")
         print("💡  或者使用外部播放器加载独立的字幕文件")
     
+    # 设置verbose参数，考虑--quiet和--verbose参数的优先级
+    # 如果指定了--quiet，则不显示任何输出（verbose=None）
+    # 如果指定了--verbose，则显示详细信息（verbose=True）
+    # 默认情况下显示进度条（verbose=False）
+    verbose_value = None if args.quiet else (True if args.verbose else False)
+    
     try:
         main(
             video_path=args.video_path,
@@ -402,7 +410,8 @@ if __name__ == "__main__":
             adult_content=args.adult,
             merge_to_video=args.merge,
             clean=args.clean,
-            optimize_low_speech=getattr(args, 'optimize_low_speech', False)
+            optimize_low_speech=getattr(args, 'optimize_low_speech', False),
+            verbose=verbose_value
         )
     except KeyboardInterrupt:
         print("\n\n🛑 程序已被用户中断")
