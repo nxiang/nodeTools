@@ -129,8 +129,22 @@ def transcribe_with_whisper(model, audio_path, model_size='medium'):
 # 翻译相关函数已在顶部导入
 
 def generate_bilingual_subtitle_file(video_path, transcription_result, 
-                                   enable_translation=True, adult_content=False, progress=None):
-    """生成双语字幕文件"""
+                                   enable_translation=True, adult_content=False, progress=None, 
+                                   time_offset=0.0):
+    """生成双语字幕文件
+    
+    Args:
+        video_path: 视频文件路径
+        transcription_result: 语音识别结果
+        enable_translation: 是否启用翻译
+        adult_content: 是否为成人内容
+        progress: 进度信息
+        time_offset: 字幕时间偏移（秒），正值表示字幕延迟，负值表示字幕提前
+    """
+    # 更新全局时间偏移参数
+    global SUBTITLE_TIME_OFFSET
+    SUBTITLE_TIME_OFFSET = time_offset
+    
     # 获取当前时间作为开始处理时间
     start_time = time.time()
     print(f"🔄 开始生成双语字幕，视频路径: {video_path}")
@@ -282,8 +296,8 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                 
                 # 优先尝试批量翻译所有未缓存的文本
                 try:
-                    # 调用批量翻译API
-                    combined_result = batch_translate(uncached_texts, separator)
+                    # 正确调用批量翻译API，添加show_individual_logs=False参数以隐藏单独翻译日志
+                    combined_result = batch_translate(uncached_texts, False, show_individual_logs=False)  # 默认为非成人内容，隐藏单独翻译日志
                     
                     # 检查返回结果类型，如果是字符串则进行分割
                     if isinstance(combined_result, str):
@@ -325,8 +339,10 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                     elif api_translated:
                         # 批量翻译结果部分可用
                         print(f"⚠️ 批量翻译结果数量不匹配: {len(api_translated)} != {len(uncached_texts)}")
+                        print(f"🔄 优先处理批量翻译成功的部分，剩余部分降级到单独翻译")
                         
-                        # 使用可用的批量翻译结果
+                        # 使用可用的批量翻译结果（保持批量优先原则）
+                        successful_batch_count = 0
                         for text_idx, idx in enumerate(uncached_indices):
                             if text_idx < len(api_translated):
                                 japanese_text = batch_japanese_texts[idx]
@@ -345,41 +361,51 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
                                         'trans_result': [{'src': japanese_text, 'dst': api_translated[text_idx]}]
                                     }
                                 }
-                                print(f"✅ 使用批量翻译部分结果: {japanese_text[:30]}{'...' if len(japanese_text) > 30 else ''} -> {api_translated[text_idx][:30]}{'...' if len(api_translated[text_idx]) > 30 else ''}")
-                            else:
-                                # 对于超出部分，使用单独翻译
+                                print(f"✅ 使用批量翻译结果: {japanese_text[:30]}{'...' if len(japanese_text) > 30 else ''} -> {api_translated[text_idx][:30]}{'...' if len(api_translated[text_idx]) > 30 else ''}")
+                                successful_batch_count += 1
+                        
+                        # 对于超出部分，作为批量翻译失败的降级处理
+                        failed_batch_count = len(uncached_texts) - successful_batch_count
+                        if failed_batch_count > 0:
+                            print(f"📊 批量翻译部分成功({successful_batch_count}/{len(uncached_texts)})，开始降级处理剩余{failed_batch_count}个文本")
+                            for text_idx, idx in enumerate(uncached_indices[successful_batch_count:]):
                                 try:
                                     japanese_text = batch_japanese_texts[idx]
                                     cache_key = f"jp:zh:{japanese_text}"
+                                    print(f"🔄 降级处理: {japanese_text[:30]}{'...' if len(japanese_text) > 30 else ''}")
                                     chinese_text = baidu_translate(japanese_text, max_retries=3)
                                     # 确保单独翻译结果也干净
                                     chinese_text = chinese_text.replace(separator, '')
                                     batch_chinese_texts[idx] = chinese_text
                                     # 使用baidu_translate函数已经保存了正确格式的缓存，这里不需要重复保存
-                                    # 精简日志输出
                                 except Exception as inner_e:
-                                    print(f"❌ 单独翻译失败: {japanese_text[:30]}... - {inner_e}")
+                                    print(f"❌ 降级翻译失败: {japanese_text[:30]}... - {inner_e}")
                                     batch_chinese_texts[idx] = "[翻译失败]"
                 except Exception as e:
-                    # 批量翻译异常，尝试使用单独翻译
-                    print(f"⚠️ 批量翻译异常: {e}")
-                    print(f"📊 降级到单独翻译")
+                    # 批量翻译异常，这是预期外的错误情况，进行降级处理
+                    print(f"❌ 批量翻译异常: {e}")
+                    print(f"🔄 按设计降级到单独翻译作为备选方案")
+                    print(f"📊 批量翻译策略: 批量优先保证语义连贯，单独翻译作为降级备份")
                     
-                    # 使用单独翻译
+                    # 严格作为批量翻译失败的降级处理
+                    success_count = 0
                     for idx in uncached_indices:
                         japanese_text = batch_japanese_texts[idx]
                         cache_key = f"jp:zh:{japanese_text}"
                         try:
-                            # 对于单独翻译，增加重试次数以提高成功率
+                            print(f"🔄 降级翻译: {japanese_text[:30]}{'...' if len(japanese_text) > 30 else ''}")
+                            # 对于降级翻译，增加重试次数以提高成功率
                             chinese_text = baidu_translate(japanese_text, max_retries=5)
                             # 清理单独翻译结果中的<SEP>分隔符
                             chinese_text = chinese_text.replace(separator, '')
                             batch_chinese_texts[idx] = chinese_text
+                            success_count += 1
                             # 使用baidu_translate函数已经保存了正确格式的缓存，这里不需要重复保存
-                            # 精简日志输出
                         except Exception as inner_e:
-                            print(f"❌ 单独翻译失败: {japanese_text[:30]}... - {inner_e}")
+                            print(f"❌ 降级翻译失败: {japanese_text[:30]}... - {inner_e}")
                             batch_chinese_texts[idx] = "[翻译失败]"
+                    
+                    print(f"📊 降级翻译完成: 成功{success_count}/{len(uncached_indices)}个文本")
             else:
                 # 所有文本都在缓存中
                 if batch_count == 0:
@@ -432,10 +458,15 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
         print(f"\r📊 翻译进度: [{progress_bar}] {progress_percent}% ({i}/{total_segments})", end="", flush=True)
         
         # 添加延迟避免请求过快，但对于批量翻译减少延迟以提高效率
-        if len(uncached_texts) > 0:
+        # 在完全复用翻译结果时（全部使用缓存）不添加延迟，提高处理速度
+        # 明确检查是否有未缓存文本需要翻译
+        if len(uncached_texts) > 0 and cached_count < len(batch_japanese_texts):
+            # 只有在确实有文本需要通过API翻译时才添加延迟
             time.sleep(0.3)  # 批量翻译后稍微减少延迟
+            print(f"⏱️ 添加翻译延迟: {0.3}秒 (存在{len(uncached_texts)}个未缓存文本)")
         else:
-            time.sleep(0.1)  # 全部使用缓存时减少延迟
+            # 完全复用翻译结果时，不添加任何延迟
+            print("🚀 完全复用翻译缓存，无延迟处理")
         
         # 实时保存进度到磁盘（每批保存一次）
         if video_path:
@@ -503,32 +534,53 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
     print(f"✅ 双语字幕文件已生成: {output_path}")
     return True
 
-def format_time(seconds):
-    """将秒数格式化为SRT时间格式"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    seconds = seconds % 60
-    milliseconds = int((seconds - int(seconds)) * 1000)
-    
-    return f"{hours:02d}:{minutes:02d}:{int(seconds):02d},{milliseconds:03d}"
+# 全局时间偏移参数（秒），可根据需要调整
+SUBTITLE_TIME_OFFSET = 0.0  # 正值表示字幕延迟，负值表示字幕提前
 
-def generate_japanese_only_subtitle(transcription_result, output_path):
-    """仅生成日语字幕"""
-    if not transcription_result or 'segments' not in transcription_result:
-        print("❌ 无效的识别结果")
-        return False
+def format_time(seconds):
+    """将秒数格式化为SRT时间格式，支持时间偏移调整"""
+    # 应用时间偏移，确保不会出现负时间
+    adjusted_seconds = max(0, seconds + SUBTITLE_TIME_OFFSET)
     
-    segments = transcription_result['segments']
+    hours = int(adjusted_seconds // 3600)
+    minutes = int((adjusted_seconds % 3600) // 60)
+    adjusted_seconds = adjusted_seconds % 60
+    milliseconds = int((adjusted_seconds - int(adjusted_seconds)) * 1000)
     
-    srt_content = ""
-    for i, segment in enumerate(segments):
-        start_time = format_time(segment['start'])
-        end_time = format_time(segment['end'])
-        japanese_text = segment['text'].strip()
+    return f"{hours:02d}:{minutes:02d}:{int(adjusted_seconds):02d},{milliseconds:03d}"
+
+def generate_japanese_only_subtitle(transcription_result, output_path, time_offset=0.0):
+    """仅生成日语字幕
+    
+    Args:
+        transcription_result: 语音识别结果
+        output_path: 输出文件路径
+        time_offset: 字幕时间偏移（秒），正值表示字幕延迟，负值表示字幕提前
+    """
+    # 更新全局时间偏移参数
+    global SUBTITLE_TIME_OFFSET
+    original_offset = SUBTITLE_TIME_OFFSET  # 保存原始偏移值
+    SUBTITLE_TIME_OFFSET = time_offset
+    
+    try:
+        if not transcription_result or 'segments' not in transcription_result:
+            print("❌ 无效的识别结果")
+            return False
         
-        srt_content += f"{i+1}\n"
-        srt_content += f"{start_time} --> {end_time}\n"
-        srt_content += f"{japanese_text}\n\n"
+        segments = transcription_result['segments']
+        
+        srt_content = ""
+        for i, segment in enumerate(segments):
+            start_time = format_time(segment['start'])
+            end_time = format_time(segment['end'])
+            japanese_text = segment['text'].strip()
+            
+            srt_content += f"{i+1}\n"
+            srt_content += f"{start_time} --> {end_time}\n"
+            srt_content += f"{japanese_text}\n\n"    
+    finally:
+        # 恢复原始偏移值
+        SUBTITLE_TIME_OFFSET = original_offset
     
     # 写入文件
     with open(output_path, 'w', encoding='utf-8') as f:

@@ -88,8 +88,15 @@ def save_translation_cache(cache=None):
         print(f"❌ 保存翻译缓存失败: {e}")
         return False
 
-def baidu_translate(text, adult_content=False, max_retries=3):
-    """使用百度翻译API翻译文本"""
+def baidu_translate(text, adult_content=False, max_retries=3, show_individual_logs=True):
+    """使用百度翻译API翻译文本
+    
+    Args:
+        text: 要翻译的文本
+        adult_content: 是否处理成人内容
+        max_retries: 最大重试次数
+        show_individual_logs: 是否显示翻译成功的单条日志
+    """
     global _translation_cache
     
     # 标准缓存键格式
@@ -175,10 +182,16 @@ def baidu_translate(text, adult_content=False, max_retries=3):
     
     for retry in range(retry_count):
         try:
+            print(f"📤 发送百度翻译API请求: 文本='{text[:20]}{'...' if len(text) > 20 else ''}' 请求方式={request_method.upper()}")
+            
             if request_method == 'post':
                 response = requests.post(url, data=data, headers=headers, timeout=10)
             else:
                 response = requests.get(url, params=params, timeout=10)
+            
+            print(f"📥 收到百度翻译API响应: 状态码={response.status_code}")
+            
+            result = response.json()
             
             result = response.json()
             
@@ -187,6 +200,8 @@ def baidu_translate(text, adult_content=False, max_retries=3):
                 print(f"❌ 百度翻译API错误: {result.get('error_code')} - {result.get('error_msg')}")
                 time.sleep(retry_delay)
                 continue
+            
+            print(f"📊 百度翻译API响应正常: 成功获取翻译结果")
             
             # 提取翻译结果（适配不同API返回格式）
             if 'trans_result' in result and isinstance(result['trans_result'], list) and result['trans_result']:
@@ -237,12 +252,113 @@ def process_adult_content(text):
     
     return processed_text
 
-def batch_translate(text_list, adult_content=False):
-    """批量翻译文本列表"""
+def batch_translate(text_list, adult_content=False, show_individual_logs=False):
+    """批量翻译文本列表，优化缓存命中的处理速度
+    
+    Args:
+        text_list: 要翻译的文本列表
+        adult_content: 是否处理成人内容
+        show_individual_logs: 是否显示每条翻译的单独日志，批量模式下建议设为False
+    """
     translated_results = []
+    
+    # 在开始处理前，预先统计真正存在的缓存命中数量
+    pre_existing_cache_count = 0
+    unique_texts = set()
     for text in text_list:
-        translated = baidu_translate(text, adult_content)
-        translated_results.append(translated)
+        if text not in unique_texts:
+            cache_key = f"jp:zh:{text}"
+            if cache_key in _translation_cache:
+                pre_existing_cache_count += 1
+            unique_texts.add(text)
+    
+    # 分组处理：缓存命中和需要API翻译的文本
+    cache_hits = 0
+    api_calls = 0
+    
+    # 首先处理缓存命中的文本，并收集需要API翻译的文本和它们在原列表中的位置
+    texts_to_translate = []
+    positions_to_fill = []
+    
+    for i, text in enumerate(text_list):
+        cache_key = f"jp:zh:{text}"
+        
+        # 直接在缓存中查找
+        if cache_key in _translation_cache:
+            cached_result = _translation_cache[cache_key]
+            # 处理不同格式的缓存数据
+            if isinstance(cached_result, dict) and 'response_result' in cached_result and 'trans_result' in cached_result['response_result']:
+                if cached_result['response_result']['trans_result']:
+                    result = cached_result['response_result']['trans_result'][0].get('dst', '')
+                    if show_individual_logs:
+                        print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
+                    cache_hits += 1
+                    translated_results.append(result)
+                    continue
+            elif isinstance(cached_result, str):
+                if show_individual_logs:
+                    print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
+                cache_hits += 1
+                translated_results.append(cached_result)
+                continue
+            elif isinstance(cached_result, dict) and 'result' in cached_result:
+                if show_individual_logs:
+                    print(f"✅ 使用缓存的翻译结果: {text[:20]}{'...' if len(text) > 20 else ''}")
+                cache_hits += 1
+                translated_results.append(cached_result['result'])
+                continue
+        
+        # 缓存未命中，添加到待翻译列表和位置记录
+        texts_to_translate.append(text)
+        translated_results.append(None)  # 先添加占位符
+        positions_to_fill.append(i)
+    
+    # 如果有需要API翻译的文本，使用<>拼接并一次性发送给百度API
+    if texts_to_translate:
+        print(f"📤 开始批量API翻译: {len(texts_to_translate)} 条文本待翻译")
+        
+        # 使用<>拼接所有待翻译文本
+        concatenated_text = "<>" .join(texts_to_translate)
+        
+        # 调用baidu_translate进行一次性翻译
+        # 注意：这里设置show_individual_logs=False，确保批量翻译过程中不显示单条日志
+        translated_batch = baidu_translate(concatenated_text, adult_content, show_individual_logs=False)
+        api_calls += 1
+        
+        # 拆分翻译结果并填充到对应的位置
+        translated_parts = translated_batch.split("<>")
+        
+        # 处理翻译结果拆分可能不匹配的情况
+        if len(translated_parts) != len(texts_to_translate):
+            print(f"⚠️  批量翻译结果拆分不匹配: 预期{len(texts_to_translate)}条，实际{len(translated_parts)}条")
+            # 降级策略：对每个文本单独调用baidu_translate函数进行翻译
+            print(f"🔄 降级为单独翻译模式")
+            for i, pos in enumerate(positions_to_fill):
+                try:
+                    # 对每个文本单独调用翻译函数
+                    individual_translated = baidu_translate(texts_to_translate[i], adult_content, show_individual_logs=False)
+                    translated_results[pos] = individual_translated
+                    # 更新缓存
+                    cache_key = f"jp:zh:{texts_to_translate[i]}"
+                    _translation_cache[cache_key] = individual_translated
+                    api_calls += 1  # 每个单独翻译也算一次API调用
+                except Exception as e:
+                    print(f"❌ 单独翻译失败: {texts_to_translate[i][:20]}{'...' if len(texts_to_translate[i]) > 20 else ''}, 错误: {str(e)}")
+                    # 失败时使用原文本作为后备
+                    translated_results[pos] = texts_to_translate[i]
+        else:
+            # 正常情况：将每个翻译结果填充到对应的位置
+            for i, pos in enumerate(positions_to_fill):
+                translated_results[pos] = translated_parts[i]
+                # 更新缓存
+                cache_key = f"jp:zh:{texts_to_translate[i]}"
+                _translation_cache[cache_key] = translated_parts[i]
+        
+        print(f"📥 批量API翻译完成: {len(texts_to_translate)} 条文本已翻译")
+    
+    # 打印批量翻译的总体统计信息，使用预先统计的真正缓存命中数量
+    print(f"📊 批量翻译完成: 总计 {len(text_list)} 条，缓存命中 {pre_existing_cache_count} 条，API调用 {api_calls} 条")
+    
     return translated_results
 
 def check_translation_quality(original_text, translated_text):

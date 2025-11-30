@@ -159,6 +159,8 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     print(f"🔬 测试模式: {'开启' if test_mode else '关闭'}")
     print(f"🔧 使用Whisper {selected_model_size}模型 {'+ 百度翻译API' if enable_translation else ''}")
     print(f"⚡ 低语音量优化: {'启用' if optimize_low_speech else '禁用'} {'(仅处理有语音的部分)' if optimize_low_speech else ''}")
+    if enable_translation and args.time_offset != 0:
+        print(f"⏱️  字幕时间偏移: {args.time_offset}秒 {'(延迟)' if args.time_offset > 0 else '(提前)'}")
     
     # 创建临时目录
     temp_dir = "temp"
@@ -230,10 +232,15 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     
     if enable_translation:
         success = generate_bilingual_subtitle_file(video_path, result, enable_translation=True, 
-                                                 adult_content=adult_content, progress=progress)
+                                                 adult_content=adult_content, progress=progress, 
+                                                 time_offset=args.time_offset)
+        if args.time_offset != 0:
+            print(f"⏱️  字幕时间偏移已设置: {args.time_offset}秒")
     else:
         # 仅生成日语字幕
-        success = generate_japanese_only_subtitle(result, subtitle_path)
+        success = generate_japanese_only_subtitle(result, subtitle_path, time_offset=args.time_offset)
+        if args.time_offset != 0:
+            print(f"⏱️  字幕时间偏移已设置: {args.time_offset}秒")
     
     if success:
         # 显示识别结果摘要
@@ -308,6 +315,7 @@ if __name__ == "__main__":
     parser.add_argument('--merge', action='store_true', help='将字幕合并到视频文件中（需要FFmpeg）')
     parser.add_argument('--clean', action='store_true', help='清理temp目录下除视频文件外的所有文件')
     parser.add_argument('--optimize-low-speech', action='store_true', help='针对低语音量场景优化处理速度（例如2小时视频但说话很少）')
+    parser.add_argument('--time-offset', type=float, default=0.0, help='字幕时间偏移（秒），正值表示字幕延迟，负值表示字幕提前')
     
     args = parser.parse_args()
     
