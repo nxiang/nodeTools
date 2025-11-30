@@ -260,6 +260,9 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
         adult_content: 是否处理成人内容
         show_individual_logs: 是否显示每条翻译的单独日志，批量模式下建议设为False
     """
+    # 定义百度翻译API的最大字符限制
+    MAX_CHAR_LIMIT = 6000
+    
     translated_results = []
     
     # 在开始处理前，预先统计真正存在的缓存命中数量
@@ -313,17 +316,67 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
         translated_results.append(None)  # 先添加占位符
         positions_to_fill.append(i)
     
-    # 如果有需要API翻译的文本，使用<>拼接并一次性发送给百度API
+    # 如果有需要API翻译的文本，进行批量翻译
     if texts_to_translate:
         print(f"📤 开始批量API翻译: {len(texts_to_translate)} 条文本待翻译")
         
         # 使用<>拼接所有待翻译文本
         concatenated_text = "<>" .join(texts_to_translate)
         
-        # 调用baidu_translate进行一次性翻译
-        # 注意：这里设置show_individual_logs=False，确保批量翻译过程中不显示单条日志
-        translated_batch = baidu_translate(concatenated_text, adult_content, show_individual_logs=False)
-        api_calls += 1
+        # 检查是否超出百度翻译API的字符限制
+        if len(concatenated_text) > MAX_CHAR_LIMIT:
+            print(f"⚠️  拼接后的文本超出字符限制: {len(concatenated_text)} > {MAX_CHAR_LIMIT} 字符")
+            print(f"🔄 开始分批翻译处理")
+            
+            # 分批处理文本
+            batches = []
+            current_batch = []
+            current_batch_size = 0
+            separator_length = len("<>")
+            
+            for text in texts_to_translate:
+                text_length = len(text)
+                # 如果添加当前文本会导致批次超出限制，则将当前批次加入批次列表并开始新批次
+                if current_batch_size + text_length + (separator_length if current_batch else 0) > MAX_CHAR_LIMIT:
+                    if current_batch:  # 确保当前批次不为空
+                        batches.append(current_batch)
+                        current_batch = []
+                        current_batch_size = 0
+                # 添加文本到当前批次
+                current_batch.append(text)
+                current_batch_size += text_length + (separator_length if current_batch_size > 0 else 0)
+            
+            # 添加最后一个批次
+            if current_batch:
+                batches.append(current_batch)
+            
+            print(f"📊 文本已分成 {len(batches)} 个批次进行翻译")
+            
+            # 处理每个批次
+            all_translated_parts = []
+            for i, batch in enumerate(batches):
+                print(f"📦 处理翻译批次 {i+1}/{len(batches)}: {len(batch)} 条文本")
+                batch_text = "<>" .join(batch)
+                print(f"   批次字符数: {len(batch_text)}")
+                
+                # 翻译当前批次
+                batch_translated = baidu_translate(batch_text, adult_content, show_individual_logs=False)
+                api_calls += 1
+                
+                # 拆分批次翻译结果
+                batch_translated_parts = batch_translated.split("<>")
+                all_translated_parts.extend(batch_translated_parts)
+            
+            # 合并所有批次的翻译结果
+            translated_parts = all_translated_parts
+        else:
+            # 未超出字符限制，直接进行一次性翻译
+            print(f"📊 当前文本字符数: {len(concatenated_text)}，未超出限制")
+            translated_batch = baidu_translate(concatenated_text, adult_content, show_individual_logs=False)
+            api_calls += 1
+            
+            # 拆分翻译结果
+            translated_parts = translated_batch.split("<>")
         
         # 拆分翻译结果并填充到对应的位置
         translated_parts = translated_batch.split("<>")

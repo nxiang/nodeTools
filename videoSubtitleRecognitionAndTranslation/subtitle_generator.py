@@ -21,6 +21,8 @@ _translation_cache = load_translation_cache()
 
 def transcribe_with_whisper(model, audio_path, model_size='medium'):
     """使用Whisper进行语音识别"""
+    # 记录开始时间
+    transcribe_start_time = time.time()
     print(f"🎤 使用Whisper {model_size}模型进行日语识别...")
     
     # 已在文件顶部导入必要的库
@@ -111,6 +113,11 @@ def transcribe_with_whisper(model, audio_path, model_size='medium'):
                         text = text[:47] + "..."
                     print(f"   {i+1}. [{format_time(segment['start'])}] {text}")
                 
+                # 记录结束时间并计算总耗时
+                transcribe_end_time = time.time()
+                transcribe_total_time = transcribe_end_time - transcribe_start_time
+                print(f"⏱️ 语音识别耗时: {transcribe_total_time:.2f}秒")
+                
                 return result
             else:
                 print("❌ 语音识别失败：无有效片段")
@@ -141,6 +148,9 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
         progress: 进度信息
         time_offset: 字幕时间偏移（秒），正值表示字幕延迟，负值表示字幕提前
     """
+    # 记录开始时间
+    subtitle_start_time = time.time()
+    
     # 更新全局时间偏移参数
     global SUBTITLE_TIME_OFFSET
     SUBTITLE_TIME_OFFSET = time_offset
@@ -531,6 +541,10 @@ def generate_bilingual_subtitle_file(video_path, transcription_result,
             set_current_video_name(video_path)
         save_translation_cache(_translation_cache)
     
+    # 记录结束时间并计算总耗时
+    subtitle_end_time = time.time()
+    subtitle_total_time = subtitle_end_time - subtitle_start_time
+    print(f"⏱️ 字幕生成耗时: {subtitle_total_time:.2f}秒")
     print(f"✅ 双语字幕文件已生成: {output_path}")
     return True
 

@@ -85,6 +85,18 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
          output_dir=None, adult_content=False, merge_to_video=False, clean=False, optimize_low_speech=False):
     """主函数"""
     
+    # 记录总处理时间开始
+    total_start_time = time.time()
+    
+    # 初始化各阶段耗时统计字典
+    time_stats = {
+        'total': 0,
+        'audio_extraction': 0,
+        'speech_recognition': 0,
+        'subtitle_generation': 0,
+        'subtitle_merging': 0
+    }
+    
     # 显示程序标题
     print_section_header("视频字幕识别与翻译工具")
     
@@ -192,6 +204,8 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
         else:
             # 测试模式下只提取前60秒音频
             segment_duration = 60 if test_mode else None
+            # 记录音频提取开始时间
+            audio_start_time = time.time()
             # 提取音频，启用低语音量优化
             extract_result = extract_audio_segment(video_path, audio_path, segment_duration=segment_duration, optimize_for_low_speech=optimize_low_speech)
             # 兼容原函数返回值
@@ -202,7 +216,10 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
                 
             if not audio_success:
                 return
+            # 记录音频提取完成时间
+            time_stats['audio_extraction'] = time.time() - audio_start_time
             print(f"💾 音频文件已保存: {audio_path}，用于后续断点续传")
+            print(f"⏱️  音频提取耗时: {time_stats['audio_extraction']:.2f}秒")
             
             # 如果有语音段信息，保存到进度中
             if speech_segments:
@@ -211,7 +228,12 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
         
         # 使用Whisper进行语音识别（CPU模式，支持进度显示和断点续传）
         model = setup_whisper_model(selected_model_size)
+        # 记录语音识别开始时间
+        recognition_start_time = time.time()
         result = transcribe_with_whisper(model, audio_path, selected_model_size)
+        # 记录语音识别完成时间
+        time_stats['speech_recognition'] = time.time() - recognition_start_time
+        print(f"⏱️  语音识别耗时: {time_stats['speech_recognition']:.2f}秒")
     
     if not result:
         return
@@ -230,6 +252,9 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     }
     save_progress(video_path, progress_data)
     
+    # 记录字幕生成开始时间
+    subtitle_start_time = time.time()
+    
     if enable_translation:
         success = generate_bilingual_subtitle_file(video_path, result, enable_translation=True, 
                                                  adult_content=adult_content, progress=progress, 
@@ -241,6 +266,10 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
         success = generate_japanese_only_subtitle(result, subtitle_path, time_offset=args.time_offset)
         if args.time_offset != 0:
             print(f"⏱️  字幕时间偏移已设置: {args.time_offset}秒")
+    
+    # 记录字幕生成完成时间
+    time_stats['subtitle_generation'] = time.time() - subtitle_start_time
+    print(f"⏱️  字幕生成耗时: {time_stats['subtitle_generation']:.2f}秒")
     
     if success:
         # 显示识别结果摘要
@@ -273,6 +302,9 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
             # 确定字幕语言
             subtitle_language = 'chi' if enable_translation else 'jpn'
             
+            # 记录字幕合并开始时间
+            merge_start_time = time.time()
+            
             # 合并字幕到视频
             merge_success = merge_subtitle_to_video(
                 video_path=video_path,
@@ -280,9 +312,13 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
                 subtitle_language=subtitle_language
             )
             
+            # 记录字幕合并完成时间
+            time_stats['subtitle_merging'] = time.time() - merge_start_time
+            
             if merge_success:
                 print("✅ 字幕已成功嵌入视频文件中")
                 print("💡 播放时可在播放器字幕菜单中选择内置字幕")
+                print(f"⏱️  字幕合并耗时: {time_stats['subtitle_merging']:.2f}秒")
             else:
                 print("⚠️ 字幕合并失败，保留独立的字幕文件")
         else:
@@ -297,7 +333,19 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     if not clean and os.path.exists(progress_file):
         print("📁 进度文件已保留，用于后续断点续传")
     
+    # 计算总处理时间
+    time_stats['total'] = time.time() - total_start_time
+    
+    # 显示各阶段耗时统计
     print_section_header("处理完成")
+    print("⏱️  处理阶段耗时统计（秒）:")
+    print(f"   - 音频提取: {time_stats['audio_extraction']:.2f}秒")
+    print(f"   - 语音识别: {time_stats['speech_recognition']:.2f}秒")
+    print(f"   - 字幕生成: {time_stats['subtitle_generation']:.2f}秒")
+    if merge_to_video:
+        print(f"   - 字幕合并: {time_stats['subtitle_merging']:.2f}秒")
+    print(f"   - 总处理时间: {time_stats['total']:.2f}秒")
+    
     print_success("视频字幕处理已完成！")
 
 if __name__ == "__main__":
