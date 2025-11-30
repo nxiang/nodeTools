@@ -81,7 +81,7 @@ def merge_subtitle_to_video(video_path, subtitle_path, output_path=None, subtitl
         print(f"❌ 合并过程中出现错误: {e}")
         return False
 
-def main(video_path=None, test_mode=True, model_size='medium', enable_translation=True, 
+def main(video_path=None, test_mode=None, model_size='medium', enable_translation=True, 
          output_dir=None, adult_content=False, merge_to_video=False, clean=False, optimize_low_speech=False):
     """主函数"""
     
@@ -168,7 +168,7 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     
     print(f"🚀 开始处理视频: {video_path}")
     print(f"🌐 识别语言: 日语 → {'中文' if enable_translation else '仅识别'}")
-    print(f"🔬 测试模式: {'开启' if test_mode else '关闭'}")
+    print(f"🔬 测试模式: {'开启' if test_mode else '关闭'} {'(' + str(test_mode) + '% 视频内容)' if test_mode else ''}")
     print(f"🔧 使用Whisper {selected_model_size}模型 {'+ 百度翻译API' if enable_translation else ''}")
     print(f"⚡ 低语音量优化: {'启用' if optimize_low_speech else '禁用'} {'(仅处理有语音的部分)' if optimize_low_speech else ''}")
     if enable_translation and args.time_offset != 0:
@@ -202,8 +202,23 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
             print(f"✅ 发现已存在的音频文件: {audio_path}，跳过提取步骤")
             speech_segments = None
         else:
-            # 测试模式下只提取前60秒音频
-            segment_duration = 60 if test_mode else None
+            # 测试模式下根据视频总时长的百分比计算提取时长
+            segment_duration = None
+            if test_mode:
+                try:
+                    # 使用ffprobe获取视频总时长
+                    import subprocess
+                    duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 
+                                   'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
+                    duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
+                    if duration_result.returncode == 0:
+                        total_duration = float(duration_result.stdout.strip())
+                        # 计算测试时长（总时长的N%）
+                        segment_duration = total_duration * (test_mode / 100)
+                        print(f"🔬 测试模式：提取前 {test_mode}% 的视频内容（约 {segment_duration:.2f} 秒）")
+                except Exception as e:
+                    print(f"⚠️ 获取视频时长失败: {e}，默认使用前60秒进行测试")
+                    segment_duration = 60
             # 记录音频提取开始时间
             audio_start_time = time.time()
             # 提取音频，启用低语音量优化
@@ -354,7 +369,7 @@ if __name__ == "__main__":
     # 命令行参数解析
     parser = argparse.ArgumentParser(description='视频字幕识别与翻译工具')
     parser.add_argument('video_path', nargs='?', help='视频文件路径')
-    parser.add_argument('--test', action='store_true', help='测试模式（仅处理前10%%内容）')
+    parser.add_argument('--test', type=int, default=None, nargs='?', const=10, choices=range(1, 101), help='测试模式：指定语音识别前N%%视频时间长度（1-100，默认10）')
     parser.add_argument('--model', default='medium', choices=['tiny', 'base', 'small', 'medium', 'large'],
                         help='Whisper模型大小（默认：medium）')
     parser.add_argument('--no-translate', action='store_true', help='仅识别不翻译')
@@ -380,7 +395,7 @@ if __name__ == "__main__":
     try:
         main(
             video_path=args.video_path,
-            test_mode=args.test,
+            test_mode=args.test,  # 传入整数值而不是布尔值
             model_size=args.model,
             enable_translation=not args.no_translate,
             output_dir=args.output_dir,
