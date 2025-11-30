@@ -82,7 +82,7 @@ def merge_subtitle_to_video(video_path, subtitle_path, output_path=None, subtitl
         return False
 
 def main(video_path=None, test_mode=True, model_size='medium', enable_translation=True, 
-         output_dir=None, adult_content=False, merge_to_video=False, clean_progress=False):
+         output_dir=None, adult_content=False, merge_to_video=False, clean=False, optimize_low_speech=False):
     """主函数"""
     
     # 显示程序标题
@@ -105,6 +105,28 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     print(f"   - 模型: {', '.join(config_summary['models'])}")
     print(f"   - 缓存: {'启用' if config_summary['system']['cache_enabled'] else '禁用'}")
     print(f"   - 临时目录: {config_summary['system']['temp_dir']}")
+    
+    # 清理模式：在程序开始时删除temp目录下除视频文件外的所有文件
+    if clean:
+        try:
+            video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv']
+            temp_dir = "temp"
+            files_cleaned = 0
+            
+            if os.path.exists(temp_dir):
+                for file in os.listdir(temp_dir):
+                    file_path = os.path.join(temp_dir, file)
+                    # 只删除文件，不删除子目录
+                    if os.path.isfile(file_path):
+                        # 检查是否是视频文件
+                        is_video = any(file.lower().endswith(ext) for ext in video_extensions)
+                        if not is_video:
+                            os.remove(file_path)
+                            files_cleaned += 1
+            
+            print(f"🧹 已清理temp目录中{files_cleaned}个非视频文件")
+        except Exception as e:
+            print(f"⚠️ 清理temp目录失败: {e}")
     
     # 如果没有指定视频文件，查找当前目录下的视频文件
     if not video_path:
@@ -136,6 +158,7 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     print(f"🌐 识别语言: 日语 → {'中文' if enable_translation else '仅识别'}")
     print(f"🔬 测试模式: {'开启' if test_mode else '关闭'}")
     print(f"🔧 使用Whisper {selected_model_size}模型 {'+ 百度翻译API' if enable_translation else ''}")
+    print(f"⚡ 低语音量优化: {'启用' if optimize_low_speech else '禁用'} {'(仅处理有语音的部分)' if optimize_low_speech else ''}")
     
     # 创建临时目录
     temp_dir = "temp"
@@ -163,12 +186,26 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
         # 检查是否已有音频文件，避免重复提取
         if os.path.exists(audio_path):
             print(f"✅ 发现已存在的音频文件: {audio_path}，跳过提取步骤")
+            speech_segments = None
         else:
             # 测试模式下只提取前60秒音频
             segment_duration = 60 if test_mode else None
-            if not extract_audio_segment(video_path, audio_path, segment_duration=segment_duration):
+            # 提取音频，启用低语音量优化
+            extract_result = extract_audio_segment(video_path, audio_path, segment_duration=segment_duration, optimize_for_low_speech=optimize_low_speech)
+            # 兼容原函数返回值
+            if isinstance(extract_result, tuple):
+                audio_success, speech_segments = extract_result
+            else:
+                audio_success, speech_segments = extract_result, None
+                
+            if not audio_success:
                 return
             print(f"💾 音频文件已保存: {audio_path}，用于后续断点续传")
+            
+            # 如果有语音段信息，保存到进度中
+            if speech_segments:
+                progress['speech_segments'] = speech_segments
+                save_progress(video_path, progress)
         
         # 使用Whisper进行语音识别（CPU模式，支持进度显示和断点续传）
         model = setup_whisper_model(selected_model_size)
@@ -248,16 +285,9 @@ def main(video_path=None, test_mode=True, model_size='medium', enable_translatio
     if 'audio_path' in locals() and os.path.exists(audio_path):
         print("💾 音频文件已保留，用于后续断点续传")
     
-    # 进度文件管理
+    # 保留进度文件以便断点续传（如果没有在开始时清理）
     progress_file = get_progress_file_path(video_path)
-    if clean_progress and os.path.exists(progress_file):
-        try:
-            os.remove(progress_file)
-            print("🧹 进度文件已清理")
-        except Exception as e:
-            print(f"⚠️ 无法清理进度文件: {e}")
-    elif os.path.exists(progress_file):
-        # 默认保留进度文件以便断点续传
+    if not clean and os.path.exists(progress_file):
         print("📁 进度文件已保留，用于后续断点续传")
     
     print_section_header("处理完成")
@@ -276,7 +306,8 @@ if __name__ == "__main__":
     parser.add_argument('--output-dir', help='输出目录')
     parser.add_argument('--adult', action='store_true', help='成人内容模式（优化专业术语翻译）')
     parser.add_argument('--merge', action='store_true', help='将字幕合并到视频文件中（需要FFmpeg）')
-    parser.add_argument('--clean-progress', action='store_true', help='清理进度文件（默认保留）')
+    parser.add_argument('--clean', action='store_true', help='清理temp目录下除视频文件外的所有文件')
+    parser.add_argument('--optimize-low-speech', action='store_true', help='针对低语音量场景优化处理速度（例如2小时视频但说话很少）')
     
     args = parser.parse_args()
     
@@ -299,7 +330,8 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             adult_content=args.adult,
             merge_to_video=args.merge,
-            clean_progress=args.clean_progress
+            clean=args.clean,
+            optimize_low_speech=getattr(args, 'optimize_low_speech', False)
         )
     except KeyboardInterrupt:
         print("\n\n🛑 程序已被用户中断")

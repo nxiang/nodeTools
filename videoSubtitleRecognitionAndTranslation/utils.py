@@ -203,24 +203,6 @@ def validate_file_path(file_path, check_exists=True):
     except Exception as e:
         return False, f"文件路径验证失败: {e}"
 
-def get_available_disk_space(directory='.'):
-    """获取可用磁盘空间"""
-    try:
-        stat = os.statvfs(directory)
-        free_space = stat.f_bavail * stat.f_frsize
-        return free_space
-    except AttributeError:
-        # Windows系统使用不同的方法
-        import ctypes
-        free_bytes = ctypes.c_ulonglong(0)
-        ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-            ctypes.c_wchar_p(directory), None, None, ctypes.pointer(free_bytes)
-        )
-        return free_bytes.value
-    except Exception as e:
-        print(f"❌ 磁盘空间获取失败: {e}")
-        return 0
-
 def print_section_header(title, width=60):
     """打印章节标题"""
     print("\n" + "=" * width)
@@ -242,14 +224,3 @@ def print_error(message):
 def print_info(message):
     """打印信息消息"""
     print(f"ℹ️  {message}")
-
-def create_backup(file_path, backup_suffix='.bak'):
-    """创建文件备份"""
-    try:
-        backup_path = file_path + backup_suffix
-        import shutil
-        shutil.copy2(file_path, backup_path)
-        return backup_path
-    except Exception as e:
-        print(f"❌ 备份创建失败: {e}")
-        return None
