@@ -339,8 +339,13 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
     if texts_to_translate:
         print(f"📤 开始批量API翻译: {len(texts_to_translate)} 条文本待翻译")
         
-        # 使用<>拼接所有待翻译文本
-        concatenated_text = "<>" .join(texts_to_translate)
+        # 获取配置中的分隔符
+        system_config = get_system_config()
+        batch_separator = system_config['batch_separator']
+        print(f"🔧 使用批量翻译分隔符: {batch_separator}")
+        
+        # 使用配置的分隔符拼接所有待翻译文本
+        concatenated_text = batch_separator.join(texts_to_translate)
         print(f"🔄 拼接文本示例: {concatenated_text[:50]}{'...' if len(concatenated_text) > 50 else ''}")
         
         # 检查是否超出百度翻译API的字符限制
@@ -352,7 +357,7 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
             batches = []
             current_batch = []
             current_batch_size = 0
-            separator_length = len("<>")
+            separator_length = len(batch_separator)
             
             print(f"📝 开始计算批次，分隔符长度: {separator_length}")
             for i, text in enumerate(texts_to_translate):
@@ -382,7 +387,7 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
             all_translated_parts = []
             for i, batch in enumerate(batches):
                 print(f"📦 处理翻译批次 {i+1}/{len(batches)}: {len(batch)} 条文本")
-                batch_text = "<>" .join(batch)
+                batch_text = batch_separator.join(batch)
                 print(f"   批次字符数: {len(batch_text)}")
                 print(f"   批次示例: {batch_text[:50]}{'...' if len(batch_text) > 50 else ''}")
                 
@@ -394,7 +399,7 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
                     print(f"✅ 批次 {i+1} 翻译完成，结果长度: {len(batch_translated)}")
                     
                     # 拆分批次翻译结果
-                    batch_translated_parts = batch_translated.split("<>")
+                    batch_translated_parts = batch_translated.split(batch_separator)
                     print(f"🔪 批次 {i+1} 结果拆分: {len(batch_translated_parts)} 部分")
                     all_translated_parts.extend(batch_translated_parts)
                 except Exception as e:
@@ -415,7 +420,7 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
                 print(f"✅ 单次翻译完成，结果长度: {len(translated_batch)}")
                 
                 # 拆分翻译结果
-                translated_parts = translated_batch.split("<>")
+                translated_parts = translated_batch.split(batch_separator)
                 print(f"🔪 结果拆分: {len(translated_parts)} 部分")
             except Exception as e:
                 print(f"❌ 单次翻译失败: {str(e)}")

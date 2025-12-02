@@ -90,7 +90,7 @@ SYSTEM_CONFIG = {
     'max_retries': 3,  # API重试次数
     'retry_delay': 2,  # 重试延迟（秒）
     'max_chars_per_batch': 5000,  # 批量翻译最大字符数
-    'batch_separator': '<1>',  # 批量翻译分隔符
+    'batch_separator': '<S>',  # 批量翻译分隔符
     'cache_enabled': True,  # 是否启用翻译缓存
     'temp_dir': 'temp',  # 临时文件目录
     'model_cache_dir': 'models',  # 模型缓存目录
