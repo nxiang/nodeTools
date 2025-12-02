@@ -160,7 +160,10 @@ def baidu_translate(text, adult_content=False, max_retries=3, show_individual_lo
             'to': 'zh',       # 中文
             'q': text,
             'salt': salt,
-            'sign': sign
+            'sign': sign,
+            'tag_handling': 1,
+            'model_type':' nmt',
+            'ignore_tags': system_config['batch_separator']
         }
         # 使用POST请求
         request_method = 'post'
@@ -262,9 +265,13 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
         show_individual_logs: 是否显示每条翻译的单独日志，批量模式下建议设为False
     """
     print(f"🔍 开始批量翻译流程 - 文本数量: {len(text_list)}, 成人内容: {adult_content}")
+
+    # 获取配置中的分隔符
+    system_config = get_system_config()
+
     
     # 定义百度翻译API的最大字符限制
-    MAX_CHAR_LIMIT = 500
+    MAX_CHAR_LIMIT = system_config['max_chars_per_batch']
     
     translated_results = []
     
@@ -339,8 +346,7 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
     if texts_to_translate:
         print(f"📤 开始批量API翻译: {len(texts_to_translate)} 条文本待翻译")
         
-        # 获取配置中的分隔符
-        system_config = get_system_config()
+        
         batch_separator = system_config['batch_separator']
         print(f"🔧 使用批量翻译分隔符: {batch_separator}")
         
@@ -351,40 +357,190 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
         # 检查是否超出百度翻译API的字符限制
         if len(concatenated_text) > MAX_CHAR_LIMIT:
             print(f"⚠️  拼接后的文本超出字符限制: {len(concatenated_text)} > {MAX_CHAR_LIMIT} 字符")
-            print(f"🔄 开始分批翻译处理")
+            print(f"🔄 开始智能分批翻译处理")
             
-            # 分批处理文本
+            # 智能分批处理文本 - 优化批量翻译效率，使批次长度尽量接近MAX_CHAR_LIMIT
             batches = []
             current_batch = []
             current_batch_size = 0
             separator_length = len(batch_separator)
             
-            print(f"📝 开始计算批次，分隔符长度: {separator_length}")
-            for i, text in enumerate(texts_to_translate):
+            print(f"📝 开始智能批次计算，分隔符长度: {separator_length}")
+            
+            # 按文本长度排序，优先处理长文本以优化批次利用率
+            sorted_texts = sorted(enumerate(texts_to_translate), key=lambda x: len(x[1]), reverse=True)
+            original_indices = [idx for idx, _ in sorted_texts]
+            sorted_texts_only = [text for _, text in sorted_texts]
+            
+            print(f"📊 文本排序完成: 最长文本={len(sorted_texts_only[0])}字符, 最短文本={len(sorted_texts_only[-1])}字符")
+            
+            # 优化批次分配策略：尽量使每个批次的字符数接近MAX_CHAR_LIMIT
+            for i, text in enumerate(sorted_texts_only):
                 text_length = len(text)
-                potential_size = current_batch_size + text_length + (separator_length if current_batch else 0)
-                print(f"📏 文本[{i}]: 长度={text_length}, 潜在批次大小={potential_size}")
                 
-                # 如果添加当前文本会导致批次超出限制，则将当前批次加入批次列表并开始新批次
+                # 如果当前文本单独就超过限制，需要单独处理
+                if text_length > MAX_CHAR_LIMIT:
+                    print(f"⚠️  文本过长({text_length}字符)，将单独处理")
+                    if current_batch:
+                        batches.append(current_batch)
+                        current_batch = []
+                        current_batch_size = 0
+                    batches.append([text])
+                    continue
+                
+                # 计算添加当前文本后的潜在大小
+                potential_size = current_batch_size + text_length + (separator_length if current_batch else 0)
+                
+                # 如果添加当前文本会导致批次超出限制，则完成当前批次
                 if potential_size > MAX_CHAR_LIMIT:
                     if current_batch:  # 确保当前批次不为空
                         batches.append(current_batch)
-                        print(f"📦 添加批次: {len(current_batch)} 条文本, 大小={current_batch_size}")
+                        print(f"📦 添加批次: {len(current_batch)} 条文本, 大小={current_batch_size}({current_batch_size/MAX_CHAR_LIMIT*100:.1f}%利用率)")
                         current_batch = []
                         current_batch_size = 0
+                    
+                    # 重新计算新批次的潜在大小
+                    potential_size = text_length
+                
                 # 添加文本到当前批次
                 current_batch.append(text)
                 current_batch_size = potential_size
+                
+                # 优化策略：如果当前批次接近限制（95%以上），提前结束批次以最大化利用率
+                if current_batch_size >= MAX_CHAR_LIMIT * 0.95:
+                    if current_batch:
+                        batches.append(current_batch)
+                        print(f"📦 高利用率批次: {len(current_batch)} 条文本, 大小={current_batch_size}({current_batch_size/MAX_CHAR_LIMIT*100:.1f}%利用率)")
+                        current_batch = []
+                        current_batch_size = 0
+                
+                # 进一步优化：检查是否可以添加更多短文本来接近限制
+                elif current_batch_size < MAX_CHAR_LIMIT * 0.8 and i < len(sorted_texts_only) - 1:
+                    # 检查后续文本是否可以添加到当前批次
+                    remaining_space = MAX_CHAR_LIMIT - current_batch_size
+                    
+                    # 查找可以添加的短文本，充分利用剩余空间
+                    for j in range(i + 1, len(sorted_texts_only)):
+                        next_text = sorted_texts_only[j]
+                        next_text_length = len(next_text)
+                        
+                        # 检查是否可以添加这个文本（考虑分隔符长度）
+                        if next_text_length + separator_length <= remaining_space:
+                            # 可以添加这个文本，继续循环让它自然添加到批次中
+                            break
+                        else:
+                            # 如果下一个文本无法添加，检查当前批次是否已经足够大
+                            if current_batch_size >= MAX_CHAR_LIMIT * 0.7:
+                                # 当前批次已经足够大，提前结束以优化效率
+                                if current_batch:
+                                    batches.append(current_batch)
+                                    print(f"📦 优化批次: {len(current_batch)} 条文本, 大小={current_batch_size}({current_batch_size/MAX_CHAR_LIMIT*100:.1f}%利用率)")
+                                    current_batch = []
+                                    current_batch_size = 0
+                            break
             
             # 添加最后一个批次
             if current_batch:
                 batches.append(current_batch)
-                print(f"📦 添加最后批次: {len(current_batch)} 条文本, 大小={current_batch_size}")
+                print(f"📦 添加最后批次: {len(current_batch)} 条文本, 大小={current_batch_size}({current_batch_size/MAX_CHAR_LIMIT*100:.1f}%利用率)")
             
-            print(f"📊 文本已分成 {len(batches)} 个批次进行翻译")
+            print(f"📊 文本已智能分成 {len(batches)} 个批次进行翻译")
+            
+            # 计算批次利用率统计
+            total_characters = sum(len(text) for text in texts_to_translate)
+            batch_utilization_stats = []
+            for i, batch in enumerate(batches):
+                batch_text = batch_separator.join(batch)
+                batch_size = len(batch_text)
+                utilization = batch_size / MAX_CHAR_LIMIT * 100
+                batch_utilization_stats.append((i, len(batch), batch_size, utilization))
+            
+            # 打印批次利用率统计
+            print(f"📈 批次利用率统计:")
+            for i, count, size, util in batch_utilization_stats:
+                print(f"   批次 {i+1}: {count}条文本, {size}字符, {util:.1f}%利用率")
+            
+            avg_utilization = sum(util for _, _, _, util in batch_utilization_stats) / len(batch_utilization_stats)
+            total_batch_size = sum(size for _, _, size, _ in batch_utilization_stats)
+            overall_utilization = total_batch_size / (len(batches) * MAX_CHAR_LIMIT) * 100
+            
+            print(f"📊 统计摘要:")
+            print(f"   总字符数: {total_characters}")
+            print(f"   批次数量: {len(batches)}")
+            print(f"   平均批次利用率: {avg_utilization:.1f}%")
+            print(f"   总体利用率: {overall_utilization:.1f}%")
+            print(f"   字符浪费率: {100 - overall_utilization:.1f}%")
+            
+            # 智能批次合并：如果批次数量过多且利用率较低，尝试合并小批次
+            if len(batches) > 3 and avg_utilization < 60:
+                print(f"🔄 检测到批次利用率较低，尝试合并小批次...")
+                
+                # 重新合并批次，优化利用率
+                optimized_batches = []
+                current_batch = []
+                current_batch_size = 0
+                
+                # 将所有文本重新按长度排序（长文本在前）
+                all_texts = []
+                for batch in batches:
+                    all_texts.extend(batch)
+                
+                sorted_all_texts = sorted(all_texts, key=len, reverse=True)
+                
+                for text in sorted_all_texts:
+                    text_length = len(text)
+                    potential_size = current_batch_size + text_length + (separator_length if current_batch else 0)
+                    
+                    # 如果添加当前文本会导致批次超出限制，则完成当前批次
+                    if potential_size > MAX_CHAR_LIMIT:
+                        if current_batch:
+                            optimized_batches.append(current_batch)
+                            current_batch = []
+                            current_batch_size = 0
+                        potential_size = text_length
+                    
+                    current_batch.append(text)
+                    current_batch_size = potential_size
+                    
+                    # 如果当前批次利用率已经很高，提前结束批次
+                    if current_batch_size > MAX_CHAR_LIMIT * 0.85:
+                        if current_batch:
+                            optimized_batches.append(current_batch)
+                            current_batch = []
+                            current_batch_size = 0
+                
+                if current_batch:
+                    optimized_batches.append(current_batch)
+                
+                if len(optimized_batches) < len(batches):
+                    print(f"✅ 批次合并优化: 从 {len(batches)} 个批次减少到 {len(optimized_batches)} 个批次")
+                    batches = optimized_batches
+                    
+                    # 重新计算批次利用率
+                    batch_utilization_stats = []
+                    for i, batch in enumerate(batches):
+                        batch_text = batch_separator.join(batch)
+                        batch_size = len(batch_text)
+                        utilization = batch_size / MAX_CHAR_LIMIT * 100
+                        batch_utilization_stats.append((i, len(batch), batch_size, utilization))
+                    
+                    avg_utilization = sum(util for _, _, _, util in batch_utilization_stats) / len(batch_utilization_stats)
+                    print(f"📊 优化后平均批次利用率: {avg_utilization:.1f}%")
+                else:
+                    print(f"ℹ️  批次合并未优化，保持原批次数量")
+            
+            # 恢复原始顺序的映射关系
+            batch_mapping = {}
+            for batch_idx, batch in enumerate(batches):
+                for text in batch:
+                    # 找到文本在原始列表中的位置
+                    for orig_idx, orig_text in zip(original_indices, sorted_texts_only):
+                        if text == orig_text:
+                            batch_mapping[orig_idx] = (batch_idx, text)
+                            break
             
             # 处理每个批次
-            all_translated_parts = []
+            batch_results = {}
             for i, batch in enumerate(batches):
                 print(f"📦 处理翻译批次 {i+1}/{len(batches)}: {len(batch)} 条文本")
                 batch_text = batch_separator.join(batch)
@@ -401,13 +557,45 @@ def batch_translate(text_list, adult_content=False, show_individual_logs=False):
                     # 拆分批次翻译结果
                     batch_translated_parts = batch_translated.split(batch_separator)
                     print(f"🔪 批次 {i+1} 结果拆分: {len(batch_translated_parts)} 部分")
-                    all_translated_parts.extend(batch_translated_parts)
+                    
+                    # 存储批次结果
+                    batch_results[i] = {
+                        'original_batch': batch,
+                        'translated_parts': batch_translated_parts
+                    }
                 except Exception as e:
                     print(f"❌ 批次 {i+1} 翻译失败: {str(e)}")
                     # 使用原文填充
-                    all_translated_parts.extend(batch)
+                    batch_results[i] = {
+                        'original_batch': batch,
+                        'translated_parts': batch
+                    }
             
-            # 合并所有批次的翻译结果
+            # 按照原始顺序重新组合翻译结果
+            all_translated_parts = []
+            for orig_idx in range(len(texts_to_translate)):
+                if orig_idx in batch_mapping:
+                    batch_idx, text = batch_mapping[orig_idx]
+                    batch_data = batch_results.get(batch_idx)
+                    if batch_data:
+                        # 在批次中找到对应的文本位置
+                        batch_texts = batch_data['original_batch']
+                        translated_parts = batch_data['translated_parts']
+                        
+                        # 查找文本在批次中的位置
+                        try:
+                            text_idx = batch_texts.index(text)
+                            if text_idx < len(translated_parts):
+                                all_translated_parts.append(translated_parts[text_idx])
+                            else:
+                                all_translated_parts.append(text)  # 使用原文作为后备
+                        except (ValueError, IndexError):
+                            all_translated_parts.append(text)  # 使用原文作为后备
+                    else:
+                        all_translated_parts.append(text)  # 使用原文作为后备
+                else:
+                    all_translated_parts.append(text)  # 使用原文作为后备
+            
             translated_parts = all_translated_parts
             print(f"📊 所有批次处理完成，总结果数: {len(translated_parts)}")
         else:
