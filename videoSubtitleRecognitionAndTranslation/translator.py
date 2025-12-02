@@ -162,7 +162,7 @@ def baidu_translate(text, adult_content=False, max_retries=3, show_individual_lo
             'salt': salt,
             'sign': sign,
             'tag_handling': 1,
-            'model_type':' nmt',
+            'model_type':'nmt',
             'ignore_tags': system_config['batch_separator']
         }
         # 使用POST请求

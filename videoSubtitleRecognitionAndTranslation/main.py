@@ -263,7 +263,9 @@ def main(video_path=None, test_mode=None, model_size='medium', enable_translatio
         'model_size': selected_model_size,
         'enable_translation': enable_translation,
         'save_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'transcription_completed': True
+        'transcription_completed': True,
+        'last_translated_index': 0,  # 初始化为0，表示翻译尚未开始
+        'srt_content': ''  # 初始化为空内容
     }
     save_progress(video_path, progress_data)
     
@@ -271,8 +273,10 @@ def main(video_path=None, test_mode=None, model_size='medium', enable_translatio
     subtitle_start_time = time.time()
     
     if enable_translation:
+        # 关键修复：使用最新的进度数据（包含last_translated_index和srt_content字段）
+        # 而不是之前加载的progress（可能缺少这些字段）
         success = generate_bilingual_subtitle_file(video_path, result, enable_translation=True, 
-                                                 adult_content=adult_content, progress=progress, 
+                                                 adult_content=adult_content, progress=progress_data, 
                                                  time_offset=args.time_offset)
         if args.time_offset != 0:
             print(f"⏱️  字幕时间偏移已设置: {args.time_offset}秒")
