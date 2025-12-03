@@ -107,7 +107,7 @@ class VideoTranslator:
             "--device", self.device,
             "--language", self.source_lang,
             "--output-dir", str(output_dir),
-            "--clean"  # 清理临时文件
+            # "--clean"  # 清理临时文件
         ]
         
         # 添加内存优化参数
@@ -155,18 +155,19 @@ class VideoTranslator:
             print(f"[失败] 运行Whisper转录时出错: {e}")
             return None
     
-    def run_srt_translation(self, srt_path: str, output_path: Optional[str] = None) -> bool:
+    def run_srt_translation(self, srt_path: str) -> bool:
         """
         运行SRT翻译，生成双语字幕
         
         Args:
             srt_path: SRT文件路径
-            output_path: 输出文件路径
             
         Returns:
             是否成功
         """
         # 构建SRT翻译命令
+        # 不指定输出文件名，让srt-translation.py自动处理：
+        # 输出文件名改为原文件名，原文名改为.back.srt
         command = [
             sys.executable, str(self.srt_translation_script),
             srt_path,
@@ -174,13 +175,11 @@ class VideoTranslator:
             "--target-lang", self.target_lang
         ]
         
-        if output_path:
-            command.extend(["-o", output_path])
-        
         print(f"[翻译] 开始SRT翻译...")
         print(f"   输入文件: {Path(srt_path).name}")
         print(f"   源语言: {self.source_lang}")
         print(f"   目标语言: {self.target_lang}")
+        print(f"   文件名处理: 输出文件将保持原文件名，原文件将备份为.back.srt")
         
         try:
             # 运行翻译命令，实时显示输出
@@ -259,10 +258,9 @@ class VideoTranslator:
         print("[开始] 开始字幕翻译阶段")
         print("=" * 60)
         
-        # 生成翻译后的SRT文件路径
-        translated_srt = output_path / f"{video_file.stem}_translated.srt"
-        
-        translation_success = self.run_srt_translation(srt_file, str(translated_srt))
+        # 不指定输出文件名，让srt-translation.py自动处理：
+        # 输出文件名改为原文件名，原文名改为.back.srt
+        translation_success = self.run_srt_translation(srt_file)
         time_tracker.checkpoint("SRT翻译")
         
         if not translation_success:
@@ -270,7 +268,9 @@ class VideoTranslator:
             time_tracker.print_summary()
             return result
         
-        result["translated_srt"] = str(translated_srt)
+        # 翻译后的文件将保持原文件名，原文件备份为.back.srt
+        result["translated_srt"] = srt_file
+        result["backup_srt"] = str(Path(srt_file).parent / f"{Path(srt_file).stem}.back.srt")
         result["stages"]["translation"] = True
         result["success"] = True
         
@@ -281,8 +281,8 @@ class VideoTranslator:
         
         # 显示结果文件
         print(f"[文件] 生成的文件:")
-        print(f"   原始SRT: {Path(srt_file).name}")
-        print(f"   双语SRT: {translated_srt.name}")
+        print(f"   双语SRT: {Path(srt_file).name} (原文件已备份为.back.srt)")
+        print(f"   备份文件: {Path(srt_file).stem}.back.srt")
         
         # 打印耗时总结
         time_tracker.print_summary()

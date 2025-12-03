@@ -357,13 +357,13 @@ class MemoryEfficientWhisper:
         time_tracker.checkpoint("结果保存")
         
         # 删除检查点
-        if checkpoint_file.exists():
-            checkpoint_file.unlink()
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
         
         print(f"\n[完成] 分段转录完成!")
         print(f"[统计] 总时长: {total_samples / sr:.2f} 秒")
-        print(f"[统计] 处理段数: {len(processed_segments)}")
-        print(f"[统计] 总文本长度: {len(full_text)} 字符")
+        print(f"[统计] 处理段数: {len(all_segments)}")
+        print(f"[统计] 总文本长度: {len(final_result['text'])} 字符")
         
         # 打印耗时总结
         time_tracker.print_summary()
@@ -1190,7 +1190,7 @@ class VideoSubtitleGenerator:
             video_path: 视频文件路径
             output_srt: 是否输出SRT文件
             output_json: 是否输出JSON转录结果
-            cleanup: 是否清理临时文件
+            cleanup: 是否清理临时文件（仅在开始执行前清理，不清理翻译缓存）
             segment_duration: 分段时长（秒），0表示自动判断
             overlap: 段间重叠时长（秒）
             use_segmented: 强制使用分段转录
@@ -1214,6 +1214,15 @@ class VideoSubtitleGenerator:
             "processing_start_time": start_time,
             "steps": {}
         }
+        
+        # 步骤0: 如果指定了--clean参数，在开始执行前清理临时文件
+        if cleanup:
+            cleanup_start = time.time()
+            print(f"[清理] 开始执行前清理临时文件...")
+            # 只清理临时文件，保留翻译缓存文件
+            self.cleanup_temp_files(keep_audio=True, keep_json=True, keep_srt=True)
+            result["steps"]["pre_cleanup"] = time.time() - cleanup_start
+            time_tracker.checkpoint("执行前清理")
         
         try:
             # 步骤1: 提取音频
@@ -1269,12 +1278,8 @@ class VideoSubtitleGenerator:
             result["steps"]["file_saving"] = time.time() - save_start
             time_tracker.checkpoint("文件保存")
             
-            # 步骤5: 清理
-            if cleanup:
-                cleanup_start = time.time()
-                self.cleanup_temp_files(keep_audio=not cleanup, keep_json=output_json, keep_srt=output_srt)
-                result["steps"]["cleanup"] = time.time() - cleanup_start
-                time_tracker.checkpoint("临时文件清理")
+            # 步骤5: 不再在处理完成后清理临时文件，保留所有生成的文件
+            # --clean参数只在开始执行前清理临时文件，不清理翻译缓存文件
             
             # 计算总时间
             total_time = time.time() - start_time
@@ -1436,7 +1441,7 @@ if __name__ == "__main__":
         print("[工具] 视频字幕生成工具")
         print("=" * 50)
         print("使用方法:")
-        print("  python whisper-translation.py <视频文件路径> [选项]")
+        print("  pythonwhisper-transcription.py <视频文件路径> [选项]")
         print("")
         print("选项:")
         print("  --model MODEL        Whisper模型 (tiny, base, small, medium, large, large-v2, large-v3)")
@@ -1459,12 +1464,12 @@ if __name__ == "__main__":
         print("  --force-memory-optimized      强制使用内存优化转录")
         print("")
         print("示例:")
-        print("  python whisper-translation.py my_video.mp4 --model base --language ja")
-        print("  python whisper-translation.py video.avi --model large-v3 --device cuda")
-        print("  python whisper-translation.py long_movie.mp4 --segment-duration 300 --overlap 10")
-        print("  python whisper-translation.py lecture.mp4 --force-segmented --segment-duration 600")
-        print("  python whisper-translation.py big_video.mp4 --model large-v2 --enable-memory-optimization")
-        print("  python whisper-translation.py hd_video.mp4 --model large-v3 --force-memory-optimized --max-chunk-duration 30")
+        print("  pythonwhisper-transcription.py my_video.mp4 --model base --language ja")
+        print("  pythonwhisper-transcription.py video.avi --model large-v3 --device cuda")
+        print("  pythonwhisper-transcription.py long_movie.mp4 --segment-duration 300 --overlap 10")
+        print("  pythonwhisper-transcription.py lecture.mp4 --force-segmented --segment-duration 600")
+        print("  pythonwhisper-transcription.py big_video.mp4 --model large-v2 --enable-memory-optimization")
+        print("  pythonwhisper-transcription.py hd_video.mp4 --model large-v3 --force-memory-optimized --max-chunk-duration 30")
         print("")
         
         # 测试示例
