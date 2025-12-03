@@ -19,6 +19,41 @@ from datetime import timedelta
 warnings.filterwarnings("ignore")
 
 
+class TimeTracker:
+    """耗时跟踪器"""
+    
+    def __init__(self):
+        self.start_time = time.time()
+        self.last_checkpoint = self.start_time
+        self.checkpoints = {}
+    
+    def checkpoint(self, stage_name: str):
+        """记录阶段耗时"""
+        current_time = time.time()
+        stage_duration = current_time - self.last_checkpoint
+        total_duration = current_time - self.start_time
+        
+        self.checkpoints[stage_name] = {
+            'stage_duration': stage_duration,
+            'total_duration': total_duration
+        }
+        
+        # 实时显示耗时
+        print(f"[耗时] [{stage_name}] 阶段耗时: {stage_duration:.2f}s | 累计耗时: {total_duration:.2f}s")
+        
+        self.last_checkpoint = current_time
+        
+    def print_summary(self):
+        """打印耗时总结"""
+        total_time = time.time() - self.start_time
+        print(f"\n[统计] 耗时统计总结:")
+        print(f"总耗时: {total_time:.2f}秒")
+        print("各阶段耗时详情:")
+        for stage, times in self.checkpoints.items():
+            print(f"  {stage}: {times['stage_duration']:.2f}s ({times['stage_duration']/total_time*100:.1f}%)")
+        print("=" * 50)
+
+
 class MemoryMonitor:
     """内存监控器"""
     
@@ -143,12 +178,18 @@ class MemoryEfficientWhisper:
         """
         print(f"\n开始内存安全转录: {Path(audio_path).name}")
         
+        # 初始化耗时跟踪器
+        time_tracker = TimeTracker()
+        time_tracker.checkpoint("初始化")
+        
         # 获取音频信息
         audio_duration = self.get_audio_duration(audio_path)
         available_memory = self.memory_monitor.get_available_memory_mb()
+        time_tracker.checkpoint("音频信息获取")
         
         # 优化分块大小
         chunk_duration = self.optimize_chunk_size(audio_duration, available_memory)
+        time_tracker.checkpoint("分块优化")
         
         # 检查点路径
         checkpoint_path = self.get_checkpoint_path(audio_path)
@@ -156,12 +197,18 @@ class MemoryEfficientWhisper:
         # 尝试从检查点恢复
         if checkpoint_path.exists():
             print(f"发现内存安全检查点，尝试恢复...")
-            return self.resume_from_checkpoint(audio_path, checkpoint_path, 
+            result = self.resume_from_checkpoint(audio_path, checkpoint_path, 
                                               chunk_duration, **transcribe_kwargs)
         else:
             print(f"开始新的内存安全转录，总时长: {audio_duration:.1f}秒")
-            return self.new_transcription(audio_path, checkpoint_path,
+            result = self.new_transcription(audio_path, checkpoint_path,
                                          chunk_duration, **transcribe_kwargs)
+        
+        # 打印耗时总结
+        time_tracker.checkpoint("转录完成")
+        time_tracker.print_summary()
+        
+        return result
     
     def get_audio_duration(self, audio_path: str) -> float:
         """获取音频时长"""
@@ -189,10 +236,15 @@ class MemoryEfficientWhisper:
             "start_time": time.time()
         }
         
+        # 初始化耗时跟踪器
+        time_tracker = TimeTracker()
+        time_tracker.checkpoint("检查点初始化")
+        
         # 加载音频
         print("加载音频文件...")
         audio, sr = librosa.load(audio_path, sr=16000)
         total_samples = len(audio)
+        time_tracker.checkpoint("音频加载")
         
         # 计算分块
         chunk_samples = chunk_duration * sr
@@ -201,6 +253,7 @@ class MemoryEfficientWhisper:
         
         print(f"音频总长度: {total_samples/sr:.1f}秒")
         print(f"分块数量: {total_chunks} (每块{chunk_duration}秒)")
+        time_tracker.checkpoint("分块计算")
         
         all_segments = []
         all_text = []
@@ -220,6 +273,7 @@ class MemoryEfficientWhisper:
             
             # 转换为Whisper格式
             chunk_audio_whisper = whisper.pad_or_trim(chunk_audio)
+            time_tracker.checkpoint(f"分块{chunk_idx+1}_音频准备")
             
             # 转录当前块
             try:
@@ -239,6 +293,7 @@ class MemoryEfficientWhisper:
                     chunk_audio_whisper,
                     **whisper_params
                 )
+                time_tracker.checkpoint(f"分块{chunk_idx+1}_转录")
                 
                 # 调整时间戳
                 chunk_start_time = start_sample / sr
@@ -264,6 +319,7 @@ class MemoryEfficientWhisper:
                 
                 # 保存检查点
                 self.save_checkpoint(checkpoint_path, checkpoint)
+                time_tracker.checkpoint(f"分块{chunk_idx+1}_保存检查点")
                 
                 print(f"✓ 分块 {chunk_idx + 1} 完成")
                 
@@ -286,6 +342,7 @@ class MemoryEfficientWhisper:
                 continue
         
         # 合并结果
+        time_tracker.checkpoint("结果合并")
         final_result = {
             "text": " ".join(all_text),
             "segments": all_segments,
@@ -297,14 +354,19 @@ class MemoryEfficientWhisper:
         
         # 保存最终结果
         self.save_final_result(audio_path, final_result)
+        time_tracker.checkpoint("结果保存")
         
-        # 保留检查点文件（即使成功完成转录）
-        if checkpoint_path.exists():
-            print(f"✓ 检查点文件已保留: {checkpoint_path}")
+        # 删除检查点
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
         
-        print(f"\n内存安全转录完成！")
-        print(f"总处理时间: {final_result['processing_time']:.1f}秒")
-        print(f"总文本长度: {len(final_result['text'])} 字符")
+        print(f"\n[完成] 分段转录完成!")
+        print(f"[统计] 总时长: {total_samples / sr:.2f} 秒")
+        print(f"[统计] 处理段数: {len(processed_segments)}")
+        print(f"[统计] 总文本长度: {len(full_text)} 字符")
+        
+        # 打印耗时总结
+        time_tracker.print_summary()
         
         return final_result
     
@@ -312,6 +374,11 @@ class MemoryEfficientWhisper:
                               chunk_duration: int, **transcribe_kwargs) -> Dict:
         """从检查点恢复转录"""
         print("加载检查点...")
+        
+        # 初始化耗时跟踪器
+        time_tracker = TimeTracker()
+        time_tracker.checkpoint("初始化")
+        
         with open(checkpoint_path, 'r', encoding='utf-8') as f:
             checkpoint = json.load(f)
         
@@ -324,6 +391,7 @@ class MemoryEfficientWhisper:
         # 合并参数
         saved_kwargs = checkpoint.get("transcribe_kwargs", {})
         saved_kwargs.update(transcribe_kwargs)
+        time_tracker.checkpoint("参数合并")
         
         print(f"从分块 {checkpoint['current_chunk']}/{checkpoint['total_chunks']} 恢复")
         
@@ -331,6 +399,7 @@ class MemoryEfficientWhisper:
         audio, sr = librosa.load(audio_path, sr=16000)
         total_samples = len(audio)
         chunk_samples = chunk_duration * sr
+        time_tracker.checkpoint("音频加载")
         
         all_segments = []
         all_text = []
@@ -341,6 +410,7 @@ class MemoryEfficientWhisper:
             # 恢复segments数据（从检查点文件中的segments字段）
             if "segments" in result:
                 all_segments.extend(result["segments"])
+        time_tracker.checkpoint("结果恢复")
         
         # 继续处理剩余分块
         for chunk_idx in range(checkpoint["current_chunk"], checkpoint["total_chunks"]):
@@ -353,6 +423,7 @@ class MemoryEfficientWhisper:
             # 提取音频块
             chunk_audio = audio[start_sample:end_sample]
             chunk_audio_whisper = whisper.pad_or_trim(chunk_audio)
+            time_tracker.checkpoint(f"分块{chunk_idx+1}_音频准备")
             
             # 转录当前块
             try:
@@ -372,6 +443,7 @@ class MemoryEfficientWhisper:
                     chunk_audio_whisper,
                     **whisper_params
                 )
+                time_tracker.checkpoint(f"分块{chunk_idx+1}_转录")
                 
                 # 调整时间戳
                 chunk_start_time = start_sample / sr
@@ -397,6 +469,7 @@ class MemoryEfficientWhisper:
                 
                 # 保存检查点
                 self.save_checkpoint(checkpoint_path, checkpoint)
+                time_tracker.checkpoint(f"分块{chunk_idx+1}_保存检查点")
                 
                 print(f"✓ 分块 {chunk_idx + 1} 完成")
                 
@@ -414,6 +487,7 @@ class MemoryEfficientWhisper:
                 continue
         
         # 合并结果
+        time_tracker.checkpoint("结果合并")
         final_result = {
             "text": " ".join(all_text),
             "segments": all_segments,
@@ -425,6 +499,7 @@ class MemoryEfficientWhisper:
         
         # 保存最终结果
         self.save_final_result(audio_path, final_result)
+        time_tracker.checkpoint("结果保存")
         
         # 保留检查点文件（即使成功完成转录）
         if checkpoint_path.exists():
@@ -432,6 +507,9 @@ class MemoryEfficientWhisper:
         
         print(f"\n转录完成！")
         print(f"总处理时间: {final_result['processing_time']:.1f}秒")
+        
+        # 打印耗时总结
+        time_tracker.print_summary()
         
         return final_result
     
@@ -478,16 +556,16 @@ class WhisperSegmentResume:
             # 检查传入的是模型对象还是模型名称
             if isinstance(model_or_name, str):
                 # 传入的是模型名称，需要加载模型
-                print(f"📥 正在为分段转录器加载Whisper模型: {model_or_name}")
+                print(f"[加载] 正在为分段转录器加载Whisper模型: {model_or_name}")
                 self.model = whisper.load_model(model_or_name, device=device)
             else:
                 # 传入的是已加载的模型对象，直接使用
-                print(f"📥 分段转录器重用已加载的模型")
+                print(f"[加载] 分段转录器重用已加载的模型")
                 self.model = model_or_name
             
             self.device = device
             self.segments_cache = []
-            print(f"✅ 分段转录器初始化成功")
+            print(f"[成功] 分段转录器初始化成功")
         except Exception as e:
             # 将详细错误信息写入文件
             error_file = Path("error_log.txt")
@@ -496,8 +574,8 @@ class WhisperSegmentResume:
                 f.write(f"分段转录器初始化失败: {e}\n")
                 f.write("完整错误堆栈:\n")
                 f.write(traceback.format_exc())
-            print(f"❌ 分段转录器初始化失败，详细信息已保存到 error_log.txt")
-            print(f"❌ 分段转录器初始化失败: {e}")
+            print(f"[失败] 分段转录器初始化失败，详细信息已保存到 error_log.txt")
+            print(f"[失败] 分段转录器初始化失败: {e}")
             raise
     
     def transcribe_long_audio(
@@ -521,6 +599,10 @@ class WhisperSegmentResume:
         Returns:
             完整的转录结果
         """
+        # 初始化耗时跟踪器
+        time_tracker = TimeTracker()
+        time_tracker.checkpoint("初始化")
+        
         # 创建检查点目录
         checkpoint_path = Path(checkpoint_dir)
         checkpoint_path.mkdir(exist_ok=True)
@@ -533,31 +615,34 @@ class WhisperSegmentResume:
         total_samples = len(audio)
         segment_samples = segment_duration * sr
         overlap_samples = overlap * sr
+        time_tracker.checkpoint("音频加载")
         
         # 计算总段数
         num_segments = math.ceil(total_samples / segment_samples)
+        time_tracker.checkpoint("段数计算")
         
         # 尝试加载检查点
         processed_segments = []
         if checkpoint_file.exists():
-            print(f"📂 加载检查点: {checkpoint_file}")
+            print(f"[加载] 加载检查点: {checkpoint_file}")
             try:
                 with open(checkpoint_file, 'r', encoding='utf-8') as f:
                     checkpoint_data = json.load(f)
                     processed_segments = checkpoint_data.get('segments', [])
                     last_processed = checkpoint_data.get('last_processed', 0)
-                    print(f"📊 已处理 {len(processed_segments)} 段，上次处理到第 {last_processed} 段")
+                    print(f"[统计] 已处理 {len(processed_segments)} 段，上次处理到第 {last_processed} 段")
             except Exception as e:
-                print(f"⚠️ 检查点加载失败，从头开始: {e}")
+                print(f"[警告] 检查点加载失败，从头开始: {e}")
                 last_processed = 0
         else:
             last_processed = 0
+        time_tracker.checkpoint("检查点加载")
         
         # 逐段处理
         all_segments = []
         
         for seg_idx in range(last_processed, num_segments):
-            print(f"\n🎯 处理第 {seg_idx + 1}/{num_segments} 段...")
+            print(f"\n[处理] 处理第 {seg_idx + 1}/{num_segments} 段...")
             
             # 计算当前段的起始和结束位置
             start_sample = max(0, seg_idx * segment_samples - (overlap_samples if seg_idx > 0 else 0))
@@ -566,16 +651,18 @@ class WhisperSegmentResume:
             # 提取音频段
             segment_audio = audio[start_sample:end_sample]
             
+            # 转换为适合Whisper的格式
+            segment_audio_whisper = whisper.pad_or_trim(segment_audio)
+            time_tracker.checkpoint(f"第{seg_idx+1}段_音频准备")
+            
             # 转录当前段
             try:
-                # 转换为适合Whisper的格式
-                segment_audio_whisper = whisper.pad_or_trim(segment_audio)
-                
                 # 转录
                 segment_result = self.model.transcribe(
                     segment_audio_whisper,
                     **transcribe_kwargs
                 )
+                time_tracker.checkpoint(f"第{seg_idx+1}段_转录")
                 
                 # 调整时间戳
                 segment_start_time = start_sample / sr
@@ -609,20 +696,22 @@ class WhisperSegmentResume:
                 
                 with open(checkpoint_file, 'w', encoding='utf-8') as f:
                     json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
+                time_tracker.checkpoint(f"第{seg_idx+1}段_保存检查点")
                 
-                print(f"✅ 第 {seg_idx + 1} 段完成，已保存检查点")
+                print(f"[完成] 第 {seg_idx + 1} 段完成，已保存检查点")
                 
             except KeyboardInterrupt:
-                print("\n⏸️  转录被用户中断")
-                print(f"💾 检查点已保存，下次可从第 {seg_idx + 1} 段继续")
+                print("\n[暂停] 转录被用户中断")
+                print(f"[保存] 检查点已保存，下次可从第 {seg_idx + 1} 段继续")
                 return None
                 
             except Exception as e:
-                print(f"❌ 第 {seg_idx + 1} 段处理失败: {e}")
+                print(f"[失败] 第 {seg_idx + 1} 段处理失败: {e}")
                 # 继续处理下一段
         
         # 合并所有段的文本
         full_text = " ".join([seg.get("text", "") for seg in all_segments])
+        time_tracker.checkpoint("结果合并")
         
         # 最终结果
         final_result = {
@@ -639,15 +728,19 @@ class WhisperSegmentResume:
         result_file = audio_file.parent / f"{audio_file.stem}_full_transcript.json"
         with open(result_file, 'w', encoding='utf-8') as f:
             json.dump(final_result, f, ensure_ascii=False, indent=2)
+        time_tracker.checkpoint("结果保存")
         
         # 删除检查点
         if checkpoint_file.exists():
             checkpoint_file.unlink()
         
-        print(f"\n🎉 分段转录完成!")
-        print(f"📊 总时长: {total_samples / sr:.2f} 秒")
-        print(f"📊 处理段数: {len(processed_segments)}")
-        print(f"📊 总文本长度: {len(full_text)} 字符")
+        print(f"\n[完成] 分段转录完成!")
+        print(f"[统计] 总时长: {total_samples / sr:.2f} 秒")
+        print(f"[统计] 处理段数: {len(processed_segments)}")
+        print(f"[统计] 总文本长度: {len(full_text)} 字符")
+        
+        # 打印耗时总结
+        time_tracker.print_summary()
         
         return final_result
 
@@ -671,9 +764,9 @@ class VideoSubtitleGenerator:
             enable_memory_optimization: 是否启用内存优化模式
             max_chunk_duration: 内存优化模式下的最大分块时长（秒）
         """
-        print(f"🎯 初始化视频字幕生成器...")
-        print(f"📦 加载模型: {model_name}")
-        print(f"⚙️  设备: {device}")
+        print(f"[初始化] 初始化视频字幕生成器...")
+        print(f"[模型] 加载模型: {model_name}")
+        print(f"[设备] 设备: {device}")
         
         # 确保temp目录存在
         self.temp_dir = Path("temp")
@@ -681,29 +774,29 @@ class VideoSubtitleGenerator:
         
         # 加载Whisper模型
         try:
-            print(f"📥 正在加载Whisper模型: {model_name}")
+            print(f"[加载] 正在加载Whisper模型: {model_name}")
             self.model = whisper.load_model(model_name, device=device)
             self.device = device
-            print(f"✅ Whisper模型加载成功")
+            print(f"[成功] Whisper模型加载成功")
         except Exception as e:
-            print(f"❌ Whisper模型加载失败: {e}")
+            print(f"[失败] Whisper模型加载失败: {e}")
             raise
         
         # 初始化分段转录器（重用已加载的模型）
         try:
-            print(f"📥 正在初始化分段转录器")
+            print(f"[加载] 正在初始化分段转录器")
             self.segment_transcriber = WhisperSegmentResume(self.model, device)
-            print(f"✅ 分段转录器初始化成功")
+            print(f"[成功] 分段转录器初始化成功")
         except Exception as e:
-            print(f"❌ 分段转录器初始化失败: {e}")
+            print(f"[失败] 分段转录器初始化失败: {e}")
             raise
         
         # 初始化内存优化转录器（仅在需要时加载）
         self.enable_memory_optimization = enable_memory_optimization
         self.memory_efficient_transcriber = None
         if enable_memory_optimization:
-            print(f"🧠 启用内存优化模式")
-            print(f"📊 最大分块时长: {max_chunk_duration}秒")
+            print(f"[内存优化] 启用内存优化模式")
+            print(f"[参数] 最大分块时长: {max_chunk_duration}秒")
             try:
                 self.memory_efficient_transcriber = MemoryEfficientWhisper(
                     self.model,
@@ -711,12 +804,12 @@ class VideoSubtitleGenerator:
                     max_chunk_duration=max_chunk_duration,
                     checkpoint_dir=str(self.temp_dir / "memory_safe_checkpoints")
                 )
-                print(f"✅ 内存优化转录器初始化成功")
+                print(f"[成功] 内存优化转录器初始化成功")
             except Exception as e:
-                print(f"❌ 内存优化转录器初始化失败: {e}")
+                print(f"[失败] 内存优化转录器初始化失败: {e}")
                 raise
         
-        print(f"✅ 模型和转录器加载完成")
+        print(f"[成功] 模型和转录器加载完成")
     
     def extract_audio_from_video(self, video_path: str) -> str:
         """
@@ -728,7 +821,7 @@ class VideoSubtitleGenerator:
         Returns:
             提取的音频文件路径
         """
-        print(f"🎵 从视频提取音频...")
+        print(f"[音频] 从视频提取音频...")
         
         video_file = Path(video_path)
         if not video_file.exists():
@@ -756,17 +849,17 @@ class VideoSubtitleGenerator:
                     error_msg = result.stderr.decode('gbk', errors='ignore')
                 raise RuntimeError(f"音频提取失败: {error_msg}")
             
-            print(f"✅ 音频提取完成: {audio_path}")
+            print(f"[完成] 音频提取完成: {audio_path}")
             return str(audio_path)
             
         except Exception as e:
-            print(f"❌ 音频提取失败: {e}")
+            print(f"[失败] 音频提取失败: {e}")
             # 备用方案：使用librosa直接读取视频音频
             try:
-                print("🔄 尝试备用音频提取方案...")
+                print("[备用] 尝试备用音频提取方案...")
                 audio, sr = librosa.load(video_path, sr=16000)
                 librosa.output.write_wav(str(audio_path), audio, sr)
-                print(f"✅ 备用方案音频提取完成: {audio_path}")
+                print(f"[完成] 备用方案音频提取完成: {audio_path}")
                 return str(audio_path)
             except Exception as fallback_e:
                 raise RuntimeError(f"所有音频提取方法均失败: {fallback_e}")
@@ -782,7 +875,7 @@ class VideoSubtitleGenerator:
         Returns:
             转录结果字典
         """
-        print(f"🎤 开始音频转录...")
+        print(f"[转录] 开始音频转录...")
         
         # 默认转录参数
         default_params = {
@@ -824,13 +917,13 @@ class VideoSubtitleGenerator:
                 result["transcription_mode"] = "memory_optimized"
                 
                 print(f"✅ 内存优化音频转录完成")
-                print(f"📊 识别片段数: {len(result.get('segments', []))}")
-                print(f"📝 总文本长度: {len(result.get('text', ''))} 字符")
+                print(f"[统计] 识别片段数: {len(result.get('segments', []))}")
+                print(f"[文本] 总文本长度: {len(result.get('text', ''))} 字符")
                 
                 return result
                 
             except Exception as e:
-                print(f"⚠️ 内存优化转录失败，回退到标准模式: {e}")
+                print(f"[警告] 内存优化转录失败，回退到标准模式: {e}")
         
         # 检查是否需要分段转录
         segment_duration = transcribe_kwargs.get("segment_duration", 0)
@@ -843,15 +936,15 @@ class VideoSubtitleGenerator:
             
             # 如果音频时长超过10分钟或明确指定使用分段转录，则启用分段模式
             if audio_duration > 600 or use_segmented:  # 10分钟
-                print(f"📊 音频时长: {audio_duration:.2f} 秒 ({timedelta(seconds=int(audio_duration))})")
-                print(f"🔀 启用分段转录模式")
+                print(f"[统计] 音频时长: {audio_duration:.2f} 秒 ({timedelta(seconds=int(audio_duration))})")
+                print(f"[模式] 启用分段转录模式")
                 
                 # 设置分段参数
                 segment_duration = segment_duration if segment_duration > 0 else 300  # 默认5分钟一段
                 overlap = transcribe_kwargs.get("overlap", 5)  # 默认重叠5秒
                 checkpoint_dir = str(self.temp_dir / "whisper_checkpoints")
                 
-                print(f"⚙️  分段参数: 每段 {segment_duration} 秒，重叠 {overlap} 秒")
+                print(f"[参数] 分段参数: 每段 {segment_duration} 秒，重叠 {overlap} 秒")
                 
                 # 过滤掉分段转录相关的参数，只保留Whisper转录参数
                 whisper_params = {k: v for k, v in params.items() 
@@ -876,17 +969,17 @@ class VideoSubtitleGenerator:
                 result["transcription_mode"] = "segmented"
                 
                 print(f"✅ 分段音频转录完成")
-                print(f"📊 识别片段数: {len(result.get('segments', []))}")
-                print(f"📝 总文本长度: {len(result.get('text', ''))} 字符")
+                print(f"[统计] 识别片段数: {len(result.get('segments', []))}")
+                print(f"[文本] 总文本长度: {len(result.get('text', ''))} 字符")
                 
                 return result
             
         except Exception as e:
-            print(f"⚠️ 音频时长检测失败，使用标准转录模式: {e}")
+            print(f"[警告] 音频时长检测失败，使用标准转录模式: {e}")
         
         # 标准转录模式
         try:
-            print(f"🔀 使用标准转录模式")
+            print(f"[模式] 使用标准转录模式")
             # 过滤掉非Whisper参数
             whisper_params = {k: v for k, v in params.items() 
                              if k not in ["segment_duration", "overlap", "use_segmented", "use_memory_optimization"]}
@@ -899,13 +992,13 @@ class VideoSubtitleGenerator:
             result["transcription_mode"] = "standard"
             
             print(f"✅ 音频转录完成")
-            print(f"📊 识别片段数: {len(result.get('segments', []))}")
-            print(f"📝 总文本长度: {len(result.get('text', ''))} 字符")
+            print(f"[统计] 识别片段数: {len(result.get('segments', []))}")
+            print(f"[文本] 总文本长度: {len(result.get('text', ''))} 字符")
             
             return result
             
         except Exception as e:
-            print(f"❌ 音频转录失败: {e}")
+            print(f"[失败] 音频转录失败: {e}")
             raise
     
     def generate_srt_content(self, transcription_result: Dict) -> str:
@@ -946,7 +1039,7 @@ class VideoSubtitleGenerator:
             print(f"✅ SRT内容生成完成，共 {len(segments)} 个字幕条目")
         else:
             # 如果没有时间戳片段但有文本内容，生成虚拟时间戳
-            print(f"⚠️  转录结果中没有时间戳片段，生成虚拟时间戳")
+            print(f"[警告] 转录结果中没有时间戳片段，生成虚拟时间戳")
             
             # 分割文本为段落
             paragraphs = [p.strip() for p in text.split('。') if p.strip()]
@@ -1017,7 +1110,7 @@ class VideoSubtitleGenerator:
         with open(srt_path, 'w', encoding='utf-8') as f:
             f.write(srt_content)
         
-        print(f"💾 SRT文件已保存: {srt_path}")
+        print(f"[保存] SRT文件已保存: {srt_path}")
         return str(srt_path)
     
     def save_transcription_result(self, result: Dict, video_path: str) -> str:
@@ -1038,7 +1131,7 @@ class VideoSubtitleGenerator:
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         
-        print(f"💾 转录结果已保存: {json_path}")
+        print(f"[保存] 转录结果已保存: {json_path}")
         return str(json_path)
     
     def cleanup_temp_files(self, keep_audio: bool = False, keep_json: bool = False, keep_srt: bool = False):
@@ -1065,9 +1158,9 @@ class VideoSubtitleGenerator:
                 
                 try:
                     file_path.unlink()
-                    print(f"🗑️  已删除: {file_path.name}")
+                    print(f"[删除] 已删除: {file_path.name}")
                 except Exception as e:
-                    print(f"⚠️  删除失败 {file_path.name}: {e}")
+                    print(f"[警告] 删除失败 {file_path.name}: {e}")
             elif file_path.is_dir():
                 # 清理检查点目录
                 if file_path.name in ["memory_safe_checkpoints", "whisper_checkpoints"]:
@@ -1075,11 +1168,11 @@ class VideoSubtitleGenerator:
                         # 删除目录及其所有内容
                         import shutil
                         shutil.rmtree(file_path)
-                        print(f"🗑️  已删除检查点目录: {file_path.name}")
+                        print(f"[删除] 已删除检查点目录: {file_path.name}")
                     except Exception as e:
-                        print(f"⚠️  删除检查点目录失败 {file_path.name}: {e}")
+                        print(f"[警告] 删除检查点目录失败 {file_path.name}: {e}")
         
-        print(f"✅ 临时文件清理完成")
+        print(f"[完成] 临时文件清理完成")
     
     def generate_subtitles(self, video_path: str, 
                           output_srt: bool = True,
@@ -1108,8 +1201,12 @@ class VideoSubtitleGenerator:
             包含所有结果的字典
         """
         print("=" * 60)
-        print(f"🎬 开始处理视频: {Path(video_path).name}")
+        print(f"[开始] 开始处理视频: {Path(video_path).name}")
         print("=" * 60)
+        
+        # 初始化耗时跟踪器
+        time_tracker = TimeTracker()
+        time_tracker.checkpoint("初始化")
         
         start_time = time.time()
         result = {
@@ -1124,6 +1221,7 @@ class VideoSubtitleGenerator:
             audio_path = self.extract_audio_from_video(video_path)
             result["audio_path"] = audio_path
             result["steps"]["audio_extraction"] = time.time() - audio_start
+            time_tracker.checkpoint("音频提取")
             
             # 步骤2: 转录音频
             transcribe_start = time.time()
@@ -1131,7 +1229,7 @@ class VideoSubtitleGenerator:
             # 如果启用了内存优化功能，自动启用内存优化转录模式
             if self.enable_memory_optimization and not use_memory_optimization:
                 use_memory_optimization = True
-                print(f"🧠 检测到内存优化功能已启用，自动启用内存优化转录模式")
+                print(f"[内存优化] 检测到内存优化功能已启用，自动启用内存优化转录模式")
             
             # 添加分段转录和内存优化参数
             transcribe_params = {
@@ -1145,6 +1243,7 @@ class VideoSubtitleGenerator:
             transcription_result = self.transcribe_audio(audio_path, **transcribe_params)
             result["transcription_result"] = transcription_result
             result["steps"]["audio_transcription"] = time.time() - transcribe_start
+            time_tracker.checkpoint("音频转录")
             
             # 记录转录模式
             result["transcription_mode"] = transcription_result.get("transcription_mode", "unknown")
@@ -1154,6 +1253,7 @@ class VideoSubtitleGenerator:
             srt_content = self.generate_srt_content(transcription_result)
             result["srt_content"] = srt_content
             result["steps"]["srt_generation"] = time.time() - srt_start
+            time_tracker.checkpoint("SRT内容生成")
             
             # 步骤4: 保存文件
             save_start = time.time()
@@ -1167,12 +1267,14 @@ class VideoSubtitleGenerator:
                 result["json_path"] = json_path
             
             result["steps"]["file_saving"] = time.time() - save_start
+            time_tracker.checkpoint("文件保存")
             
             # 步骤5: 清理
             if cleanup:
                 cleanup_start = time.time()
                 self.cleanup_temp_files(keep_audio=not cleanup, keep_json=output_json, keep_srt=output_srt)
                 result["steps"]["cleanup"] = time.time() - cleanup_start
+                time_tracker.checkpoint("临时文件清理")
             
             # 计算总时间
             total_time = time.time() - start_time
@@ -1181,9 +1283,9 @@ class VideoSubtitleGenerator:
             
             # 输出统计信息
             print("=" * 60)
-            print(f"✅ 处理完成!")
+            print(f"[完成] 处理完成!")
             print("=" * 60)
-            print(f"📊 处理统计:")
+            print(f"[统计] 处理统计:")
             print(f"   视频文件: {Path(video_path).name}")
             print(f"   转录模式: {result.get('transcription_mode', 'unknown')}")
             print(f"   总处理时间: {total_time:.2f}秒")
@@ -1210,20 +1312,23 @@ class VideoSubtitleGenerator:
             if output_json:
                 print(f"   JSON文件: {result.get('json_path', '未生成')}")
             
-            print(f"⏱️  各步骤耗时:")
+            print(f"[耗时] 各步骤耗时:")
             for step, duration in result["steps"].items():
                 print(f"     {step}: {duration:.2f}秒")
+            
+            # 打印耗时总结
+            time_tracker.print_summary()
             
             return result
             
         except Exception as e:
-            print(f"❌ 处理失败: {e}")
+            print(f"[失败] 处理失败: {e}")
             result["error"] = str(e)
             result["processing_end_time"] = time.time()
             result["total_processing_time"] = time.time() - start_time
             
             # 发生错误时保留临时文件以便调试
-            print(f"⚠️  发生错误，临时文件将保留在 {self.temp_dir}")
+            print(f"[警告] 发生错误，临时文件将保留在 {self.temp_dir}")
             
             return result
 
@@ -1231,6 +1336,10 @@ class VideoSubtitleGenerator:
 def main():
     """主函数 - 命令行接口"""
     import argparse
+    
+    # 初始化总耗时跟踪器
+    total_time_tracker = TimeTracker()
+    total_time_tracker.checkpoint("程序启动")
     
     parser = argparse.ArgumentParser(description="视频字幕生成工具")
     parser.add_argument("video_path", help="视频文件路径")
@@ -1264,10 +1373,11 @@ def main():
                        help="强制使用内存优化转录模式")
     
     args = parser.parse_args()
+    total_time_tracker.checkpoint("参数解析")
     
     # 验证视频文件存在
     if not Path(args.video_path).exists():
-        print(f"❌ 视频文件不存在: {args.video_path}")
+        print(f"[失败] 视频文件不存在: {args.video_path}")
         return 1
     
     # 初始化字幕生成器
@@ -1278,8 +1388,9 @@ def main():
             enable_memory_optimization=args.enable_memory_optimization,
             max_chunk_duration=args.max_chunk_duration
         )
+        total_time_tracker.checkpoint("字幕生成器初始化")
     except Exception as e:
-        print(f"❌ 初始化失败: {e}")
+        print(f"[失败] 初始化失败: {e}")
         return 1
     
     # 设置输出目录
@@ -1304,20 +1415,25 @@ def main():
         use_memory_optimization=args.force_memory_optimized,
         **transcribe_params
     )
+    total_time_tracker.checkpoint("字幕生成完成")
     
     # 处理结果
     if "error" in result:
-        print(f"❌ 字幕生成失败: {result['error']}")
+        print(f"[失败] 字幕生成失败: {result['error']}")
+        total_time_tracker.checkpoint("处理失败")
+        total_time_tracker.print_summary()
         return 1
     else:
-        print(f"🎉 字幕生成成功!")
+        print(f"[成功] 字幕生成成功!")
+        total_time_tracker.checkpoint("处理成功")
+        total_time_tracker.print_summary()
         return 0
 
 
 if __name__ == "__main__":
     # 示例用法
     if len(os.sys.argv) == 1:
-        print("🎯 视频字幕生成工具")
+        print("[工具] 视频字幕生成工具")
         print("=" * 50)
         print("使用方法:")
         print("  python whisper-translation.py <视频文件路径> [选项]")
@@ -1354,7 +1470,7 @@ if __name__ == "__main__":
         # 测试示例
         test_video = input("输入测试视频路径 (或按回车跳过): ").strip()
         if test_video and Path(test_video).exists():
-            print(f"\n🎬 开始测试处理: {test_video}")
+            print(f"\n[开始] 开始测试处理: {test_video}")
             
             generator = VideoSubtitleGenerator(model_name="base", device="cpu")
             result = generator.generate_subtitles(
@@ -1365,7 +1481,7 @@ if __name__ == "__main__":
                 language="ja"
             )
         else:
-            print("❌ 未提供有效的测试视频路径")
+            print("[失败] 未提供有效的测试视频路径")
     else:
         # 正常命令行执行
         exit(main())
