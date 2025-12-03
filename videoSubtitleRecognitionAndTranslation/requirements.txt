@@ -1,23 +1,16 @@
-# 视频字幕识别与翻译工具依赖包
+# Whisper video subtitle generation tool dependencies
 
-# 核心依赖
+# Core audio processing
+librosa>=0.10.0
+
+# Whisper speech recognition
 openai-whisper>=20231117
-requests>=2.31.0
 
-# 音频/视频处理
-tqdm>=4.66.1
-ffmpeg-python>=0.2.0
+# Audio processing
+numpy>=1.21.0
 
-# 系统工具
-psutil>=5.9.5
+# System monitoring
+psutil>=5.9.0
 
-# 数据处理
-numpy>=1.24.3
-
-# 可选：用于更好的进度显示
-colorama>=0.4.6
-
-# 开发工具
-pytest>=7.4.3
-black>=23.9.1
-flake8>=6.0.0
+# Video processing
+moviepy>=1.0.3
