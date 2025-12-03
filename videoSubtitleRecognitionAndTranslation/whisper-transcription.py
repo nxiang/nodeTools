@@ -765,18 +765,40 @@ class VideoSubtitleGenerator:
             max_chunk_duration: 内存优化模式下的最大分块时长（秒）
         """
         print(f"[初始化] 初始化视频字幕生成器...")
-        print(f"[模型] 加载模型: {model_name}")
+        print(f"[模型] 模型名称: {model_name}")
         print(f"[设备] 设备: {device}")
         
         # 确保temp目录存在
         self.temp_dir = Path("temp")
         self.temp_dir.mkdir(exist_ok=True)
         
+        # 保存模型参数，延迟加载模型
+        self.model_name = model_name
+        self.device = device
+        self.enable_memory_optimization = enable_memory_optimization
+        self.max_chunk_duration = max_chunk_duration
+        
+        # 延迟加载的模型和转录器
+        self.model = None
+        self.segment_transcriber = None
+        self.memory_efficient_transcriber = None
+        
+        print(f"[成功] 字幕生成器初始化完成（模型延迟加载）")
+    
+    def _lazy_load_model(self):
+        """
+        延迟加载Whisper模型和转录器
+        只有在需要转录时才加载模型，避免不必要的资源消耗
+        """
+        if self.model is not None:
+            return  # 模型已经加载
+            
+        print(f"[加载] 延迟加载Whisper模型: {self.model_name}")
+        
         # 加载Whisper模型
         try:
-            print(f"[加载] 正在加载Whisper模型: {model_name}")
-            self.model = whisper.load_model(model_name, device=device)
-            self.device = device
+            print(f"[加载] 正在加载Whisper模型: {self.model_name}")
+            self.model = whisper.load_model(self.model_name, device=self.device)
             print(f"[成功] Whisper模型加载成功")
         except Exception as e:
             print(f"[失败] Whisper模型加载失败: {e}")
@@ -785,23 +807,21 @@ class VideoSubtitleGenerator:
         # 初始化分段转录器（重用已加载的模型）
         try:
             print(f"[加载] 正在初始化分段转录器")
-            self.segment_transcriber = WhisperSegmentResume(self.model, device)
+            self.segment_transcriber = WhisperSegmentResume(self.model, self.device)
             print(f"[成功] 分段转录器初始化成功")
         except Exception as e:
             print(f"[失败] 分段转录器初始化失败: {e}")
             raise
         
         # 初始化内存优化转录器（仅在需要时加载）
-        self.enable_memory_optimization = enable_memory_optimization
-        self.memory_efficient_transcriber = None
-        if enable_memory_optimization:
+        if self.enable_memory_optimization:
             print(f"[内存优化] 启用内存优化模式")
-            print(f"[参数] 最大分块时长: {max_chunk_duration}秒")
+            print(f"[参数] 最大分块时长: {self.max_chunk_duration}秒")
             try:
                 self.memory_efficient_transcriber = MemoryEfficientWhisper(
                     self.model,
-                    device=device,
-                    max_chunk_duration=max_chunk_duration,
+                    device=self.device,
+                    max_chunk_duration=self.max_chunk_duration,
                     checkpoint_dir=str(self.temp_dir / "memory_safe_checkpoints")
                 )
                 print(f"[成功] 内存优化转录器初始化成功")
@@ -821,7 +841,7 @@ class VideoSubtitleGenerator:
         Returns:
             提取的音频文件路径
         """
-        print(f"[音频] 从视频提取音频...")
+        print(f"[音频] 检查音频文件...")
         
         video_file = Path(video_path)
         if not video_file.exists():
@@ -830,6 +850,13 @@ class VideoSubtitleGenerator:
         # 生成音频文件名
         audio_filename = f"{video_file.stem}_audio.wav"
         audio_path = self.temp_dir / audio_filename
+        
+        # 检查音频文件是否已存在
+        if audio_path.exists():
+            print(f"[跳过] 音频文件已存在: {audio_path}")
+            return str(audio_path)
+        
+        print(f"[音频] 从视频提取音频...")
         
         # 使用ffmpeg提取音频
         try:
@@ -876,6 +903,9 @@ class VideoSubtitleGenerator:
             转录结果字典
         """
         print(f"[转录] 开始音频转录...")
+        
+        # 延迟加载模型（只有在需要转录时才加载）
+        self._lazy_load_model()
         
         # 默认转录参数
         default_params = {
@@ -1225,7 +1255,7 @@ class VideoSubtitleGenerator:
             time_tracker.checkpoint("执行前清理")
         
         try:
-            # 步骤1: 提取音频
+            # 步骤1: 提取音频（在模型加载之前）
             audio_start = time.time()
             audio_path = self.extract_audio_from_video(video_path)
             result["audio_path"] = audio_path
