@@ -57,7 +57,7 @@ class SRTTranslator:
         self.session = requests.Session()
         
         # 设置缓存文件路径
-        self.cache_dir = Path("temp")
+        self.cache_dir = Path("translation_caches")
         self.cache_dir.mkdir(exist_ok=True)
         self.cache_file = self.cache_dir / f"translation_cache_{source_lang}_{target_lang}.json"
         self.translation_cache = self._load_cache()

@@ -58,7 +58,7 @@ class VideoTranslator:
         初始化视频翻译器
         
         Args:
-            whisper_model: Whisper模型大小 (tiny, base, small, medium, large, large-v2, large-v3)
+            whisper_model: Whisper模型大小 (tiny, base, small, medium, large, large-v1, large-v2, large-v3, large-v3-turbo, turbo)
             device: 运行设备 (cpu, cuda)
             source_lang: 源语言代码 (ja=日语, en=英语等)
             target_lang: 目标语言代码 (zh-CN=简体中文)
@@ -85,7 +85,7 @@ class VideoTranslator:
     
     def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 60) -> Optional[str]:
         """
-        运行Whisper转录，生成SRT文件
+        运行Whisper转录，生成SRT字幕文件
         
         Args:
             video_path: 视频文件路径
@@ -96,63 +96,178 @@ class VideoTranslator:
         Returns:
             SRT文件路径，失败返回None
         """
-        if output_dir is None:
-            output_dir = self.workspace_dir
-        
-        # 构建Whisper转录命令
-        command = [
-            sys.executable, str(self.whisper_script),
-            video_path,
-            "--model", self.whisper_model,
-            "--device", self.device,
-            "--language", self.source_lang,
-            "--output-dir", str(output_dir),
-            # "--clean"  # 清理临时文件
-        ]
-        
-        # 添加内存优化参数
-        if enable_memory_optimization:
-            command.extend(["--enable-memory-optimization"])
-            command.extend(["--max-chunk-duration", str(max_chunk_duration)])
-        
-        print(f"[转录] 开始Whisper转录...")
-        print(f"   视频文件: {Path(video_path).name}")
-        print(f"   模型: {self.whisper_model}")
-        print(f"   设备: {self.device}")
-        print(f"   语言: {self.source_lang}")
-        if enable_memory_optimization:
-            print(f"   内存优化: 已启用，分块时长: {max_chunk_duration}秒")
-        
         try:
-            # 运行转录命令，实时显示输出
-            result = subprocess.run(command, capture_output=False, text=True, cwd=self.script_dir)
+            # 构建命令行参数 - 只传递whisper-transcription.py支持的参数
+            cmd = [
+                sys.executable, 'whisper-transcription.py',
+                video_path,
+                '--model', self.whisper_model,
+                '--language', self.source_lang,
+                '--segment-duration', str(max_chunk_duration)
+            ]
             
-            # 由于capture_output=False，输出会直接显示，不需要额外处理
+            print(f"[Whisper] 开始转录...")
+            print(f"   视频文件: {Path(video_path).name}")
+            print(f"   模型: {self.whisper_model}")
+            print(f"   语言: {self.source_lang}")
+            print(f"   分段时长: {max_chunk_duration}秒")
+            
+            # 执行转录，实时显示输出
+            result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
             
             if result.returncode == 0:
-                # 转录成功，查找生成的SRT文件
-                video_stem = Path(video_path).stem
-                srt_file = Path(output_dir) / f"{video_stem}.srt"
+                # whisper-transcription.py生成的文件路径格式: temp/{video_name}_{hash}_{model}/transcription.txt
+                video_name = Path(video_path).stem
                 
-                if srt_file.exists():
-                    print(f"[成功] Whisper转录完成: {srt_file}")
-                    return str(srt_file)
+                # 查找temp目录下的转录文件
+                temp_dir = Path("temp")
+                if not temp_dir.exists():
+                    print(f"[Whisper] temp目录不存在: {temp_dir}")
+                    return None
+                
+                # 查找匹配的转录文件
+                # 由于文件名可能包含特殊字符（如方括号），使用更安全的搜索方式
+                txt_files = []
+                for subdir in temp_dir.iterdir():
+                    if subdir.is_dir() and video_name in subdir.name and self.whisper_model in subdir.name:
+                        txt_file = subdir / "transcription.txt"
+                        if txt_file.exists():
+                            txt_files.append(txt_file)
+                            break  # 找到第一个匹配的就退出
+                
+                if txt_files:
+                    txt_file = txt_files[0]  # 取第一个匹配的文件
+                    
+                    # 将txt文件转换为SRT格式
+                    srt_file = self._convert_txt_to_srt(txt_file)
+                    if srt_file:
+                        # 将SRT文件移动到输出目录
+                        if output_dir:
+                            output_path = Path(output_dir)
+                            output_path.mkdir(exist_ok=True)
+                            final_srt_file = output_path / f"{video_name}.srt"
+                            srt_file.rename(final_srt_file)
+                            print(f"[Whisper] 转录完成: {final_srt_file.name}")
+                            return str(final_srt_file)
+                        else:
+                            print(f"[Whisper] 转录完成: {srt_file.name}")
+                            return str(srt_file)
+                    else:
+                        print(f"[Whisper] SRT文件转换失败")
+                        return None
                 else:
-                    print(f"[失败] 未找到生成的SRT文件: {srt_file}")
+                    print(f"[Whisper] 转录文件未找到，搜索模式: {pattern}")
                     return None
             else:
-                print(f"[失败] Whisper转录失败 (返回码: {result.returncode}):")
-                # 尝试直接运行whisper-transcription.py来调试
-                debug_command = command + ["--help"]
-                debug_result = subprocess.run(debug_command, capture_output=True, text=True, cwd=self.script_dir)
-                if debug_result.returncode == 0:
-                    print(f"   调试: whisper-transcription.py 可以正常运行")
+                # 由于capture_output=False，stderr不会被捕获，显示通用错误信息
+                print(f"[Whisper] 转录过程出现错误，但可能已有部分转录内容")
+                print(f"[Whisper] 返回码: {result.returncode}")
+                
+                # 检查是否已经生成了部分转录文件
+                video_name = Path(video_path).stem
+                temp_dir = Path("temp")
+                
+                # 由于文件名可能包含特殊字符（如方括号），使用更安全的搜索方式
+                # 先找到所有包含视频名称的目录，然后在这些目录中查找transcription.txt
+                txt_files = []
+                for subdir in temp_dir.iterdir():
+                    if subdir.is_dir() and video_name in subdir.name:
+                        txt_file = subdir / "transcription.txt"
+                        if txt_file.exists():
+                            txt_files.append(txt_file)
+                            break  # 找到第一个匹配的就退出
+                
+                if txt_files:
+                    print(f"[Whisper] 发现部分转录文件，可能仍有可用内容")
+                    txt_file = txt_files[0]
+                    srt_file = self._convert_txt_to_srt(txt_file)
+                    if srt_file:
+                        # 重命名为partial.srt以表示部分转录
+                        partial_srt = srt_file.with_name(f"{video_name}_partial.srt")
+                        srt_file.rename(partial_srt)
+                        print(f"[Whisper] 部分转录转换完成: {partial_srt.name}")
+                        
+                        # 将SRT文件移动到输出目录
+                        if output_dir:
+                            output_path = Path(output_dir)
+                            output_path.mkdir(exist_ok=True)
+                            final_srt_file = output_path / f"{video_name}_partial.srt"
+                            partial_srt.rename(final_srt_file)
+                            print(f"[Whisper] 已生成部分转录文件: {final_srt_file.name}")
+                            return str(final_srt_file)
+                        else:
+                            print(f"[Whisper] 已生成部分转录文件: {partial_srt.name}")
+                            return str(partial_srt)
+                    else:
+                        print("[Whisper] 部分转录转换失败")
+                        return None
                 else:
-                    print(f"   调试: whisper-transcription.py 也存在问题")
-                return None
+                    print(f"[Whisper] 转录失败，返回码: {result.returncode}")
+                    return None
                 
         except Exception as e:
-            print(f"[失败] 运行Whisper转录时出错: {e}")
+            print(f"❌ 运行Whisper转录时出错: {e}")
+            return None
+    
+    def _convert_txt_to_srt(self, txt_file: Path) -> Optional[Path]:
+        """
+        将whisper-transcription.py生成的txt文件转换为SRT格式
+        
+        Args:
+            txt_file: 输入的txt文件路径
+            
+        Returns:
+            转换后的SRT文件路径，失败返回None
+        """
+        try:
+            # 读取txt文件内容
+            with open(txt_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # 跳过文件头信息（前几行）
+            content_lines = []
+            for line in lines:
+                if line.strip() and '=' not in line and not line.startswith('视频:') and not line.startswith('模型:'):
+                    content_lines.append(line.strip())
+            
+            # 解析时间戳和文本
+            srt_entries = []
+            entry_index = 1
+            
+            for line in content_lines:
+                if line.startswith('[') and ']' in line:
+                    # 解析时间戳行，如: [00:01:23 - 00:01:45] 文本内容
+                    time_part, text_part = line.split(']', 1)
+                    time_part = time_part[1:]  # 去掉开头的[
+                    
+                    if ' - ' in time_part:
+                        start_time, end_time = time_part.split(' - ', 1)
+                        
+                        # 将时间格式转换为SRT格式（HH:MM:SS,mmm）
+                        def convert_time_format(time_str):
+                            # 格式: HH:MM:SS -> HH:MM:SS,000
+                            parts = time_str.split(':')
+                            if len(parts) == 3:
+                                return f"{parts[0]}:{parts[1]}:{parts[2]},000"
+                            return time_str
+                        
+                        srt_start = convert_time_format(start_time.strip())
+                        srt_end = convert_time_format(end_time.strip())
+                        
+                        # 创建SRT条目
+                        srt_entry = f"{entry_index}\n{srt_start} --> {srt_end}\n{text_part.strip()}\n"
+                        srt_entries.append(srt_entry)
+                        entry_index += 1
+            
+            # 生成SRT文件
+            srt_file = txt_file.with_suffix('.srt')
+            with open(srt_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(srt_entries))
+            
+            return srt_file
+            
+        except Exception as e:
+            print(f"❌ 转换txt到SRT时出错: {e}")
             return None
     
     def run_srt_translation(self, srt_path: str) -> bool:
@@ -297,8 +412,8 @@ def main():
     
     parser = argparse.ArgumentParser(description="视频翻译工具")
     parser.add_argument("video_path", help="视频文件路径")
-    parser.add_argument("--model", default="base", 
-                       choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"],
+    parser.add_argument("--model", "-m", default="base", 
+                       choices=["tiny", "base", "small", "medium", "large", "large-v1", "large-v2", "large-v3", "large-v3-turbo", "turbo"],
                        help="Whisper模型大小 (默认: base)")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                        help="运行设备 (默认: cpu)")
@@ -358,7 +473,7 @@ if __name__ == "__main__":
         print("  python video-translation.py <视频文件路径> [选项]")
         print("")
         print("选项:")
-        print("  --model MODEL        Whisper模型 (tiny, base, small, medium, large, large-v2, large-v3)")
+        print("  --model MODEL        Whisper模型 (tiny, base, small, medium, large, large-v1, large-v2, large-v3, large-v3-turbo, turbo)")
         print("  --device DEVICE      运行设备 (cpu, cuda)")
         print("  --source-lang LANG   源语言代码 (ja, zh, en等)")
         print("  --target-lang LANG   目标语言代码 (zh-CN, en等)")
@@ -366,7 +481,7 @@ if __name__ == "__main__":
         print("")
         print("示例:")
         print("  python video-translation.py my_video.mp4 --model base --source-lang ja --target-lang zh-CN")
-        print("  python video-translation.py video.avi --model large-v3 --device cuda")
+        print("  python video-translation.py video.avi --model large-v4 --device cuda")
         print("")
         
         # 测试示例
