@@ -11,6 +11,7 @@ import time
 import subprocess
 from pathlib import Path
 from typing import Dict, Optional
+import send2trash  # 新增导入，用于将文件移动到回收站
 
 
 class TimeTracker:

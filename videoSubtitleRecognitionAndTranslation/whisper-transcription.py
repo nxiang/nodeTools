@@ -11,6 +11,7 @@ import numpy as np
 import wave
 import contextlib
 from dotenv import load_dotenv
+import send2trash  # 新增导入，用于将文件移动到回收站
 load_dotenv()
 
 # 虚拟环境管理
@@ -352,50 +353,47 @@ class SegmentTranscriber:
             return []
     
 class WhisperXTranscriber:
-    def __init__(self, video_path, model_size="base", language="ja", segment_duration=60,
-                 batch_size=4, compute_type="int8", device="cpu"):
-        """
-        初始化 WhisperX 转录器
-        
-        Args:
-            video_path: 视频文件路径
-            model_size: Whisper模型大小 (tiny, base, small, medium, large, large-v1, large-v2, large-v3, large-v3-turbo, turbo)
-            language: 音频语言代码 (默认: ja - 日语)
-            segment_duration: 音频分段时长（秒），默认60秒（用于断点续传）
-            batch_size: 批处理大小，CPU上建议较小值（如4）
-            compute_type: 计算类型，CPU建议使用 "int8" 以节省内存
-            device: 计算设备，强制为 "cpu"
-        """
+    def __init__(self, video_path, model_size="base", language="ja", segment_duration=180,
+                 batch_size=4, compute_type="int8", device="cpu", cleanup=False):
+        """初始化转录器"""
         self.video_path = Path(video_path)
         self.model_size = model_size
         self.language = language
         self.segment_duration = segment_duration
         self.batch_size = batch_size
         self.compute_type = compute_type
-        self.device = device  # 强制使用CPU
+        self.device = device
+        self.cleanup = cleanup  # 是否清理临时文件
         
-        # 基础信息
-        self.video_name = self.video_path.stem
-        self.video_hash = hashlib.md5(str(self.video_path).encode()).hexdigest()[:8]
-        self.temp_base = Path("temp") / f"{self.video_name}_{self.video_hash}_{self.model_size}"
-        self.temp_base.mkdir(parents=True, exist_ok=True)
+        # 生成临时文件目录（基于视频文件哈希）
+        video_hash = hashlib.md5(str(self.video_path).encode()).hexdigest()[:8]
+        self.temp_base = Path(f"temp_{video_hash}")
+        self.temp_base.mkdir(exist_ok=True)
         
-        # 状态文件路径
+        # 临时文件路径
+        self.audio_file = self.temp_base / "audio.wav"
         self.state_file = self.temp_base / "transcription_state.json"
-        self.audio_file = self.temp_base / "extracted_audio.wav"
-        self.output_file = self.temp_base / "transcription.txt"
         self.progress_file = self.temp_base / "progress.txt"
         
-        # 时间戳记录
+        # 输出文件
+        self.output_file = self.video_path.with_suffix(".txt")
+        
+        # 状态和计时器
+        self.state = {
+            "segments": [],
+            "total_segments": 0,
+            "audio_duration": 0,
+            "completed_segments": set()
+        }
         self.timestamps = {
-            "start_time": None,
-            "audio_extraction_time": None,
-            "model_loading_time": None,
-            "transcription_time": None,
-            "total_time": None
+            "start_time": 0,
+            "audio_extraction_time": 0,
+            "model_loading_time": 0,
+            "transcription_time": 0,
+            "total_time": 0
         }
         
-        # 模型与对齐模型
+        # WhisperX模型
         self.model = None
         self.align_model = None
         self.align_metadata = None
@@ -835,10 +833,11 @@ class WhisperXTranscriber:
                 self._save_progress(segment_text)
                 
                 segment_time = time.time() - segment_start
+                cumulative_time = time.time() - self.timestamps["start_time"]
                 if len(segment_results) > 0:
-                    print(f"片段 {segment_index} 完成，耗时: {format_timedelta(segment_time)}")
+                    print(f"片段 {segment_index} 完成，耗时: {format_timedelta(segment_time)}，累计耗时: {format_timedelta(cumulative_time)}")
                 else:
-                    print(f"片段 {segment_index} 无语音内容，跳过")
+                    print(f"片段 {segment_index} 无语音内容，跳过，累计耗时: {format_timedelta(cumulative_time)}")
             else:
                 print(f"片段 {segment_index} 转录失败")
                 return False
@@ -868,22 +867,46 @@ class WhisperXTranscriber:
                 f.write(f"[{start} - {end}] {text}\n")
     
     def _cleanup(self):
-        """清理临时文件（与原代码一致）"""
+        """清理临时文件（修改为移动到回收站）"""
         try:
+            # 使用send2trash将文件移动到回收站而不是直接删除
             if self.state_file.exists():
-                self.state_file.unlink()
+                send2trash.send2trash(str(self.state_file))
             if self.progress_file.exists():
-                self.progress_file.unlink()
+                send2trash.send2trash(str(self.progress_file))
             if self.audio_file.exists():
-                self.audio_file.unlink()
+                send2trash.send2trash(str(self.audio_file))
+            
             segments_dir = self.temp_base / "segments"
             if segments_dir.exists():
+                # 先将所有音频片段文件移动到回收站
                 for file in segments_dir.glob("*.wav"):
-                    file.unlink()
-                segments_dir.rmdir()
-            print("临时文件已清理")
+                    send2trash.send2trash(str(file))
+                # 然后移动空目录到回收站
+                send2trash.send2trash(str(segments_dir))
+            
+            # 如果临时基础目录为空，也移动到回收站
+            if self.temp_base.exists() and not any(self.temp_base.iterdir()):
+                send2trash.send2trash(str(self.temp_base))
+            
+            print("临时文件已移动到回收站")
         except Exception as e:
             print(f"清理临时文件时出错: {e}")
+            # 如果send2trash失败，回退到原删除逻辑
+            try:
+                if self.state_file.exists():
+                    self.state_file.unlink()
+                if self.progress_file.exists():
+                    self.progress_file.unlink()
+                if self.audio_file.exists():
+                    self.audio_file.unlink()
+                if segments_dir.exists():
+                    for file in segments_dir.glob("*.wav"):
+                        file.unlink()
+                    segments_dir.rmdir()
+                print("临时文件已直接删除（回收站操作失败）")
+            except Exception as e2:
+                print(f"直接删除也失败: {e2}")
     
     def transcribe(self):
         """执行转录过程（主流程框架不变，内部更换为WhisperX）"""
@@ -911,21 +934,29 @@ class WhisperXTranscriber:
             # 阶段4: 转录所有片段（断点续传）
             transcription_success = self._transcribe_segments()
             
-            # 阶段5: 保存结果
-            if self.state["segments"]:
+            # 阶段5: 保存结果（只有在所有片段都成功时才保存）
+            if transcription_success and self.state["segments"]:
                 self._save_final_transcription()
-                
-                if transcription_success:
-                    print(f"\n转录完成！结果保存在: {self.output_file}")
-                else:
-                    print(f"\n转录部分完成！已保存 {len(self.state['segments'])} 个句子的转录结果到: {self.output_file}")
-                    print("注意：部分片段转录失败，但已保存可用内容")
+                print(f"\n转录完成！结果保存在: {self.output_file}")
+            elif self.state["segments"]:
+                # 部分片段失败，不保存结果文件，但保留状态用于断点续传
+                print(f"\n转录部分完成，已处理 {len(self.state['segments'])} 个句子")
+                print("注意：部分片段转录失败，未生成最终结果文件")
+                print(f"下次运行将从失败片段继续，状态文件: {self.state_file}")
+                return False
+            else:
+                # 没有任何成功转录的内容
+                print("\n转录失败，未生成任何结果")
+                return False
             
             if not transcription_success:
                 return False
             
-            # 阶段6: 清理临时文件
-            self._cleanup()
+            # 阶段6: 清理临时文件（默认不清理，仅在指定--cleanup时清理）
+            if self.cleanup:
+                self._cleanup()
+            else:
+                print(f"临时文件保留在: {self.temp_base}")
             
             # 计算总时间
             self.timestamps["total_time"] = time.time() - self.timestamps["start_time"]
@@ -937,9 +968,7 @@ class WhisperXTranscriber:
         except KeyboardInterrupt:
             print("\n转录被用户中断，已保存当前状态")
             self._save_state()
-            if self.state["segments"]:
-                self._save_final_transcription()
-                print(f"已保存部分转录结果到: {self.output_file}")
+            print(f"下次运行将从当前片段继续，状态文件: {self.state_file}")
             return False
         except Exception as e:
             print(f"转录过程中出错: {e}")
@@ -994,6 +1023,8 @@ def main():
                            help="批处理大小，CPU上建议较小值（默认: 4）")
         parser.add_argument("--compute-type", "-c", default="int8", choices=["float32", "int8"],
                            help="计算类型，CPU建议使用 int8 以节省内存（默认: int8）")
+        parser.add_argument("--cleanup", action="store_true",
+                           help="在程序开始前清理临时文件（默认不清理）")
         
         args = parser.parse_args()
         
@@ -1001,6 +1032,18 @@ def main():
         if not Path(args.video_path).exists():
             print(f"错误: 视频文件不存在: {args.video_path}")
             sys.exit(1)
+        
+        # 如果指定了--cleanup，先清理临时文件
+        if args.cleanup:
+            print("清理临时文件...")
+            video_hash = hashlib.md5(str(args.video_path).encode()).hexdigest()[:8]
+            temp_base = Path(f"temp_{video_hash}")
+            if temp_base.exists():
+                import shutil
+                shutil.rmtree(temp_base)
+                print(f"已清理临时目录: {temp_base}")
+            else:
+                print("未找到对应的临时目录，无需清理")
         
         # 创建转录器并执行（强制使用CPU）
         transcriber = WhisperXTranscriber(
@@ -1010,7 +1053,8 @@ def main():
             segment_duration=args.segment_duration,
             batch_size=args.batch_size,
             compute_type=args.compute_type,
-            device="cpu"  # 强制使用CPU
+            device="cpu",  # 强制使用CPU
+            cleanup=args.cleanup  # 传递清理参数
         )
         
         success = transcriber.transcribe()

@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import List, Dict, Optional
 import urllib.parse
+import send2trash  # 新增导入，用于将文件移动到回收站
 
 
 class TimeTracker:
@@ -314,18 +315,23 @@ class SRTTranslator:
             
             # 设置输出文件
             if output_file is None:
-                # 保持原文件名不变，将原文件重命名为.back.srt
+                # 保持原文件名不变，将原文件移动到回收站
                 output_path = input_path
-                backup_path = input_path.parent / f"{input_path.stem}.back.srt"
                 
-                # 如果原文件存在，先备份
+                # 如果原文件存在，先移动到回收站
                 if input_path.exists():
-                    import shutil
-                    shutil.copy2(input_path, backup_path)
-                    print(f"💾 备份原文件: {backup_path}")
+                    try:
+                        send2trash.send2trash(str(input_path))
+                        print(f"🗑️  原文件已移动到回收站: {input_path}")
+                    except Exception as e:
+                        print(f"⚠️  回收站操作失败，使用直接删除: {e}")
+                        # 如果回收站操作失败，使用原逻辑创建备份
+                        backup_path = input_path.parent / f"{input_path.stem}.back.srt"
+                        import shutil
+                        shutil.copy2(input_path, backup_path)
+                        print(f"💾 备份原文件: {backup_path}")
             else:
                 output_path = Path(output_file)
-                backup_path = None
             
             time_tracker.checkpoint("文件准备")
             
