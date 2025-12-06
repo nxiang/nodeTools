@@ -988,8 +988,8 @@ def main():
                            help="Whisper模型大小 (默认: base)")
         parser.add_argument("--language", "-l", default="ja", 
                            help="音频语言代码 (默认: ja - 日语)")
-        parser.add_argument("--segment-duration", "-s", type=int, default=60,
-                           help="音频分段时长（秒），默认60秒（用于断点续传）")
+        parser.add_argument("--segment-duration", "-s", type=int, default=180,
+                           help="音频分段时长（秒），默认180秒（用于断点续传）")
         parser.add_argument("--batch-size", "-b", type=int, default=4,
                            help="批处理大小，CPU上建议较小值（默认: 4）")
         parser.add_argument("--compute-type", "-c", default="int8", choices=["float32", "int8"],

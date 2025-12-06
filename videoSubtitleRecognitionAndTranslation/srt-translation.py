@@ -283,7 +283,7 @@ class SRTTranslator:
         original_font_size = max(8, translated_font_size - 2)
         
         # 格式化双语字幕（参考JUQ-587-C.srt格式）
-        formatted = f"<font size=\"{original_font_size}\" color=\"#FFD700\">{original_with_breaks}</font>\\n"
+        formatted = f"<font size=\"{original_font_size}\" color=\"#FFD700\">{original_with_breaks}</font>\n"
         formatted += f"<font size=\"{translated_font_size}\" color=\"#FFFFFF\">{translated_with_breaks}</font>"
         
         return formatted
