@@ -365,18 +365,24 @@ class WhisperXTranscriber:
         self.device = device
         self.cleanup = cleanup  # 是否清理临时文件
         
-        # 生成临时文件目录（基于视频文件哈希）
-        video_hash = hashlib.md5(str(self.video_path).encode()).hexdigest()[:8]
-        self.temp_base = Path(f"temp_{video_hash}")
-        self.temp_base.mkdir(exist_ok=True)
+        # 生成临时文件目录（按视频名+模型名隔离）
+        video_name = self.video_path.stem
+        # 清理文件名中的特殊字符，只保留字母数字和下划线
+        safe_video_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in video_name)
+        # 限制文件名长度，避免路径过长
+        safe_video_name = safe_video_name[:50]
+        
+        # 创建隔离的临时目录：temp/{safe_video_name}_{model_size}
+        self.temp_base = Path("temp") / f"{safe_video_name}_{self.model_size}"
+        self.temp_base.mkdir(parents=True, exist_ok=True)
         
         # 临时文件路径
         self.audio_file = self.temp_base / "audio.wav"
         self.state_file = self.temp_base / "transcription_state.json"
         self.progress_file = self.temp_base / "progress.txt"
         
-        # 输出文件
-        self.output_file = self.video_path.with_suffix(".txt")
+        # 输出文件 - 保存到临时目录而不是视频文件目录
+        self.output_file = self.temp_base / "transcription.txt"
         
         # 状态和计时器
         self.state = {
@@ -866,6 +872,60 @@ class WhisperXTranscriber:
                 text = segment['text'].strip()
                 f.write(f"[{start} - {end}] {text}\n")
     
+    def _check_complete_transcription(self):
+        """检查是否已有完整的转录结果"""
+        # 首先检查当前模型大小的状态文件
+        if self.state_file.exists():
+            state = self._load_state()
+            
+            # 检查是否有转录结果且所有片段都已处理
+            if state.get("segments") and state.get("processed_segments", 0) >= state.get("total_segments", 0):
+                print(f"发现已完成的转录结果: {len(state['segments'])} 个句子")
+                print(f"音频时长: {format_timedelta(state.get('audio_duration', 0))}")
+                print(f"已处理片段: {state.get('processed_segments', 0)}/{state.get('total_segments', 0)}")
+                
+                # 更新状态
+                self.state = state
+                return True
+        
+        # 如果当前模型大小的状态文件不存在或不完整，检查其他可能的模型大小
+        temp_dir = Path("temp")
+        if temp_dir.exists():
+            # 获取视频的安全名称
+            video_name = self.video_path.stem
+            safe_video_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in video_name)
+            safe_video_name = safe_video_name[:50]
+            
+            # 查找所有可能的模型目录
+            for model_dir in temp_dir.glob(f"{safe_video_name}_*"):
+                if model_dir.is_dir():
+                    state_file = model_dir / "transcription_state.json"
+                    if state_file.exists() and state_file != self.state_file:
+                        # 尝试加载状态
+                        try:
+                            with open(state_file, 'r', encoding='utf-8') as f:
+                                state = json.load(f)
+                            
+                            # 检查是否有完整的转录结果
+                            if state.get("segments") and state.get("processed_segments", 0) >= state.get("total_segments", 0):
+                                print(f"发现其他模型的完整转录结果: {model_dir.name}")
+                                print(f"转录句子: {len(state['segments'])} 个")
+                                print(f"音频时长: {format_timedelta(state.get('audio_duration', 0))}")
+                                
+                                # 更新模型大小和状态文件路径
+                                self.model_size = state.get("model_size", self.model_size)
+                                self.state_file = state_file
+                                self.temp_base = model_dir
+                                self.output_file = self.temp_base / "transcription.txt"
+                                
+                                # 更新状态
+                                self.state = state
+                                return True
+                        except Exception as e:
+                            print(f"检查状态文件 {state_file} 时出错: {e}")
+        
+        return False
+    
     def _cleanup(self):
         """清理临时文件（修改为移动到回收站）"""
         try:
@@ -915,6 +975,13 @@ class WhisperXTranscriber:
         print(f"设备: {self.device}, 计算类型: {self.compute_type}, 批处理大小: {self.batch_size}")
         print(f"临时文件目录: {self.temp_base}")
         print("-" * 50)
+        
+        # 检查是否已有完整的转录结果
+        if self._check_complete_transcription():
+            print("发现已完成的转录结果，直接生成最终文件...")
+            self._save_final_transcription()
+            print(f"转录结果已生成: {self.output_file}")
+            return True
         
         self.timestamps["start_time"] = time.time()
         

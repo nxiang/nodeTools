@@ -315,21 +315,15 @@ class SRTTranslator:
             
             # 设置输出文件
             if output_file is None:
-                # 保持原文件名不变，将原文件移动到回收站
+                # 保持原文件名不变，先创建备份
                 output_path = input_path
                 
-                # 如果原文件存在，先移动到回收站
+                # 如果原文件存在，先创建备份
                 if input_path.exists():
-                    try:
-                        send2trash.send2trash(str(input_path))
-                        print(f"🗑️  原文件已移动到回收站: {input_path}")
-                    except Exception as e:
-                        print(f"⚠️  回收站操作失败，使用直接删除: {e}")
-                        # 如果回收站操作失败，使用原逻辑创建备份
-                        backup_path = input_path.parent / f"{input_path.stem}.back.srt"
-                        import shutil
-                        shutil.copy2(input_path, backup_path)
-                        print(f"💾 备份原文件: {backup_path}")
+                    backup_path = input_path.parent / f"{input_path.stem}.back.srt"
+                    import shutil
+                    shutil.copy2(input_path, backup_path)
+                    print(f"💾 备份原文件: {backup_path}")
             else:
                 output_path = Path(output_file)
             

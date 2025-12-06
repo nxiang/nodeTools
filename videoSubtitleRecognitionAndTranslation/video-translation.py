@@ -114,6 +114,17 @@ class VideoTranslator:
                     print(f"   ✓ 找到转录文件: {txt_file}")
                     break  # 找到第一个匹配的就退出
         
+        # 如果找不到，尝试使用双下划线分隔符的格式查找
+        if not txt_files:
+            expected_dir_name = f"{video_name}__{self.whisper_model}"
+            for subdir in temp_dir.iterdir():
+                if subdir.is_dir() and subdir.name == expected_dir_name:
+                    txt_file = subdir / "transcription.txt"
+                    if txt_file.exists():
+                        txt_files.append(txt_file)
+                        print(f"   ✓ 找到转录文件（双下划线格式）: {txt_file}")
+                        break
+        
         if txt_files:
             txt_file = txt_files[0]
             
@@ -203,28 +214,42 @@ class VideoTranslator:
             result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
             
             if result.returncode == 0:
-                # whisper-transcription.py生成的文件路径格式: temp/{video_name}_{hash}_{model}/transcription.txt
+                # whisper-transcription.py生成的文件路径格式: temp/{video_name}_{model}/transcription.txt
                 video_name = Path(video_path).stem
                 
-                # 查找temp目录下的转录文件
-                temp_dir = Path("temp")
-                if not temp_dir.exists():
-                    print(f"[Whisper] temp目录不存在: {temp_dir}")
+                # 清理文件名中的特殊字符，只保留字母数字和下划线
+                safe_video_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in video_name)
+                # 限制文件名长度，避免路径过长
+                safe_video_name = safe_video_name[:50]
+                
+                # 查找转录文件 - 尝试两种目录格式
+                txt_file = None
+                
+                # 格式1: 单下划线分隔符
+                temp_dir1 = Path("temp") / f"{safe_video_name}_{self.whisper_model}"
+                if temp_dir1.exists():
+                    txt_file1 = temp_dir1 / "transcription.txt"
+                    if txt_file1.exists():
+                        txt_file = txt_file1
+                        print(f"[Whisper] 找到转录文件（单下划线格式）: {txt_file}")
+                
+                # 格式2: 双下划线分隔符
+                if txt_file is None:
+                    temp_dir2 = Path("temp") / f"{safe_video_name}__{self.whisper_model}"
+                    if temp_dir2.exists():
+                        txt_file2 = temp_dir2 / "transcription.txt"
+                        if txt_file2.exists():
+                            txt_file = txt_file2
+                            print(f"[Whisper] 找到转录文件（双下划线格式）: {txt_file}")
+                
+                if txt_file is None:
+                    print(f"[Whisper] 转录文件未找到，尝试了以下目录:")
+                    print(f"   格式1: {temp_dir1}")
+                    print(f"   格式2: {temp_dir2}")
                     return None
                 
-                # 查找匹配的转录文件
-                # 由于文件名可能包含特殊字符（如方括号），使用更安全的搜索方式
-                txt_files = []
-                for subdir in temp_dir.iterdir():
-                    if subdir.is_dir() and video_name in subdir.name and self.whisper_model in subdir.name:
-                        txt_file = subdir / "transcription.txt"
-                        if txt_file.exists():
-                            txt_files.append(txt_file)
-                            break  # 找到第一个匹配的就退出
-                
-                if txt_files:
-                    txt_file = txt_files[0]  # 取第一个匹配的文件
-                    
+                # 将txt文件转换为SRT格式
+                if txt_file.exists():
                     # 将txt文件转换为SRT格式
                     srt_file = self._convert_txt_to_srt(txt_file)
                     if srt_file:
@@ -243,7 +268,7 @@ class VideoTranslator:
                         print(f"[Whisper] SRT文件转换失败")
                         return None
                 else:
-                    print(f"[Whisper] 转录文件未找到")
+                    print(f"[Whisper] 转录文件未找到: {txt_file}")
                     return None
             else:
                 # 由于capture_output=False，stderr不会被捕获，显示通用错误信息
@@ -252,21 +277,40 @@ class VideoTranslator:
                 
                 # 检查是否已经生成了部分转录文件
                 video_name = Path(video_path).stem
-                temp_dir = Path("temp")
                 
-                # 由于文件名可能包含特殊字符（如方括号），使用更安全的搜索方式
-                # 先找到所有包含视频名称的目录，然后在这些目录中查找transcription.txt
-                txt_files = []
-                for subdir in temp_dir.iterdir():
-                    if subdir.is_dir() and video_name in subdir.name:
-                        txt_file = subdir / "transcription.txt"
-                        if txt_file.exists():
-                            txt_files.append(txt_file)
-                            break  # 找到第一个匹配的就退出
+                # 清理文件名中的特殊字符，只保留字母数字和下划线
+                safe_video_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in video_name)
+                # 限制文件名长度，避免路径过长
+                safe_video_name = safe_video_name[:50]
                 
-                if txt_files:
+                # 查找转录文件 - 尝试两种目录格式
+                txt_file = None
+                
+                # 格式1: 单下划线分隔符
+                temp_dir1 = Path("temp") / f"{safe_video_name}_{self.whisper_model}"
+                if temp_dir1.exists():
+                    txt_file1 = temp_dir1 / "transcription.txt"
+                    if txt_file1.exists():
+                        txt_file = txt_file1
+                        print(f"[Whisper] 找到部分转录文件（单下划线格式）: {txt_file}")
+                
+                # 格式2: 双下划线分隔符
+                if txt_file is None:
+                    temp_dir2 = Path("temp") / f"{safe_video_name}__{self.whisper_model}"
+                    if temp_dir2.exists():
+                        txt_file2 = temp_dir2 / "transcription.txt"
+                        if txt_file2.exists():
+                            txt_file = txt_file2
+                            print(f"[Whisper] 找到部分转录文件（双下划线格式）: {txt_file}")
+                
+                if txt_file is None:
+                    print(f"[Whisper] 部分转录文件未找到，尝试了以下目录:")
+                    print(f"   格式1: {temp_dir1}")
+                    print(f"   格式2: {temp_dir2}")
+                    return None
+                
+                if txt_file.exists():
                     print(f"[Whisper] 发现部分转录文件，可能仍有可用内容")
-                    txt_file = txt_files[0]
                     srt_file = self._convert_txt_to_srt(txt_file)
                     if srt_file:
                         # 重命名为partial.srt以表示部分转录
@@ -366,18 +410,27 @@ class VideoTranslator:
         Returns:
             是否成功
         """
+        # 确保SRT文件路径是绝对路径
+        srt_abs_path = Path(srt_path).absolute()
+        
+        # 检查SRT文件是否存在
+        if not srt_abs_path.exists():
+            print(f"❌ SRT文件不存在: {srt_abs_path}")
+            return False
+        
         # 构建SRT翻译命令
         # 不指定输出文件名，让srt-translation.py自动处理：
         # 输出文件名改为原文件名，原文名改为.back.srt
         command = [
             sys.executable, str(self.srt_translation_script),
-            srt_path,
+            str(srt_abs_path),
             "--source-lang", self.source_lang,
             "--target-lang", self.target_lang
         ]
         
         print(f"[翻译] 开始SRT翻译...")
-        print(f"   输入文件: {Path(srt_path).name}")
+        print(f"   输入文件: {srt_abs_path.name}")
+        print(f"   文件路径: {srt_abs_path}")
         print(f"   源语言: {self.source_lang}")
         print(f"   目标语言: {self.target_lang}")
         print(f"   文件名处理: 输出文件将保持原文件名，原文件将备份为.back.srt")
