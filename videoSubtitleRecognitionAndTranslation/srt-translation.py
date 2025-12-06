@@ -228,9 +228,63 @@ class SRTTranslator:
         if not translated_clean:
             return f"<font size=\"16\" color=\"#FFFFFF\">{original_clean}</font>"
         
+        # 添加自动换行功能：每行最多显示指定字符数
+        def add_line_breaks(text, max_chars=20):
+            if not text:
+                return text
+            
+            lines = []
+            current_line = ""
+            
+            # 按字符逐个处理
+            for char in text:
+                # 如果当前行长度未超过限制，继续添加字符
+                if len(current_line) < max_chars:
+                    current_line += char
+                else:
+                    # 当前行已达到限制，添加到结果列表
+                    lines.append(current_line)
+                    current_line = char
+            
+            # 添加最后一行
+            if current_line:
+                lines.append(current_line)
+            
+            return '\\n'.join(lines)
+        
+        # 对原文和译文都进行换行处理
+        original_with_breaks = add_line_breaks(original_clean, 20)
+        translated_with_breaks = add_line_breaks(translated_clean, 25)
+        
+        # 根据文本长度动态调整字号
+        def get_font_size_by_length(text):
+            if not text:
+                return 16
+            
+            # 计算文本总长度（不考虑换行符）
+            total_length = len(text.replace("\\n", ""))
+            
+            # 根据长度调整字号
+            if total_length <= 20:
+                return 16  # 短文本使用正常字号
+            elif total_length <= 40:
+                return 14  # 中等长度文本稍小
+            elif total_length <= 60:
+                return 12  # 较长文本再小一些
+            else:
+                return 10  # 很长文本使用最小字号
+        
+        # 获取原文和译文的合适字号
+        # 原文使用比译文小两号的字体
+        original_font_size = get_font_size_by_length(original_clean)
+        translated_font_size = get_font_size_by_length(translated_clean)
+        
+        # 确保原文字体比译文小两号，最小为8号字体
+        original_font_size = max(8, translated_font_size - 2)
+        
         # 格式化双语字幕（参考JUQ-587-C.srt格式）
-        formatted = f"<font size=\"12\" color=\"#FFD700\">{original_clean}</font>\n"
-        formatted += f"<font size=\"16\" color=\"#FFFFFF\">{translated_clean}</font>"
+        formatted = f"<font size=\"{original_font_size}\" color=\"#FFD700\">{original_with_breaks}</font>\\n"
+        formatted += f"<font size=\"{translated_font_size}\" color=\"#FFFFFF\">{translated_with_breaks}</font>"
         
         return formatted
     
@@ -292,10 +346,17 @@ class SRTTranslator:
                 print("❌ 未找到有效的字幕块")
                 return False
             
+            # 检测是否已经是双语字幕（幂等性检查）
+            def is_bilingual_subtitle(text):
+                """检测文本是否已经是双语字幕格式"""
+                # 检查是否包含双语字幕的典型特征：font标签和换行符
+                return '<font' in text and '\\n' in text
+            
             # 翻译字幕块（批量处理）
             translated_blocks = []
             success_count = 0
             fail_count = 0
+            already_translated_count = 0
             
             # 按batch_size分批处理
             for batch_start in range(0, len(blocks), batch_size):
@@ -311,7 +372,14 @@ class SRTTranslator:
                     block_index = batch_start + i
                     print(f"🔍 处理第 {block_index + 1}/{len(blocks)} 个字幕块")
                     
-                    # 检查文本是否在缓存中
+                    # 幂等性检查：如果已经是双语字幕，直接跳过
+                    if is_bilingual_subtitle(block['text']):
+                        print(f"✅ 跳过已翻译的字幕块")
+                        translated_blocks.append(block)
+                        already_translated_count += 1
+                        continue
+                    
+                    # 清理文本，移除HTML标签，获取纯文本用于翻译
                     clean_text = re.sub(r'<[^>]+>', '', block['text']).strip()
                     cache_key = f"{self.source_lang}_{self.target_lang}_{clean_text}"
                     
@@ -320,7 +388,7 @@ class SRTTranslator:
                         translated_text = self.translation_cache[cache_key]
                         print(f"📚 使用缓存翻译: '{clean_text[:50]}...' -> '{translated_text[:50]}...'")
                         
-                        # 格式化双语字幕
+                        # 格式化双语字幕（确保应用字符限制）
                         formatted_text = self.format_bilingual_subtitle(block['text'], translated_text)
                         
                         # 更新块内容
@@ -333,7 +401,7 @@ class SRTTranslator:
                         translated_text = self.translate_text(block['text'])
                         
                         if translated_text:
-                            # 格式化双语字幕
+                            # 格式化双语字幕（应用字符限制）
                             formatted_text = self.format_bilingual_subtitle(block['text'], translated_text)
                             
                             # 更新块内容
@@ -379,6 +447,7 @@ class SRTTranslator:
             print(f"\n🎉 翻译完成!")
             print(f"✅ 成功翻译: {success_count} 个")
             print(f"❌ 翻译失败: {fail_count} 个")
+            print(f"💾 已翻译跳过: {already_translated_count} 个")
             print(f"💾 输出文件: {output_path}")
             print(f"📚 缓存记录: {len(self.translation_cache)} 条")
             print(f"⏱️  总耗时: {total_duration:.2f}秒")

@@ -83,7 +83,74 @@ class VideoTranslator:
         if not self.srt_translation_script.exists():
             raise FileNotFoundError(f"SRT翻译脚本不存在: {self.srt_translation_script}")
     
-    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 60) -> Optional[str]:
+    def _check_existing_transcription(self, video_path: str) -> Optional[Path]:
+        """
+        检查是否已有转录文件可以复用
+        
+        Args:
+            video_path: 视频文件路径
+            
+        Returns:
+            如果找到可复用的转录文件，返回SRT文件路径，否则返回None
+        """
+        video_name = Path(video_path).stem
+        temp_dir = Path("temp")
+        
+        if not temp_dir.exists():
+            return None
+        
+        print(f"[复用检查] 检查已有转录文件...")
+        print(f"   视频名称: {video_name}")
+        print(f"   模型: {self.whisper_model}")
+        
+        # 查找匹配的转录文件
+        txt_files = []
+        for subdir in temp_dir.iterdir():
+            if subdir.is_dir() and video_name in subdir.name and self.whisper_model in subdir.name:
+                txt_file = subdir / "transcription.txt"
+                if txt_file.exists():
+                    txt_files.append(txt_file)
+                    print(f"   ✓ 找到转录文件: {txt_file}")
+                    break  # 找到第一个匹配的就退出
+        
+        if txt_files:
+            txt_file = txt_files[0]
+            
+            # 检查转录文件是否完整（有足够的内容）
+            try:
+                with open(txt_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # 检查是否有实际转录内容（排除文件头信息）
+                lines_with_content = [line for line in content.split('\n') 
+                                    if line.strip() and '=' not in line 
+                                    and not line.startswith('视频:') 
+                                    and not line.startswith('模型:') 
+                                    and line.startswith('[') and ']' in line]
+                
+                if len(lines_with_content) > 0:
+                    print(f"   ✓ 转录文件包含 {len(lines_with_content)} 个有效字幕块")
+                    
+                    # 将txt文件转换为SRT格式
+                    srt_file = self._convert_txt_to_srt(txt_file)
+                    if srt_file:
+                        print(f"   ✓ 成功转换为SRT格式: {srt_file.name}")
+                        return srt_file
+                    else:
+                        print(f"   ✗ SRT转换失败")
+                        return None
+                else:
+                    print(f"   ✗ 转录文件为空或格式不正确")
+                    return None
+                    
+            except Exception as e:
+                print(f"   ✗ 检查转录文件时出错: {e}")
+                return None
+        
+        print(f"   ✗ 未找到可复用的转录文件")
+        return None
+    
+    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180) -> Optional[str]:
         """
         运行Whisper转录，生成SRT字幕文件
         
@@ -97,6 +164,31 @@ class VideoTranslator:
             SRT文件路径，失败返回None
         """
         try:
+            # 首先检查是否有可复用的转录文件
+            existing_srt = self._check_existing_transcription(video_path)
+            if existing_srt:
+                print(f"[复用] ✓ 复用已有转录文件，跳过转录过程")
+                
+                # 将SRT文件移动到输出目录
+                if output_dir:
+                    output_path = Path(output_dir)
+                    output_path.mkdir(exist_ok=True)
+                    video_name = Path(video_path).stem
+                    final_srt_file = output_path / f"{video_name}.srt"
+                    existing_srt.rename(final_srt_file)
+                    print(f"[复用] 转录完成: {final_srt_file.name}")
+                    return str(final_srt_file)
+                else:
+                    print(f"[复用] 转录完成: {existing_srt.name}")
+                    return str(existing_srt)
+            
+            # 如果没有可复用的文件，执行转录
+            print(f"[Whisper] 开始转录...")
+            print(f"   视频文件: {Path(video_path).name}")
+            print(f"   模型: {self.whisper_model}")
+            print(f"   语言: {self.source_lang}")
+            print(f"   分段时长: {max_chunk_duration}秒")
+            
             # 构建命令行参数 - 只传递whisper-transcription.py支持的参数
             cmd = [
                 sys.executable, 'whisper-transcription.py',
@@ -105,12 +197,6 @@ class VideoTranslator:
                 '--language', self.source_lang,
                 '--segment-duration', str(max_chunk_duration)
             ]
-            
-            print(f"[Whisper] 开始转录...")
-            print(f"   视频文件: {Path(video_path).name}")
-            print(f"   模型: {self.whisper_model}")
-            print(f"   语言: {self.source_lang}")
-            print(f"   分段时长: {max_chunk_duration}秒")
             
             # 执行转录，实时显示输出
             result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
@@ -156,7 +242,7 @@ class VideoTranslator:
                         print(f"[Whisper] SRT文件转换失败")
                         return None
                 else:
-                    print(f"[Whisper] 转录文件未找到，搜索模式: {pattern}")
+                    print(f"[Whisper] 转录文件未找到")
                     return None
             else:
                 # 由于capture_output=False，stderr不会被捕获，显示通用错误信息
@@ -194,7 +280,6 @@ class VideoTranslator:
                             final_srt_file = output_path / f"{video_name}_partial.srt"
                             partial_srt.rename(final_srt_file)
                             print(f"[Whisper] 已生成部分转录文件: {final_srt_file.name}")
-                            return str(final_srt_file)
                         else:
                             print(f"[Whisper] 已生成部分转录文件: {partial_srt.name}")
                             return str(partial_srt)
@@ -311,7 +396,7 @@ class VideoTranslator:
             print(f"❌ 运行SRT翻译时出错: {e}")
             return False
     
-    def translate_video(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 60) -> Dict:
+    def translate_video(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180) -> Dict:
         """
         完整的视频翻译流程
         
@@ -426,8 +511,8 @@ def main():
     # 内存优化参数
     parser.add_argument("--enable-memory-optimization", action="store_true",
                        help="启用内存优化模式，支持large-v2模型在16GB内存机器上运行")
-    parser.add_argument("--max-chunk-duration", type=int, default=60,
-                       help="内存优化模式下的最大分块时长（秒） (默认: 60)")
+    parser.add_argument("--max-chunk-duration", type=int, default=180,
+                       help="内存优化模式下的最大分块时长（秒） (默认: 180)")
     
     args = parser.parse_args()
     
