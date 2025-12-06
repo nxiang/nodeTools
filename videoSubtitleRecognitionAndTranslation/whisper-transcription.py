@@ -162,9 +162,73 @@ class SegmentTranscriber:
         segment_files = sorted(list(self.segments_dir.glob("segment_*.wav")))
         return segment_files
     
-    def _split_sentences(self, text, start_time, end_time):
-        """将长文本按句子边界分割成多个片段"""
-        # 日语句子分隔符（增加更多分隔符）
+    def _split_sentences_using_word_timestamps(self, segment):
+        """利用WhisperX的词级时间戳进行更精确的句子分割"""
+        if 'words' not in segment or not segment['words']:
+            # 如果没有词级时间戳，回退到原来的分割方法
+            return self._split_sentences_fallback(segment['text'], segment['start'], segment['end'])
+        
+        sentences = []
+        current_sentence = ""
+        current_start = segment['start']
+        current_words = []
+        
+        # 日语句子分隔符
+        sentence_endings = ['。', '！', '？', '!', '?', '…', '…', '、', '，', ',', ';', '；', '：', ':', '\n', '\r\n']
+        
+        for word_info in segment['words']:
+            word = word_info.get('word', '').strip()
+            word_start = word_info.get('start', segment['start'])
+            word_end = word_info.get('end', segment['end'])
+            
+            # 跳过空词
+            if not word:
+                continue
+                
+            current_sentence += word
+            current_words.append(word_info)
+            
+            # 检查是否到达句子结束
+            is_sentence_end = (
+                word[-1] in sentence_endings or  # 当前词以句子结束符结尾
+                len(current_sentence) >= 30 or   # 句子长度限制
+                (len(current_words) > 0 and word_info == segment['words'][-1])  # 最后一个词
+            )
+            
+            if is_sentence_end and current_sentence.strip():
+                # 使用词级时间戳计算精确的句子时间
+                sentence_start = current_words[0].get('start', current_start)
+                sentence_end = current_words[-1].get('end', word_end)
+                
+                sentences.append({
+                    'text': current_sentence.strip(),
+                    'start': sentence_start,
+                    'end': sentence_end,
+                    'words': current_words  # 保留词级信息用于调试
+                })
+                
+                # 重置当前句子
+                current_sentence = ""
+                current_words = []
+                current_start = sentence_end
+        
+        # 处理剩余的内容
+        if current_sentence.strip():
+            sentence_start = current_words[0].get('start', current_start) if current_words else current_start
+            sentence_end = current_words[-1].get('end', segment['end']) if current_words else segment['end']
+            
+            sentences.append({
+                'text': current_sentence.strip(),
+                'start': sentence_start,
+                'end': sentence_end,
+                'words': current_words
+            })
+        
+        return sentences if sentences else [segment]
+    
+    def _split_sentences_fallback(self, text, start_time, end_time):
+        """回退的句子分割方法（当没有词级时间戳时使用）"""
+        # 日语句子分隔符
         sentence_endings = ['。', '！', '？', '!', '?', '…', '…', '、', '，', ',', ';', '；', '：', ':', '\n', '\r\n']
         
         sentences = []
@@ -175,8 +239,8 @@ class SegmentTranscriber:
         for i, char in enumerate(text):
             current_sentence += char
             
-            # 检查是否到达句子结束（降低阈值到30个字符）
-            if char in sentence_endings or i == len(text) - 1 or len(current_sentence) >= 30:
+            # 检查是否到达句子结束
+            if char in sentence_endings or i == len(text) - 1 or len(current_sentence) >= 20:
                 if current_sentence.strip():
                     # 计算当前句子的时间戳（按比例分配）
                     sentence_duration = (end_time - start_time) * (len(current_sentence) / len(text))
@@ -191,28 +255,6 @@ class SegmentTranscriber:
                     # 更新下一个句子的开始时间
                     current_start = sentence_end
                     current_sentence = ""
-        
-        # 如果没有找到句子边界，按更短的长度分割（降低到20个字符）
-        if not sentences and len(text) > 20:
-            max_length = 20  # 每段最多20个字符（降低阈值）
-            total_duration = end_time - start_time
-            segment_count = (len(text) + max_length - 1) // max_length
-            
-            for i in range(segment_count):
-                seg_start = i * max_length
-                seg_end = min((i + 1) * max_length, len(text))
-                seg_text = text[seg_start:seg_end].strip()
-                
-                if seg_text:
-                    seg_duration = total_duration * (len(seg_text) / len(text))
-                    seg_start_time = start_time + (total_duration * seg_start / len(text))
-                    seg_end_time = seg_start_time + seg_duration
-                    
-                    sentences.append({
-                        'text': seg_text,
-                        'start': seg_start_time,
-                        'end': seg_end_time
-                    })
         
         return sentences if sentences else [{'text': text, 'start': start_time, 'end': end_time}]
 
@@ -316,7 +358,7 @@ class SegmentTranscriber:
                 result['segments'] = filtered_segments
                 print(f"   经过VAD过滤，保留 {len(filtered_segments)} 个语音段（原 {original_segment_count} 个）")
             
-            # 5. 进行语音对齐（原有逻辑保持不变）
+            # 5. 进行语音对齐，使用支持的参数
             if self.align_model is not None:
                 result = whisperx.align(
                     result["segments"],
@@ -324,7 +366,7 @@ class SegmentTranscriber:
                     self.align_metadata,
                     audio,
                     self.device,
-                    return_char_alignments=False
+                    return_char_alignments=False  # 使用支持的参数
                 )
             
             # 6. 调整时间戳（原有逻辑保持不变）
@@ -332,12 +374,17 @@ class SegmentTranscriber:
                 segment['start'] += start_time
                 segment['end'] += start_time
             
-            # 7. 句子级别分割 - 降低分割阈值，使句子划分更灵敏
+            # 7. 句子级别分割 - 使用whisperx的词级时间戳进行精确分割
             final_segments = []
             for segment in result['segments']:
                 text = segment['text'].strip()
-                if len(text) > 20:  # 降低阈值到20个字符，使句子划分更灵敏
-                    sentences = self._split_sentences(text, segment['start'], segment['end'])
+                if len(text) > 15:  # 降低阈值到15个字符，使句子划分更灵敏
+                    # 优先使用词级时间戳进行精确分割
+                    if 'words' in segment and segment['words']:
+                        sentences = self._split_sentences_using_word_timestamps(segment)
+                    else:
+                        # 如果没有词级时间戳，使用回退方法
+                        sentences = self._split_sentences_fallback(segment['text'], segment['start'], segment['end'])
                     final_segments.extend(sentences)
                 else:
                     final_segments.append(segment)
