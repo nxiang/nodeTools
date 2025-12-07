@@ -576,15 +576,14 @@ class WhisperTranscriber:
             # 阶段4: 转录所有片段
             transcription_success = self._transcribe_segments()
             
-            # 阶段5: 保存结果（即使部分失败也保存）
-            if self.state["segments"]:
+            # 阶段5: 保存结果（仅在全部成功时保存）
+            if transcription_success and self.state["segments"]:
                 self._save_final_transcription()
-                
-                if transcription_success:
-                    print(f"\n转录完成！结果保存在: {self.output_file}")
-                else:
-                    print(f"\n转录部分完成！已保存 {len(self.state['segments'])}/{self.state['total_segments']} 个片段的转录结果到: {self.output_file}")
-                    print("注意：部分片段转录失败，但已保存可用内容")
+                print(f"\n转录完成！结果保存在: {self.output_file}")
+            elif self.state["segments"]:
+                # 部分转录完成，但不保存文件
+                print(f"\n转录失败！已转录 {len(self.state['segments'])}/{self.state['total_segments']} 个片段")
+                print("注意：由于转录未全部完成，未生成最终转录文件")
             
             if not transcription_success:
                 return False
@@ -600,13 +599,12 @@ class WhisperTranscriber:
             return True
             
         except KeyboardInterrupt:
-            print("\n转录被用户中断，已保存当前状态")
+            print("\n转录被用户中断")
             self._save_state()
             
-            # 保存已转录的部分
+            # 不保存部分转录结果
             if self.state["segments"]:
-                self._save_final_transcription()
-                print(f"已保存部分转录结果到: {self.output_file}")
+                print(f"已转录 {len(self.state['segments'])}/{self.state['total_segments']} 个片段，但未生成最终转录文件")
             
             return False
         except Exception as e:

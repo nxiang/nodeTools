@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import subprocess
+import hashlib
 from pathlib import Path
 from typing import Dict, Optional
 import send2trash  # 新增导入，用于将文件移动到回收站
@@ -194,6 +195,12 @@ class VideoTranslator:
                     output_path.mkdir(exist_ok=True)
                     video_name = Path(video_path).stem
                     final_srt_file = output_path / f"{video_name}.srt"
+                    
+                    # 如果目标文件已存在，先删除它
+                    if final_srt_file.exists():
+                        final_srt_file.unlink()
+                        print(f"[复用] 删除已存在的目标文件: {final_srt_file.name}")
+                    
                     existing_srt.rename(final_srt_file)
                     print(f"[复用] 转录完成: {final_srt_file.name}")
                     return str(final_srt_file)
@@ -243,10 +250,10 @@ class VideoTranslator:
                 # 限制文件名长度，避免路径过长
                 safe_video_name = safe_video_name[:50]
                 
-                # 查找转录文件 - 尝试两种目录格式
+                # 查找转录文件 - 尝试多种目录格式
                 txt_file = None
                 
-                # 格式1: 单下划线分隔符
+                # 格式1: 单下划线分隔符（不含哈希值）
                 temp_dir1 = Path("temp") / f"{safe_video_name}_{self.whisper_model}"
                 if temp_dir1.exists():
                     txt_file1 = temp_dir1 / "transcription.txt"
@@ -254,7 +261,7 @@ class VideoTranslator:
                         txt_file = txt_file1
                         print(f"[Whisper] 找到转录文件（单下划线格式）: {txt_file}")
                 
-                # 格式2: 双下划线分隔符
+                # 格式2: 双下划线分隔符（不含哈希值）
                 if txt_file is None:
                     temp_dir2 = Path("temp") / f"{safe_video_name}__{self.whisper_model}"
                     if temp_dir2.exists():
@@ -263,10 +270,37 @@ class VideoTranslator:
                             txt_file = txt_file2
                             print(f"[Whisper] 找到转录文件（双下划线格式）: {txt_file}")
                 
+                # 格式3: 包含哈希值的格式（实际生成的格式）
                 if txt_file is None:
-                    print(f"[Whisper] 转录文件未找到，尝试了以下目录:")
-                    print(f"   格式1: {temp_dir1}")
-                    print(f"   格式2: {temp_dir2}")
+                    # 计算视频文件的哈希值
+                    video_hash = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
+                    temp_dir3 = Path("temp") / f"{safe_video_name}_{video_hash}_{self.whisper_model}"
+                    if temp_dir3.exists():
+                        txt_file3 = temp_dir3 / "transcription.txt"
+                        if txt_file3.exists():
+                            txt_file = txt_file3
+                            print(f"[Whisper] 找到转录文件（哈希格式）: {txt_file}")
+                
+                # 格式4: 通配符搜索（最通用的方法）
+                if txt_file is None:
+                    temp_dir = Path("temp")
+                    if temp_dir.exists():
+                        # 查找所有包含视频名和模型名的目录
+                        pattern = f"*{safe_video_name}*{self.whisper_model}*"
+                        for model_dir in temp_dir.glob(pattern):
+                            if model_dir.is_dir():
+                                txt_file_candidate = model_dir / "transcription.txt"
+                                if txt_file_candidate.exists():
+                                    txt_file = txt_file_candidate
+                                    print(f"[Whisper] 找到转录文件（通配符搜索）: {txt_file}")
+                                    break
+                
+                if txt_file is None:
+                    print(f"[Whisper] 转录文件未找到，尝试了以下目录格式:")
+                    print(f"   格式1（单下划线）: {temp_dir1}")
+                    print(f"   格式2（双下划线）: {temp_dir2}")
+                    print(f"   格式3（哈希值）: {temp_dir3}")
+                    print(f"   格式4（通配符）: temp/*{safe_video_name}*{self.whisper_model}*")
                     return None
                 
                 # 将txt文件转换为SRT格式
@@ -279,6 +313,12 @@ class VideoTranslator:
                             output_path = Path(output_dir)
                             output_path.mkdir(exist_ok=True)
                             final_srt_file = output_path / f"{video_name}.srt"
+                            
+                            # 如果目标文件已存在，先删除它
+                            if final_srt_file.exists():
+                                final_srt_file.unlink()
+                                print(f"[Whisper] 删除已存在的目标文件: {final_srt_file.name}")
+                            
                             srt_file.rename(final_srt_file)
                             print(f"[Whisper] 转录完成: {final_srt_file.name}")
                             return str(final_srt_file)
@@ -336,6 +376,12 @@ class VideoTranslator:
                     if srt_file:
                         # 重命名为partial.srt以表示部分转录
                         partial_srt = srt_file.with_name(f"{video_name}_partial.srt")
+                        
+                        # 如果目标文件已存在，先删除它
+                        if partial_srt.exists():
+                            partial_srt.unlink()
+                            print(f"[Whisper] 删除已存在的部分转录文件: {partial_srt.name}")
+                        
                         srt_file.rename(partial_srt)
                         print(f"[Whisper] 部分转录转换完成: {partial_srt.name}")
                         
@@ -344,6 +390,12 @@ class VideoTranslator:
                             output_path = Path(output_dir)
                             output_path.mkdir(exist_ok=True)
                             final_srt_file = output_path / f"{video_name}_partial.srt"
+                            
+                            # 如果目标文件已存在，先删除它
+                            if final_srt_file.exists():
+                                final_srt_file.unlink()
+                                print(f"[Whisper] 删除已存在的目标文件: {final_srt_file.name}")
+                            
                             partial_srt.rename(final_srt_file)
                             print(f"[Whisper] 已生成部分转录文件: {final_srt_file.name}")
                         else:
