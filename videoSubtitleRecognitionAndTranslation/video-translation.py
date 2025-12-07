@@ -54,7 +54,8 @@ class VideoTranslator:
     """视频翻译器"""
     
     def __init__(self, whisper_model: str = "base", device: str = "cpu", 
-                 source_lang: str = "ja", target_lang: str = "zh-CN"):
+                 source_lang: str = "ja", target_lang: str = "zh-CN", 
+                 use_vad: bool = False):
         """
         初始化视频翻译器
         
@@ -63,11 +64,13 @@ class VideoTranslator:
             device: 运行设备 (cpu, cuda)
             source_lang: 源语言代码 (ja=日语, en=英语等)
             target_lang: 目标语言代码 (zh-CN=简体中文)
+            use_vad: 是否使用VAD（语音活动检测）转录
         """
         self.whisper_model = whisper_model
         self.device = device
         self.source_lang = source_lang
         self.target_lang = target_lang
+        self.use_vad = use_vad
         
         # 设置工作目录
         self.workspace_dir = Path("temp")
@@ -75,7 +78,11 @@ class VideoTranslator:
         
         # 获取脚本所在目录
         self.script_dir = Path(__file__).parent
-        self.whisper_script = self.script_dir / "whisper-transcription.py"
+        # 根据use_vad选择转录脚本
+        if self.use_vad:
+            self.whisper_script = self.script_dir / "whisper-transcription.vad.py"
+        else:
+            self.whisper_script = self.script_dir / "whisper-transcription.py"
         self.srt_translation_script = self.script_dir / "srt-translation.py"
         
         # 验证脚本文件存在
@@ -162,7 +169,7 @@ class VideoTranslator:
         print(f"   ✗ 未找到可复用的转录文件")
         return None
     
-    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180) -> Optional[str]:
+    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False) -> Optional[str]:
         """
         运行Whisper转录，生成SRT字幕文件
         
@@ -200,15 +207,29 @@ class VideoTranslator:
             print(f"   模型: {self.whisper_model}")
             print(f"   语言: {self.source_lang}")
             print(f"   分段时长: {max_chunk_duration}秒")
+            print(f"   转录脚本: {'whisper-transcription.vad.py (VAD模式)' if use_vad else 'whisper-transcription.py (标准模式)'}")
             
-            # 构建命令行参数 - 只传递whisper-transcription.py支持的参数
-            cmd = [
-                sys.executable, 'whisper-transcription.py',
-                video_path,
-                '--model', self.whisper_model,
-                '--language', self.source_lang,
-                '--segment-duration', str(max_chunk_duration)
-            ]
+            # 构建命令行参数 - 根据use_vad选择不同的脚本和参数
+            if self.use_vad:
+                # whisper-transcription.vad.py 的参数
+                cmd = [
+                    sys.executable, 'whisper-transcription.vad.py',
+                    video_path,
+                    '--model', self.whisper_model,
+                    '--language', self.source_lang,
+                    '--segment-duration', str(max_chunk_duration),
+                    '--batch-size', '4',  # VAD版本建议使用较小的批处理大小
+                    '--compute-type', 'int8'  # CPU优化
+                ]
+            else:
+                # whisper-transcription.py 的参数
+                cmd = [
+                    sys.executable, 'whisper-transcription.py',
+                    video_path,
+                    '--model', self.whisper_model,
+                    '--language', self.source_lang,
+                    '--segment-duration', str(max_chunk_duration)
+                ]
             
             # 执行转录，实时显示输出
             result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
@@ -450,7 +471,7 @@ class VideoTranslator:
             print(f"❌ 运行SRT翻译时出错: {e}")
             return False
     
-    def translate_video(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180) -> Dict:
+    def translate_video(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False) -> Dict:
         """
         完整的视频翻译流程
         
@@ -494,9 +515,13 @@ class VideoTranslator:
         print(f"   输出目录: {output_path}")
         if enable_memory_optimization:
             print(f"   内存优化: 已启用，分块时长: {max_chunk_duration}秒")
+        if use_vad:
+            print(f"   转录模式: VAD（语音活动检测）模式")
+        else:
+            print(f"   转录模式: 标准模式")
         print("=" * 60)
         
-        srt_file = self.run_whisper_transcription(video_path, output_dir, enable_memory_optimization, max_chunk_duration)
+        srt_file = self.run_whisper_transcription(video_path, output_dir, enable_memory_optimization, max_chunk_duration, use_vad)
         time_tracker.checkpoint("Whisper转录")
         
         if not srt_file:
@@ -568,6 +593,10 @@ def main():
     parser.add_argument("--max-chunk-duration", type=int, default=180,
                        help="内存优化模式下的最大分块时长（秒） (默认: 180)")
     
+    # VAD参数
+    parser.add_argument("--vad", action="store_true",
+                       help="使用VAD（语音活动检测）模式进行转录，使用whisper-transcription.vad.py脚本")
+    
     args = parser.parse_args()
     
     # 验证视频文件存在
@@ -581,7 +610,8 @@ def main():
             whisper_model=args.model,
             device=args.device,
             source_lang=args.source_lang,
-            target_lang=args.target_lang
+            target_lang=args.target_lang,
+            use_vad=args.vad
         )
     except Exception as e:
         print(f"[失败] 初始化失败: {e}")
@@ -592,7 +622,8 @@ def main():
         video_path=args.video_path,
         output_dir=args.output_dir,
         enable_memory_optimization=args.enable_memory_optimization,
-        max_chunk_duration=args.max_chunk_duration
+        max_chunk_duration=args.max_chunk_duration,
+        use_vad=args.vad
     )
     
     if result["success"]:
