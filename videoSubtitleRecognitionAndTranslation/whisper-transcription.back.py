@@ -7,10 +7,124 @@ import subprocess
 import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
-import whisper
 import numpy as np
 import wave
 import contextlib
+
+# 虚拟环境管理类
+class VirtualEnvironmentManager:
+    """管理虚拟环境的激活和退出"""
+    
+    def __init__(self, venv_path=None):
+        """
+        初始化虚拟环境管理器
+        
+        Args:
+            venv_path: 虚拟环境路径，如果为None则自动检测
+        """
+        if venv_path is None:
+            # 自动检测虚拟环境路径
+            script_dir = Path(__file__).parent
+            possible_venv_paths = [
+                script_dir / "whisperx_env",
+                script_dir / "venv",
+                script_dir / "env"
+            ]
+            
+            for path in possible_venv_paths:
+                if path.exists():
+                    self.venv_path = path
+                    break
+            else:
+                self.venv_path = None
+        else:
+            self.venv_path = Path(venv_path)
+        
+        self.original_sys_path = sys.path.copy()
+        self.original_os_environ = os.environ.copy()
+        self.is_activated = False
+    
+    def activate(self):
+        """激活虚拟环境"""
+        if self.venv_path is None:
+            print("警告: 未找到虚拟环境，使用系统Python环境")
+            return True
+        
+        try:
+            # 获取虚拟环境的Python路径
+            if os.name == 'nt':  # Windows
+                python_exe = self.venv_path / "Scripts" / "python.exe"
+                site_packages = self.venv_path / "Lib" / "site-packages"
+            else:  # Unix/Linux
+                python_exe = self.venv_path / "bin" / "python"
+                site_packages = self.venv_path / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+            
+            if not python_exe.exists():
+                print(f"警告: 虚拟环境Python可执行文件不存在: {python_exe}")
+                return False
+            
+            # 添加虚拟环境的site-packages到sys.path
+            if site_packages.exists():
+                sys.path.insert(0, str(site_packages))
+            
+            # 设置环境变量
+            os.environ['VIRTUAL_ENV'] = str(self.venv_path)
+            
+            # 更新PATH环境变量
+            if os.name == 'nt':  # Windows
+                venv_bin = self.venv_path / "Scripts"
+            else:  # Unix/Linux
+                venv_bin = self.venv_path / "bin"
+            
+            if venv_bin.exists():
+                os.environ['PATH'] = str(venv_bin) + os.pathsep + os.environ['PATH']
+            
+            self.is_activated = True
+            print(f"虚拟环境已激活: {self.venv_path}")
+            return True
+            
+        except Exception as e:
+            print(f"激活虚拟环境失败: {e}")
+            return False
+    
+    def deactivate(self):
+        """退出虚拟环境"""
+        if not self.is_activated:
+            return
+        
+        try:
+            # 恢复原始sys.path
+            sys.path[:] = self.original_sys_path
+            
+            # 恢复原始环境变量
+            os.environ.clear()
+            os.environ.update(self.original_os_environ)
+            
+            self.is_activated = False
+            print("虚拟环境已退出")
+            
+        except Exception as e:
+            print(f"退出虚拟环境失败: {e}")
+    
+    def __enter__(self):
+        """上下文管理器入口"""
+        self.activate()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """上下文管理器出口"""
+        self.deactivate()
+
+# 延迟导入whisper，确保在虚拟环境激活后导入
+def import_whisper():
+    """在虚拟环境激活后导入whisper模块"""
+    try:
+        import whisper
+        return whisper
+    except ImportError as e:
+        print(f"导入whisper模块失败: {e}")
+        print("请确保虚拟环境中已安装whisper模块")
+        return None
 
 def format_timedelta(seconds):
     """将秒数格式化为时:分:秒格式"""
@@ -40,6 +154,9 @@ class SegmentTranscriber:
         self.language = language
         self.segments_dir = temp_base / "segments"
         self.segments_dir.mkdir(exist_ok=True)
+        
+        # 延迟导入的whisper模块
+        self.whisper_module = None
     
     def split_audio(self, audio_file, segment_duration=600):
         """将音频分割成多个片段（默认10分钟一个片段）"""
@@ -70,8 +187,15 @@ class SegmentTranscriber:
         print(f"转录片段 {segment_index}: {segment_file.name}")
         
         try:
+            # 延迟导入whisper模块
+            if self.whisper_module is None:
+                self.whisper_module = import_whisper()
+                if self.whisper_module is None:
+                    print("错误: 无法导入whisper模块")
+                    return []
+            
             # 加载音频
-            audio = whisper.load_audio(str(segment_file))
+            audio = self.whisper_module.load_audio(str(segment_file))
             
             # 转录当前片段
             result = self.model.transcribe(
@@ -132,6 +256,9 @@ class WhisperTranscriber:
         # 加载状态
         self.state = self._load_state()
         self.segment_transcriber = None
+        
+        # whisper模块将在需要时延迟导入
+        self.whisper_module = None
     
     def _load_state(self):
         """加载断点续传状态"""
@@ -412,7 +539,14 @@ class WhisperTranscriber:
             model_start = time.time()
             
             try:
-                self.model = whisper.load_model(self.model_size)
+                # 延迟导入whisper模块
+                if self.whisper_module is None:
+                    self.whisper_module = import_whisper()
+                    if self.whisper_module is None:
+                        print("错误: 无法导入whisper模块")
+                        return False
+                
+                self.model = self.whisper_module.load_model(self.model_size)
                 self.timestamps["model_loading_time"] = time.time() - model_start
                 print(f"模型加载完成，耗时: {format_timedelta(self.timestamps['model_loading_time'])}")
             except Exception as e:
@@ -497,6 +631,7 @@ def main():
                        help="音频语言代码 (默认: ja - 日语)")
     parser.add_argument("--segment-duration", "-s", type=int, default=60,
                        help="音频分段时长（秒），默认60秒（1分钟）")
+    parser.add_argument("--venv-path", help="虚拟环境路径（可选，默认自动检测）")
     
     args = parser.parse_args()
     
@@ -505,24 +640,28 @@ def main():
         print(f"错误: 视频文件不存在: {args.video_path}")
         sys.exit(1)
     
-    # 创建转录器并执行
-    transcriber = WhisperTranscriber(
-        video_path=args.video_path,
-        model_size=args.model,
-        language=args.language,
-        segment_duration=args.segment_duration
-    )
+    # 使用虚拟环境管理器
+    venv_manager = VirtualEnvironmentManager(args.venv_path)
     
-    success = transcriber.transcribe()
-    
-    if not success:
-        # 检查是否有部分转录结果
-        if transcriber.state["segments"]:
-            print("转录过程部分完成，已保存可用内容")
-            sys.exit(0)  # 返回0表示部分成功
-        else:
-            print("转录过程出现错误或中断")
-            sys.exit(1)
+    with venv_manager:
+        # 创建转录器并执行
+        transcriber = WhisperTranscriber(
+            video_path=args.video_path,
+            model_size=args.model,
+            language=args.language,
+            segment_duration=args.segment_duration
+        )
+        
+        success = transcriber.transcribe()
+        
+        if not success:
+            # 检查是否有部分转录结果
+            if transcriber.state["segments"]:
+                print("转录过程部分完成，已保存可用内容")
+                sys.exit(0)  # 返回0表示部分成功
+            else:
+                print("转录过程出现错误或中断")
+                sys.exit(1)
 
 if __name__ == "__main__":
     main()

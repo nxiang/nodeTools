@@ -228,33 +228,60 @@ class SegmentTranscriber:
     
     def _split_sentences_fallback(self, text, start_time, end_time):
         """回退的句子分割方法（当没有词级时间戳时使用）"""
-        # 日语句子分隔符
-        sentence_endings = ['。', '！', '？', '!', '?', '…', '…', '、', '，', ',', ';', '；', '：', ':', '\n', '\r\n']
+        # 日语句子分隔符（按优先级排序）
+        sentence_endings = ['。', '！', '？', '!', '?', '…', '、', '，', ',', ';', '；', '：', ':', '\n', '\r\n']
         
         sentences = []
         current_sentence = ""
         current_start = start_time
+        last_end_index = 0
         
         # 按字符遍历文本
         for i, char in enumerate(text):
             current_sentence += char
             
-            # 检查是否到达句子结束
-            if char in sentence_endings or i == len(text) - 1 or len(current_sentence) >= 20:
-                if current_sentence.strip():
-                    # 计算当前句子的时间戳（按比例分配）
-                    sentence_duration = (end_time - start_time) * (len(current_sentence) / len(text))
-                    sentence_end = current_start + sentence_duration
-                    
-                    sentences.append({
-                        'text': current_sentence.strip(),
-                        'start': current_start,
-                        'end': sentence_end
-                    })
-                    
-                    # 更新下一个句子的开始时间
-                    current_start = sentence_end
-                    current_sentence = ""
+            # 智能句子分割策略：
+            # 1. 遇到句子结束符（。！？等）时强制分割
+            # 2. 句子长度超过15个字符且遇到逗号、顿号等次要分隔符时分割
+            # 3. 句子长度超过25个字符时强制分割
+            should_split = False
+            
+            if char in ['。', '！', '？', '!', '?', '…']:
+                # 主要句子结束符，强制分割
+                should_split = True
+            elif len(current_sentence) >= 15 and char in ['、', '，', ',', ';', '；']:
+                # 次要分隔符，且句子较长时分割
+                should_split = True
+            elif len(current_sentence) >= 25:
+                # 句子过长，强制分割
+                should_split = True
+            elif i == len(text) - 1:
+                # 文本结束
+                should_split = True
+            
+            if should_split and current_sentence.strip():
+                # 计算当前句子的时间戳（基于字符在文本中的位置）
+                char_position_ratio = (i + 1) / len(text)
+                sentence_end = start_time + (end_time - start_time) * char_position_ratio
+                
+                sentences.append({
+                    'text': current_sentence.strip(),
+                    'start': current_start,
+                    'end': sentence_end
+                })
+                
+                # 更新下一个句子的开始时间
+                current_start = sentence_end
+                current_sentence = ""
+                last_end_index = i + 1
+        
+        # 处理剩余文本（如果有）
+        if current_sentence.strip():
+            sentences.append({
+                'text': current_sentence.strip(),
+                'start': current_start,
+                'end': end_time
+            })
         
         return sentences if sentences else [{'text': text, 'start': start_time, 'end': end_time}]
 
@@ -374,20 +401,26 @@ class SegmentTranscriber:
                 segment['start'] += start_time
                 segment['end'] += start_time
             
-            # 7. 句子级别分割 - 使用whisperx的词级时间戳进行精确分割
+            # 7. 句子级别分割 - 使用更智能的句子分割策略
             final_segments = []
             for segment in result['segments']:
                 text = segment['text'].strip()
-                if len(text) > 15:  # 降低阈值到15个字符，使句子划分更灵敏
-                    # 优先使用词级时间戳进行精确分割
-                    if 'words' in segment and segment['words']:
-                        sentences = self._split_sentences_using_word_timestamps(segment)
-                    else:
-                        # 如果没有词级时间戳，使用回退方法
-                        sentences = self._split_sentences_fallback(segment['text'], segment['start'], segment['end'])
-                    final_segments.extend(sentences)
+                
+                # 智能句子分割策略：
+                # 1. 优先使用词级时间戳进行精确分割
+                if 'words' in segment and segment['words']:
+                    sentences = self._split_sentences_using_word_timestamps(segment)
+                # 2. 如果文本包含句子结束符，使用回退方法分割
+                elif any(end_char in text for end_char in ['。', '！', '？', '!', '?', '…']):
+                    sentences = self._split_sentences_fallback(segment['text'], segment['start'], segment['end'])
+                # 3. 否则，如果文本过长（超过30字符），强制分割
+                elif len(text) > 30:
+                    sentences = self._split_sentences_fallback(segment['text'], segment['start'], segment['end'])
+                # 4. 短文本直接保留
                 else:
-                    final_segments.append(segment)
+                    sentences = [segment]
+                
+                final_segments.extend(sentences)
             
             print(f"   句子分割: 从 {len(result['segments'])} 个段分割为 {len(final_segments)} 个句子")
             
@@ -593,12 +626,14 @@ class WhisperXTranscriber:
                 # 允许omegaconf.listconfig.ListConfig类型
                 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
                 
-                # 使用安全上下文加载VAD模型，调整VAD参数使其更灵敏
+                # 使用安全上下文加载VAD模型，调整VAD参数使其更合理
                 with torch.serialization.safe_globals([omegaconf.listconfig.ListConfig]):
                     self.vad_model = whisperx.vad.load_vad_model(
                         device=self.device,
-                        vad_onset=0.3,   # 降低语音开始阈值，使其更灵敏 (0.3)
-                        vad_offset=0.3   # 降低语音结束阈值，使其更灵敏 (0.3)
+                        vad_onset=0.5,   # 提高语音开始阈值，减少噪音检测 (0.5)
+                        vad_offset=0.3,  # 适当降低语音结束阈值 (0.3)
+                        vad_pad=0.1,    # 减少语音段前后填充时间 (0.1)
+                        min_silence_duration=0.3  # 增加静音持续时间阈值 (0.3)
                     )
                 print("VAD模型加载成功。")
             except Exception as e:
@@ -656,8 +691,10 @@ class WhisperXTranscriber:
                     with torch.serialization.safe_globals([omegaconf.listconfig.ListConfig]):
                         self.vad_model = whisperx.load_vad_model(
                             device=self.device,
-                            vad_onset=0.5,
-                            vad_offset=0.5
+                            vad_onset=0.5,   # 提高语音开始阈值，减少噪音检测 (0.5)
+                            vad_offset=0.3,  # 适当降低语音结束阈值 (0.3)
+                            vad_pad=0.1,    # 减少语音段前后填充时间 (0.1)
+                            min_silence_duration=0.3  # 增加静音持续时间阈值 (0.3)
                         )
                 else:
                     # 方式2：尝试使用pyannote.audio的VAD功能
@@ -732,8 +769,10 @@ class WhisperXTranscriber:
                         # 在不安全加载方式中，VAD模型也会自动使用weights_only=False
                         self.vad_model = whisperx.load_vad_model(
                             device=self.device,
-                            vad_onset=0.5,
-                            vad_offset=0.5
+                            vad_onset=0.5,   # 提高语音开始阈值，减少噪音检测 (0.5)
+                            vad_offset=0.3,  # 适当降低语音结束阈值 (0.3)
+                            vad_pad=0.1,    # 减少语音段前后填充时间 (0.1)
+                            min_silence_duration=0.3  # 增加静音持续时间阈值 (0.3)
                         )
                     else:
                         # 方式2：尝试使用pyannote.audio的VAD功能
