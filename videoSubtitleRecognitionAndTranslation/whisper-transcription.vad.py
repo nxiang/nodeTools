@@ -1,1003 +1,1333 @@
+#!/usr/bin/env python3
+"""
+Whisper转录 + 日语成人向视频VAD检测
+集成断点续传功能的完整解决方案
+"""
+
 import os
 import json
-import hashlib
-import time
 import logging
-import argparse
-import shutil
-import subprocess
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+import torch
+import torchaudio
+from scipy import signal
+import librosa
+import soundfile as sf
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict, Any, Union
 from pathlib import Path
-import whisper
-from dataclasses import dataclass, asdict, field
-from datetime import datetime, timedelta
-from enum import Enum
+import time
+from datetime import datetime
+import warnings
+warnings.filterwarnings("ignore")
+
+# 导入现有的whisper相关模块
+try:
+    import whisper
+    from whisper.utils import get_writer
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    print("警告: whisper未安装，部分功能可能受限")
+
+# 检查moviepy可用性（用于视频文件支持）
+try:
+    # 新版本moviepy (2.2.1+) 中VideoFileClip直接位于moviepy包中
+    from moviepy import VideoFileClip
+    MOVIEPY_AVAILABLE = True
+except ImportError:
+    MOVIEPY_AVAILABLE = False
+    print("警告: moviepy未安装，视频文件处理功能受限")
 
 # 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-
-def format_timedelta(seconds):
-    """将秒数格式化为时:分:秒.毫秒格式，用于SRT"""
+def format_time(seconds: float) -> str:
+    """将秒数格式化为时分秒格式"""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds - int(seconds)) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-
-def format_simple_timedelta(seconds):
-    """简化版时间格式，用于文本输出"""
-    td = timedelta(seconds=seconds)
-    total_seconds = int(td.total_seconds())
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-
-class TranscriptionStatus(Enum):
-    """转录状态枚举"""
-    PENDING = "pending"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
+    seconds = seconds % 60
+    
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+    elif minutes > 0:
+        return f"{minutes:02d}:{seconds:06.3f}"
+    else:
+        return f"{seconds:06.3f}s"
 
 @dataclass
-class SegmentInfo:
-    """音频片段信息"""
-    index: int
-    start_time: float
-    end_time: float
-    file_path: str
-    status: TranscriptionStatus = TranscriptionStatus.PENDING
-    transcription: Optional[str] = None
-    segments: Optional[List[dict]] = None  # Whisper返回的详细分段信息（包含词级时间戳）
-    error: Optional[str] = None
-    processed_at: Optional[datetime] = None
-    processing_time: Optional[float] = None  # 处理耗时（秒）
+class VADConfig:
+    """针对日语成人视频的VAD配置"""
+    # 基础参数
+    sample_rate: int = 16000
+    frame_duration: int = 30  # 毫秒
+    threshold: float = 0.4  # 更低的阈值以适应成人内容
     
-    def to_dict(self):
-        return {
-            "index": self.index,
-            "start_time": self.start_time,
-            "end_time": self.end_time,
-            "file_path": self.file_path,
-            "status": self.status.value,
-            "transcription": self.transcription,
-            "segments": self.segments,  # 保存详细的分段信息
-            "error": self.error,
-            "processed_at": self.processed_at.isoformat() if self.processed_at else None,
-            "processing_time": self.processing_time
-        }
+    # 成人视频特定参数
+    min_speech_duration: float = 0.2  # 更短的最小持续时间
+    min_silence_duration: float = 0.15
     
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(
-            index=data["index"],
-            start_time=data["start_time"],
-            end_time=data["end_time"],
-            file_path=data["file_path"],
-            status=TranscriptionStatus(data["status"]),
-            transcription=data.get("transcription"),
-            segments=data.get("segments"),  # 加载详细的分段信息
-            error=data.get("error"),
-            processed_at=datetime.fromisoformat(data["processed_at"]) if data.get("processed_at") else None,
-            processing_time=data.get("processing_time")
-        )
-
+    # 频率范围（针对日语人声和特殊声音优化）
+    low_freq: int = 70  # 更低的低频以检测喘息声
+    high_freq: int = 4500  # 日语语音频率上限
+    
+    # 能量阈值
+    energy_threshold: float = 0.005  # 更低的能量阈值
+    
+    # 特殊声音检测
+    detect_moans: bool = True
+    detect_whispers: bool = True
+    detect_screams: bool = True
+    moan_freq_range: Tuple[int, int] = (65, 280)  # 呻吟声频率范围
+    
+    # 后处理
+    merge_gap: float = 0.5  # 合并间隙
+    padding: float = 0.25  # 填充时间
+    max_segment_duration: float = 180.0  # 最大段持续时间
+    
+    # 针对日语语音的特殊参数
+    japanese_phoneme_threshold: float = 0.3
+    vowel_detection: bool = True  # 日语元音检测
+    
+    # VAD模型选择
+    use_webrtc: bool = False  # WebRTC VAD通常不适合成人内容
+    use_silero: bool = False  # Silero VAD
 
 @dataclass
-class TranscriptionState:
-    """转录状态管理器"""
-    audio_file: str
-    original_file: str
-    temp_dir: str
-    segments: List[SegmentInfo] = field(default_factory=list)
-    total_segments: int = 0
-    completed_segments: int = 0
-    failed_segments: int = 0
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
-    model_name: str = "base"
-    language: str = "ja"  # 默认日语
-    segment_duration: int = 600
+class TranscriptionConfig:
+    """转录配置"""
+    model_size: str = "large"  # whisper模型大小
+    language: str = "ja"  # 日语
+    task: str = "transcribe"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type: str = "float16" if torch.cuda.is_available() else "float32"
+    beam_size: int = 5
+    best_of: int = 5
+    temperature: float = 0.0
+    compression_ratio_threshold: float = 2.4
+    logprob_threshold: float = -1.0
+    no_speech_threshold: float = 0.6
+    condition_on_previous_text: bool = True
+    initial_prompt: Optional[str] = None
+    word_timestamps: bool = True
+    prepend_punctuations: str = "\"'¿([{-"
+    append_punctuations: str = "\"'.。,，!！?？:：”)]}、"
     
-    def to_dict(self):
-        return {
-            "audio_file": self.audio_file,
-            "original_file": self.original_file,
-            "temp_dir": self.temp_dir,
-            "segments": [segment.to_dict() for segment in self.segments],
-            "total_segments": self.total_segments,
-            "completed_segments": self.completed_segments,
-            "failed_segments": self.failed_segments,
-            "start_time": self.start_time.isoformat() if self.start_time else None,
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-            "model_name": self.model_name,
-            "language": self.language,
-            "segment_duration": self.segment_duration
-        }
+    # 输出格式
+    output_formats: List[str] = field(default_factory=lambda: ["txt", "srt", "vtt", "tsv", "json"])
+    output_dir: str = "./transcription_output"
     
-    @classmethod
-    def from_dict(cls, data: dict):
-        state = cls(
-            audio_file=data["audio_file"],
-            original_file=data["original_file"],
-            temp_dir=data["temp_dir"],
-            total_segments=data["total_segments"],
-            completed_segments=data["completed_segments"],
-            failed_segments=data["failed_segments"],
-            model_name=data.get("model_name", "base"),
-            language=data.get("language", "ja"),
-            segment_duration=data.get("segment_duration", 600)
-        )
-        
-        if data.get("start_time"):
-            state.start_time = datetime.fromisoformat(data["start_time"])
-        if data.get("end_time"):
-            state.end_time = datetime.fromisoformat(data["end_time"])
-        
-        state.segments = [SegmentInfo.from_dict(seg) for seg in data.get("segments", [])]
-        return state
+    # 临时文件目录
+    temp_dir: str = "./temp"
+    
+    # 断点续传
+    checkpoint_dir: str = "./temp/checkpoints"
+    save_checkpoint_interval: int = 10  # 每10秒保存一次检查点
 
-
-class VideoTranscriber:
-    """支持断点续传的视频/音频转录器"""
+class JapaneseAdultVAD:
+    """日语成人视频专用的VAD检测器"""
     
-    def __init__(self, 
-                 model_name: str = "base"):
-        """
-        初始化转录器
+    def __init__(self, config: Optional[VADConfig] = None):
+        self.config = config or VADConfig()
+        self._init_filters()
         
-        Args:
-            model_name: Whisper模型名称
-        """
-        # 固定目录
-        self.base_dir = Path(".")
-        self.output_dir = self.base_dir / "temp"
-        self.temp_base_dir = self.base_dir / "temp"
+    def _init_filters(self):
+        """初始化滤波器"""
+        nyquist = self.config.sample_rate / 2
         
-        self.model_name = model_name
-        self.model = None
+        # 主带通滤波器（针对日语语音优化）
+        if self.config.low_freq < nyquist and self.config.high_freq < nyquist:
+            self.bandpass_filter = signal.butter(
+                4,
+                [self.config.low_freq/nyquist, self.config.high_freq/nyquist],
+                btype='band'
+            )
+        else:
+            # 使用默认值
+            self.bandpass_filter = signal.butter(4, [80/nyquist, 4000/nyquist], btype='band')
         
-        # 时间戳记录
-        self.timestamps = {
-            "start_time": None,
-            "audio_extraction_time": None,
-            "model_loading_time": None,
-            "transcription_time": None,
-            "total_time": None
-        }
+        # 呻吟声检测滤波器
+        moan_low = max(10, self.config.moan_freq_range[0]) / nyquist
+        moan_high = min(nyquist-1, self.config.moan_freq_range[1]) / nyquist
+        self.moan_filter = signal.butter(4, [moan_low, moan_high], btype='band')
         
-        # 创建目录
-        self.output_dir.mkdir(exist_ok=True, parents=True)
-        self.temp_base_dir.mkdir(exist_ok=True, parents=True)
-    
-    def get_temp_dir(self, video_file: str) -> Path:
-        """
-        获取临时目录
-        
-        Args:
-            video_file: 视频文件路径
-            
-        Returns:
-            临时目录路径
-        """
-        # 获取文件名（不带扩展名）
-        video_name = Path(video_file).stem
-        
-        # 创建目录名：视频名_模型名（不需要哈希）
-        temp_dir = self.temp_base_dir / f"{video_name}_{self.model_name}"
-        temp_dir.mkdir(exist_ok=True, parents=True)
-        
-        return temp_dir
-    
-    def cleanup_temp_files(self, video_file: str):
-        """
-        清理特定视频的临时文件
-        
-        Args:
-            video_file: 视频文件路径
-        """
-        temp_dir = self.get_temp_dir(video_file)
-        if temp_dir.exists():
-            logger.info(f"清理临时目录: {temp_dir}")
-            shutil.rmtree(temp_dir)
-    
-    def extract_audio_from_video(self, video_file: str, temp_dir: Path) -> str:
-        """
-        从视频文件中提取音频
-        
-        Args:
-            video_file: 视频文件路径
-            temp_dir: 临时目录
-            
-        Returns:
-            提取的音频文件路径
-        """
-        audio_file = temp_dir / "extracted_audio.wav"
-        
-        # 检查是否已存在提取的音频
-        if audio_file.exists():
-            logger.info(f"已存在提取的音频文件: {audio_file}")
-            return str(audio_file)
-        
-        logger.info(f"从视频中提取音频: {video_file}")
+    def load_audio(self, audio_path: str, target_sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
+        """加载音频文件（支持视频文件）"""
+        target_sr = target_sr or self.config.sample_rate
         
         try:
-            # 使用ffmpeg提取音频，确保使用正确的编码
-            cmd = [
-                'ffmpeg',
-                '-i', video_file,
-                '-vn',  # 忽略视频流
-                '-ac', '1',  # 单声道（Whisper处理单声道更好）
-                '-ar', '16000',  # 设置采样率为16000Hz（Whisper推荐）
-                '-acodec', 'pcm_s16le',  # 使用PCM编码
-                '-f', 'wav',  # 输出为wav格式
-                '-y',  # 覆盖已存在文件
-                str(audio_file)
+            # 检查文件扩展名
+            file_ext = Path(audio_path).suffix.lower()
+            
+            # 音频文件
+            if file_ext in ('.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg'):
+                logger.info(f"加载音频文件: {audio_path}")
+                audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
+                return audio, sr
+            
+            # 视频文件
+            elif file_ext in ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm'):
+                logger.info(f"检测到视频文件: {audio_path}")
+                
+                # 优先使用moviepy（如果可用）
+                if MOVIEPY_AVAILABLE:
+                    try:
+                        logger.info("使用moviepy提取视频音频...")
+                        video = VideoFileClip(audio_path)
+                        
+                        # 提取音频到临时文件
+                        temp_audio_path = f"./temp_{int(time.time())}.wav"
+                        video.audio.write_audiofile(temp_audio_path, fps=target_sr)
+                        
+                        # 加载音频
+                        audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
+                        
+                        # 清理临时文件
+                        try:
+                            os.remove(temp_audio_path)
+                        except:
+                            pass
+                        
+                        video.close()
+                        logger.info(f"视频音频提取成功: 时长 {len(audio)/sr:.1f}s")
+                        return audio, sr
+                        
+                    except Exception as e:
+                        logger.warning(f"moviepy处理失败: {e}")
+                
+                # 后备方案：使用torchaudio
+                try:
+                    logger.info("使用torchaudio提取视频音频...")
+                    audio, sr = torchaudio.load(audio_path)
+                    audio = audio.numpy()
+                    if len(audio.shape) > 1:
+                        audio = audio.mean(axis=0)
+                    
+                    if sr != target_sr:
+                        audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+                        sr = target_sr
+                    
+                    logger.info(f"torchaudio音频提取成功: 时长 {len(audio)/sr:.1f}s")
+                    return audio, sr
+                    
+                except Exception as e:
+                    logger.warning(f"torchaudio处理失败: {e}")
+                
+                # 最后尝试使用librosa
+                logger.info("使用librosa作为后备方案...")
+                audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
+                logger.info(f"librosa音频加载成功: 时长 {len(audio)/sr:.1f}s")
+                return audio, sr
+            
+            else:
+                # 未知文件类型，尝试多种方法
+                logger.warning(f"未知文件类型: {file_ext}，尝试自动检测...")
+                
+                # 尝试librosa
+                try:
+                    audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
+                    logger.info(f"librosa自动检测成功: 时长 {len(audio)/sr:.1f}s")
+                    return audio, sr
+                except Exception as e:
+                    logger.error(f"所有音频加载方法都失败了: {e}")
+                    raise
+            
+        except Exception as e:
+            logger.error(f"加载音频失败 {audio_path}: {e}")
+            raise
+    
+    def detect_voice_activity(self, audio: np.ndarray, sample_rate: int) -> List[Tuple[float, float, Dict]]:
+        """检测语音活动并返回时间段及元数据"""
+        # 预处理：带通滤波
+        audio_filtered = signal.filtfilt(*self.bandpass_filter, audio)
+        
+        # 计算帧大小
+        frame_size = int(self.config.frame_duration * sample_rate / 1000)
+        hop_length = frame_size // 2  # 50%重叠
+        
+        # 使用滑动窗口处理
+        num_frames = (len(audio_filtered) - frame_size) // hop_length + 1
+        frames = []
+        for i in range(num_frames):
+            start = i * hop_length
+            end = start + frame_size
+            frames.append(audio_filtered[start:end])
+        
+        # 检测每帧
+        is_speech = []
+        frame_features = []
+        
+        for i, frame in enumerate(frames):
+            features = self._extract_frame_features(frame, sample_rate)
+            frame_features.append(features)
+            
+            # 决策逻辑
+            is_voice = self._decide_if_voice(features)
+            is_speech.append(is_voice)
+        
+        # 转换为时间段
+        segments = self._frames_to_segments(is_speech, frame_features, frame_size, hop_length, sample_rate)
+        
+        # 后处理
+        segments = self._merge_segments(segments)
+        segments = self._filter_segments(segments)
+        segments = self._apply_padding(segments, len(audio)/sample_rate)
+        
+        return segments
+    
+    def _extract_frame_features(self, frame: np.ndarray, sample_rate: int) -> Dict[str, Any]:
+        """提取帧特征"""
+        # 能量特征
+        energy = np.mean(frame ** 2)
+        log_energy = np.log(energy + 1e-10)
+        
+        # 频谱特征
+        stft = librosa.stft(frame, n_fft=512, hop_length=160)
+        magnitude = np.abs(stft)
+        
+        # 频谱质心
+        spectral_centroid = librosa.feature.spectral_centroid(
+            S=magnitude, sr=sample_rate
+        )[0].mean()
+        
+        # 频谱带宽
+        spectral_bandwidth = librosa.feature.spectral_bandwidth(
+            S=magnitude, sr=sample_rate
+        )[0].mean()
+        
+        # 过零率
+        zero_crossing_rate = librosa.feature.zero_crossing_rate(frame)[0].mean()
+        
+        # MFCC特征（针对语音）
+        mfccs = librosa.feature.mfcc(y=frame, sr=sample_rate, n_mfcc=13)
+        mfcc_mean = np.mean(mfccs, axis=1)
+        
+        # 特殊声音检测
+        moan_features = self._detect_moan_features(frame, sample_rate)
+        whisper_features = self._detect_whisper_features(frame, sample_rate, magnitude)
+        scream_features = self._detect_scream_features(frame, sample_rate, magnitude)
+        
+        # 日语元音检测
+        vowel_score = self._detect_japanese_vowels(frame, sample_rate) if self.config.vowel_detection else 0.0
+        
+        return {
+            'energy': energy,
+            'log_energy': log_energy,
+            'spectral_centroid': spectral_centroid,
+            'spectral_bandwidth': spectral_bandwidth,
+            'zero_crossing_rate': zero_crossing_rate,
+            'mfcc_mean': mfcc_mean,
+            'vowel_score': vowel_score,
+            'moan_probability': moan_features['probability'],
+            'is_moan': moan_features['is_moan'],
+            'is_whisper': whisper_features['is_whisper'],
+            'is_scream': scream_features['is_scream'],
+            'is_japanese_phoneme': vowel_score > self.config.japanese_phoneme_threshold
+        }
+    
+    def _detect_moan_features(self, frame: np.ndarray, sample_rate: int) -> Dict[str, Any]:
+        """检测呻吟声特征"""
+        try:
+            # 应用呻吟声滤波器
+            moan_filtered = signal.filtfilt(*self.moan_filter, frame)
+            
+            # 计算低频能量
+            moan_energy = np.mean(moan_filtered ** 2)
+            total_energy = np.mean(frame ** 2)
+            
+            # 低频能量比
+            low_freq_ratio = moan_energy / (total_energy + 1e-10)
+            
+            # 计算节奏特征（呻吟声通常有节奏）
+            autocorr = np.correlate(moan_filtered, moan_filtered, mode='full')
+            autocorr = autocorr[len(autocorr)//2:]
+            
+            # 寻找峰值
+            peaks, _ = signal.find_peaks(autocorr[:1000], height=0.1)
+            rhythm_regularity = len(peaks) / 10.0  # 简化指标
+            
+            is_moan = (low_freq_ratio > 0.25 and rhythm_regularity > 0.3)
+            probability = min(low_freq_ratio * 2 + rhythm_regularity * 0.5, 1.0)
+            
+            return {
+                'is_moan': is_moan,
+                'probability': probability,
+                'low_freq_ratio': low_freq_ratio,
+                'rhythm_regularity': rhythm_regularity
+            }
+        except:
+            return {'is_moan': False, 'probability': 0.0}
+    
+    def _detect_whisper_features(self, frame: np.ndarray, sample_rate: int, magnitude: np.ndarray) -> Dict[str, Any]:
+        """检测耳语特征"""
+        # 耳语通常频谱质心较低，高频能量较少
+        spectral_centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sample_rate)[0].mean()
+        spectral_rolloff = librosa.feature.spectral_rolloff(S=magnitude, sr=sample_rate)[0].mean()
+        
+        # 耳语通常能量较低但过零率较高
+        energy = np.mean(frame ** 2)
+        zcr = librosa.feature.zero_crossing_rate(frame)[0].mean()
+        
+        is_whisper = (spectral_centroid < 1000 and 
+                     spectral_rolloff < 4000 and 
+                     energy < 0.01 and 
+                     zcr > 0.05)
+        
+        return {'is_whisper': is_whisper}
+    
+    def _detect_scream_features(self, frame: np.ndarray, sample_rate: int, magnitude: np.ndarray) -> Dict[str, Any]:
+        """检测尖叫特征"""
+        spectral_centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sample_rate)[0].mean()
+        spectral_bandwidth = librosa.feature.spectral_bandwidth(S=magnitude, sr=sample_rate)[0].mean()
+        energy = np.mean(frame ** 2)
+        
+        is_scream = (spectral_centroid > 2000 and 
+                    spectral_bandwidth > 1500 and 
+                    energy > 0.05)
+        
+        return {'is_scream': is_scream}
+    
+    def _detect_japanese_vowels(self, frame: np.ndarray, sample_rate: int) -> float:
+        """检测日语元音特征"""
+        # 简化的日语元音检测（あ、い、う、え、お）
+        try:
+            # 计算频谱包络
+            stft = librosa.stft(frame, n_fft=512)
+            magnitude = np.abs(stft)
+            
+            # 日语元音通常在某些频率有特征峰
+            # 这里使用简化的检测方法
+            freq_bins = librosa.fft_frequencies(sr=sample_rate, n_fft=512)
+            
+            # 检查日语元音特征频率（简化版）
+            vowel_ranges = [
+                (250, 350),    # あ
+                (300, 400),    # い
+                (200, 300),    # う
+                (400, 500),    # え
+                (350, 450),    # お
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
-            if result.returncode != 0:
-                raise Exception(f"FFmpeg提取音频失败: {result.stderr}")
+            vowel_score = 0.0
+            for low, high in vowel_ranges:
+                mask = (freq_bins >= low) & (freq_bins <= high)
+                if np.any(mask):
+                    range_energy = np.mean(magnitude[mask, :])
+                    total_energy = np.mean(magnitude)
+                    if total_energy > 0:
+                        vowel_score = max(vowel_score, range_energy / total_energy)
             
-            # 验证提取的音频文件
-            if not audio_file.exists() or audio_file.stat().st_size == 0:
-                raise Exception(f"提取的音频文件为空: {audio_file}")
-            
-            logger.info(f"音频提取完成: {audio_file}")
-            return str(audio_file)
-            
-        except FileNotFoundError:
-            logger.error("未找到ffmpeg，请先安装ffmpeg")
-            raise Exception("未找到ffmpeg，请先安装ffmpeg")
-        except Exception as e:
-            logger.error(f"提取音频失败: {e}")
-            raise
-    
-    def _get_state_file_path(self, video_file: str) -> Path:
-        """获取状态文件路径"""
-        # 状态文件放在临时目录下的states子目录中
-        temp_dir = self.get_temp_dir(video_file)
-        state_dir = temp_dir / "states"
-        state_dir.mkdir(exist_ok=True)
-        return state_dir / "state.json"
-    
-    def load_state(self, video_file: str) -> Optional[TranscriptionState]:
-        """加载转录状态"""
-        state_file = self._get_state_file_path(video_file)
-        
-        if not state_file.exists():
-            return None
-        
-        try:
-            with open(state_file, 'r', encoding='utf-8') as f:
-                state_data = json.load(f)
-            
-            state = TranscriptionState.from_dict(state_data)
-            
-            # 检查临时目录是否存在，如果不存在则状态无效
-            temp_dir = Path(state.temp_dir)
-            if not temp_dir.exists():
-                logger.warning(f"临时目录不存在: {temp_dir}")
-                return None
-                
-            return state
-        except Exception as e:
-            logger.warning(f"加载状态文件失败: {e}")
-            return None
-    
-    def save_state(self, state: TranscriptionState):
-        """保存转录状态"""
-        state_file = self._get_state_file_path(state.original_file)
-        
-        try:
-            with open(state_file, 'w', encoding='utf-8') as f:
-                json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存状态文件失败: {e}")
-    
-    def prepare_segments(self, video_file: str, segment_duration: int = 600) -> TranscriptionState:
-        """
-        准备音频分段
-        
-        Args:
-            video_file: 视频文件路径
-            segment_duration: 分段时长（秒），默认10分钟
-            
-        Returns:
-            转录状态对象
-        """
-        try:
-            from pydub import AudioSegment
-        except ImportError:
-            logger.error("请安装pydub: pip install pydub")
-            raise
-        
-        # 获取临时目录
-        temp_dir = self.get_temp_dir(video_file)
-        
-        # 提取音频
-        audio_file = self.extract_audio_from_video(video_file, temp_dir)
-        
-        # 创建分段子目录
-        segments_dir = temp_dir / "segments"
-        segments_dir.mkdir(exist_ok=True)
-        
-        # 使用pydub加载音频
-        logger.info(f"加载音频文件: {audio_file}")
-        try:
-            audio = AudioSegment.from_wav(audio_file)
+            return min(vowel_score, 1.0)
         except:
-            # 如果不是wav格式，尝试通用加载
-            audio = AudioSegment.from_file(audio_file)
-            
-        duration_ms = len(audio)
-        duration_sec = duration_ms / 1000
-        
-        # 计算分段数
-        segment_count = int(duration_sec // segment_duration) + (1 if duration_sec % segment_duration > 0 else 0)
-        
-        # 创建状态对象
-        state = TranscriptionState(
-            audio_file=audio_file,
-            original_file=video_file,
-            temp_dir=str(temp_dir),
-            total_segments=segment_count,
-            model_name=self.model_name,
-            segment_duration=segment_duration,
-            start_time=datetime.now()
-        )
-        
-        # 分割音频并创建分段信息
-        for i in range(segment_count):
-            start_ms = i * segment_duration * 1000
-            end_ms = min((i + 1) * segment_duration * 1000, duration_ms)
-            
-            segment = audio[start_ms:end_ms]
-            segment_file = segments_dir / f"segment_{i:04d}.wav"
-            
-            # 导出为wav格式
-            segment.export(str(segment_file), format="wav")
-            
-            # 验证保存的文件
-            if not segment_file.exists() or segment_file.stat().st_size == 0:
-                logger.error(f"片段 {i} 保存失败: {segment_file}")
-                continue
-            
-            # 添加分段信息
-            segment_info = SegmentInfo(
-                index=i,
-                start_time=start_ms / 1000,
-                end_time=end_ms / 1000,
-                file_path=str(segment_file)
-            )
-            state.segments.append(segment_info)
-        
-        # 如果实际创建的片段数少于预期，更新总数
-        state.total_segments = len(state.segments)
-        
-        # 保存初始状态
-        self.save_state(state)
-        logger.info(f"音频分段完成，共{state.total_segments}段，临时文件保存在: {temp_dir}")
-        return state
+            return 0.0
     
-    def load_model(self):
-        """加载Whisper模型"""
-        if self.model is None:
-            logger.info(f"加载Whisper模型: {self.model_name}")
-            try:
-                # 尝试加载模型
-                self.model = whisper.load_model(self.model_name)
-                logger.info(f"模型加载成功: {self.model_name}")
-            except Exception as e:
-                logger.error(f"加载模型失败: {e}")
-                # 如果模型名称包含"turbo"，尝试使用可能的后缀
-                if "turbo" in self.model_name.lower():
-                    logger.info("尝试加载不带turbo后缀的模型...")
-                    try:
-                        base_model_name = self.model_name.replace("-turbo", "").replace("_turbo", "")
-                        self.model = whisper.load_model(base_model_name)
-                        logger.info(f"备用模型加载成功: {base_model_name}")
-                    except Exception as e2:
-                        logger.error(f"备用模型也加载失败: {e2}")
-                        raise
-                else:
-                    raise
+    def _decide_if_voice(self, features: Dict[str, Any]) -> bool:
+        """判断是否为语音/声音"""
+        is_voice = False
+        
+        # 规则1：基础能量阈值
+        if features['energy'] > self.config.energy_threshold:
+            is_voice = True
+        
+        # 规则2：特殊声音检测
+        if features['is_moan'] or features['is_scream']:
+            is_voice = True
+        
+        # 规则3：日语语音特征
+        if features['is_japanese_phoneme']:
+            is_voice = True
+        
+        # 规则4：频谱特征
+        if (features['spectral_centroid'] > 85 and 
+            features['spectral_centroid'] < 4500 and
+            features['spectral_bandwidth'] > 300):
+            is_voice = True
+        
+        # 规则5：过零率（适用于呼吸声等）
+        if features['zero_crossing_rate'] < 0.15 and features['energy'] > 0.002:
+            is_voice = True
+        
+        return is_voice
     
-    def check_audio_file(self, audio_path: str) -> Tuple[bool, str]:
-        """
-        检查音频文件是否有效
+    def _frames_to_segments(self, is_speech: List[bool], frame_features: List[Dict], 
+                           frame_size: int, hop_length: int, sample_rate: int) -> List[Tuple[float, float, Dict]]:
+        """将帧检测结果转换为时间段"""
+        segments = []
+        current_start = None
+        current_features = []
         
-        Args:
-            audio_path: 音频文件路径
+        for i, speech in enumerate(is_speech):
+            frame_time = i * hop_length / sample_rate
             
-        Returns:
-            (是否有效, 错误信息)
-        """
-        try:
-            # 检查文件是否存在且大小大于0
-            if not os.path.exists(audio_path):
-                return False, "文件不存在"
-            
-            if os.path.getsize(audio_path) == 0:
-                return False, "文件大小为0"
-            
-            # 尝试直接加载音频数据
-            import whisper
-            audio_data = whisper.load_audio(audio_path)
-            
-            # 检查是否有音频数据
-            if len(audio_data) == 0:
-                return False, "没有音频数据"
-            
-            # 检查音频是否为静音
-            if np.max(np.abs(audio_data)) < 0.001:
-                return False, "音频可能是静音"
-            
-            return True, f"音频有效，长度: {len(audio_data)/16000:.2f}秒"
-            
-        except Exception as e:
-            return False, f"检查音频文件失败: {str(e)}"
-    
-    def transcribe_segment(self, segment_info: SegmentInfo, state: TranscriptionState) -> SegmentInfo:
-        """
-        转录单个音频片段
-        
-        Args:
-            segment_info: 音频片段信息
-            state: 转录状态
-            
-        Returns:
-            更新后的片段信息
-        """
-        import time
-        
-        try:
-            # 如果已经完成，直接返回
-            if segment_info.status == TranscriptionStatus.COMPLETED:
-                return segment_info
-            
-            # 标记为处理中
-            segment_info.status = TranscriptionStatus.PROCESSING
-            self.save_state(state)
-            
-            # 记录片段开始时间
-            segment_start_time = time.time()
-            
-            # 加载模型（如果未加载）
-            if self.model is None:
-                self.load_model()
-            
-            # 检查音频文件是否有效
-            is_valid, check_msg = self.check_audio_file(segment_info.file_path)
-            if not is_valid:
-                logger.warning(f"音频片段 {segment_info.index} 无效: {check_msg}")
-                segment_info.status = TranscriptionStatus.FAILED
-                segment_info.error = f"音频无效: {check_msg}"
-                return segment_info
-            
-            logger.info(f"开始转录片段 {segment_info.index + 1}/{state.total_segments}")
-            logger.info(f"音频检查结果: {check_msg}")
-            
-            # 转录音频片段（启用词级时间戳）
-            result = self.model.transcribe(
-                segment_info.file_path,
-                language=state.language,
-                fp16=False,
-                verbose=False,
-                condition_on_previous_text=False,
-                word_timestamps=True  # 启用词级时间戳
-            )
-            
-            # 计算片段转录耗时
-            segment_time = time.time() - segment_start_time
-            
-            # 更新片段信息
-            segment_info.transcription = result["text"]
-            segment_info.segments = result.get("segments", [])  # 保存详细的分段信息（包含词级时间戳）
-            segment_info.status = TranscriptionStatus.COMPLETED
-            segment_info.processed_at = datetime.now()
-            segment_info.processing_time = segment_time  # 记录片段处理时间
-            
-            logger.info(f"完成转录片段 {segment_info.index + 1}/{state.total_segments}，耗时: {segment_time:.2f}秒")
-            
-        except Exception as e:
-            logger.error(f"转录片段 {segment_info.index} 失败: {e}")
-            logger.exception(e)  # 打印完整的堆栈跟踪
-            
-            segment_info.status = TranscriptionStatus.FAILED
-            segment_info.error = str(e)
-            
-            # 如果是张量形状错误，尝试特殊处理
-            if "cannot reshape tensor of 0 elements" in str(e):
-                logger.info(f"检测到张量形状错误，尝试重新生成音频片段 {segment_info.index}")
-                try:
-                    # 尝试重新生成音频文件
-                    self._regenerate_audio_segment(segment_info, state)
-                    
-                    # 重新转录
-                    result = self.model.transcribe(
-                        segment_info.file_path,
-                        language=state.language,
-                        fp16=False,
-                        verbose=False,
-                        condition_on_previous_text=False
-                    )
-                    
-                    segment_info.transcription = result["text"]
-                    segment_info.status = TranscriptionStatus.COMPLETED
-                    segment_info.processed_at = datetime.now()
-                    logger.info(f"重新转录成功完成片段 {segment_info.index + 1}/{state.total_segments}")
-                except Exception as e2:
-                    logger.error(f"重新转录也失败: {e2}")
-        
-        return segment_info
-    
-    def _regenerate_audio_segment(self, segment_info: SegmentInfo, state: TranscriptionState):
-        """重新生成音频片段"""
-        try:
-            from pydub import AudioSegment
-            
-            # 加载原始音频
-            audio = AudioSegment.from_wav(state.audio_file)
-            
-            # 计算片段位置
-            start_ms = int(segment_info.start_time * 1000)
-            end_ms = int(segment_info.end_time * 1000)
-            
-            # 提取片段
-            segment = audio[start_ms:end_ms]
-            
-            # 重新导出
-            segment.export(segment_info.file_path, format="wav")
-            
-            logger.info(f"重新生成音频片段 {segment_info.index}")
-            
-        except Exception as e:
-            logger.error(f"重新生成音频片段失败: {e}")
-            raise
-    
-    def resume_transcription(self, video_file: str) -> TranscriptionState:
-        """
-        恢复转录（断点续传）
-        
-        Args:
-            video_file: 视频文件路径
-            
-        Returns:
-            转录状态对象
-        """
-        # 加载已有状态
-        state = self.load_state(video_file)
-        if not state:
-            raise ValueError("未找到转录状态，请先开始新的转录")
-        
-        logger.info(f"恢复转录: {video_file}")
-        logger.info(f"临时目录: {state.temp_dir}")
-        logger.info(f"进度: {state.completed_segments}/{state.total_segments}")
-        
-        # 加载模型
-        if self.model is None:
-            self.load_model()
-        
-        # 统计待处理片段
-        pending_segments = [s for s in state.segments if s.status in [
-            TranscriptionStatus.PENDING, 
-            TranscriptionStatus.FAILED
-        ]]
-        
-        if not pending_segments:
-            logger.info("所有片段已完成转录")
-            return state
-        
-        # 顺序处理待转录片段
-        return self._process_segments_sequential(state, pending_segments)
-    
-    def transcribe(self, 
-                  video_file: str, 
-                  segment_duration: int = 600,
-                  language: str = "ja",  # 默认日语
-                  resume: bool = True,
-                  cleanup: bool = False) -> TranscriptionState:
-        """
-        转录视频/音频文件
-        
-        Args:
-            video_file: 视频/音频文件路径
-            segment_duration: 分段时长（秒）
-            language: 语言代码（默认日语）
-            resume: 是否尝试恢复之前的转录
-            cleanup: 是否清理临时文件
-            
-        Returns:
-            转录状态对象
-        """
-        import time
-        
-        # 记录开始时间
-        self.timestamps["start_time"] = time.time()
-        total_start_time = self.timestamps["start_time"]
-        
-        # 检查文件是否存在
-        if not Path(video_file).exists():
-            raise FileNotFoundError(f"文件不存在: {video_file}")
-        
-        # 清理临时文件
-        if cleanup:
-            self.cleanup_temp_files(video_file)
-        
-        # 尝试恢复之前的转录
-        if resume:
-            existing_state = self.load_state(video_file)
-            if existing_state:
-                logger.info("检测到未完成的转录任务，尝试恢复...")
-                return self.resume_transcription(video_file)
-        
-        # 开始新的转录
-        logger.info(f"开始新的转录任务: {video_file}")
-        
-        # 准备音频分段
-        audio_prep_start = time.time()
-        state = self.prepare_segments(video_file, segment_duration)
-        state.language = language
-        audio_prep_time = time.time() - audio_prep_start
-        self.timestamps["audio_extraction_time"] = audio_prep_time
-        
-        # 打印音频准备耗时
-        print(f"音频提取与分段耗时: {format_simple_timedelta(audio_prep_time)}")
-        print(f"累计耗时: {format_simple_timedelta(time.time() - total_start_time)}")
-        
-        # 加载模型
-        model_load_start = time.time()
-        self.load_model()
-        model_load_time = time.time() - model_load_start
-        self.timestamps["model_loading_time"] = model_load_time
-        
-        # 打印模型加载耗时
-        print(f"模型加载耗时: {format_simple_timedelta(model_load_time)}")
-        print(f"累计耗时: {format_simple_timedelta(time.time() - total_start_time)}")
-        
-        # 获取所有待处理片段
-        pending_segments = [s for s in state.segments if s.status == TranscriptionStatus.PENDING]
-        
-        if not pending_segments:
-            logger.warning("没有需要转录的片段")
-            return state
-        
-        # 顺序处理所有片段
-        transcription_start = time.time()
-        result = self._process_segments_sequential(state, pending_segments)
-        transcription_time = time.time() - transcription_start
-        self.timestamps["transcription_time"] = transcription_time
-        
-        # 打印转录耗时
-        print(f"转录处理耗时: {format_simple_timedelta(transcription_time)}")
-        
-        # 计算总耗时
-        total_time = time.time() - total_start_time
-        self.timestamps["total_time"] = total_time
-        
-        # 打印总耗时
-        print(f"总耗时: {format_simple_timedelta(total_time)}")
-        
-        return result
-    
-    def _process_segments_sequential(self, 
-                                   state: TranscriptionState, 
-                                   segments_to_process: List[SegmentInfo]) -> TranscriptionState:
-        """顺序处理音频片段"""
-        import time
-        
-        try:
-            # 按索引排序
-            segments_to_process.sort(key=lambda x: x.index)
-            
-            # 记录转录开始时间
-            transcription_start_time = time.time()
-            
-            # 顺序处理每个片段
-            for i, segment in enumerate(segments_to_process):
-                try:
-                    # 计算当前累计耗时
-                    current_cumulative_time = time.time() - transcription_start_time
-                    logger.info(f"处理片段 {segment.index + 1}/{state.total_segments}，累计耗时: {format_simple_timedelta(current_cumulative_time)}")
-                    
-                    updated_segment = self.transcribe_segment(segment, state)
-                    
-                    # 更新状态
-                    idx = segment.index
-                    state.segments[idx] = updated_segment
-                    
-                    # 更新统计
-                    if updated_segment.status == TranscriptionStatus.COMPLETED:
-                        state.completed_segments += 1
-                    elif updated_segment.status == TranscriptionStatus.FAILED:
-                        state.failed_segments += 1
-                    
-                    # 保存状态
-                    self.save_state(state)
-                    
-                    # 计算当前进度和预计剩余时间
-                    completed_count = state.completed_segments + state.failed_segments
-                    total_count = state.total_segments
-                    progress_percentage = (completed_count / total_count * 100) if total_count > 0 else 0
-                    
-                    # 计算平均处理时间
-                    completed_segments_with_time = [s for s in state.segments if s.processing_time is not None]
-                    if completed_segments_with_time:
-                        avg_time = sum(s.processing_time for s in completed_segments_with_time) / len(completed_segments_with_time)
-                        remaining_segments = total_count - completed_count
-                        estimated_remaining_time = avg_time * remaining_segments
-                        logger.info(f"进度: {completed_count}/{total_count} ({progress_percentage:.1f}%)，预计剩余时间: {format_simple_timedelta(estimated_remaining_time)}")
-                    else:
-                        logger.info(f"进度: {completed_count}/{total_count} ({progress_percentage:.1f}%)")
-                    
-                except KeyboardInterrupt:
-                    logger.info("转录被用户中断，保存当前进度...")
-                    self.save_state(state)
-                    raise
-                except Exception as e:
-                    logger.error(f"处理片段 {segment.index} 时出错: {e}")
-                    segment.status = TranscriptionStatus.FAILED
-                    segment.error = str(e)
-                    state.failed_segments += 1
-                    self.save_state(state)
-            
-            # 转录完成
-            state.end_time = datetime.now()
-            
-            # 保存最终状态
-            self.save_state(state)
-            
-            # 合并转录结果
-            if state.completed_segments > 0:
-                self._merge_transcriptions(state)
-            
-            # 输出摘要
-            self._print_summary(state)
-            
-            return state
-            
-        except KeyboardInterrupt:
-            logger.info("转录被用户中断，保存当前进度...")
-            self.save_state(state)
-            raise
-            
-        except Exception as e:
-            logger.error(f"转录过程中发生错误: {e}")
-            self.save_state(state)
-            raise
-    
-    def _merge_transcriptions(self, state: TranscriptionState):
-        """合并所有片段的转录结果"""
-        # 按时间顺序排序片段
-        sorted_segments = sorted(state.segments, key=lambda x: x.index)
-        
-        # 生成纯文本格式（保留原有格式）
-        transcriptions = []
-        for segment in sorted_segments:
-            if segment.transcription:
-                # 添加时间戳标记
-                time_mark = f"[{segment.start_time:.1f}s-{segment.end_time:.1f}s]"
-                transcriptions.append(f"{time_mark} {segment.transcription}")
-        
-        full_text = "\n".join(transcriptions)
-        
-        # 保存纯文本格式
-        txt_file = self.output_dir / f"{Path(state.original_file).stem}_transcription.txt"
-        with open(txt_file, 'w', encoding='utf-8') as f:
-            f.write(full_text)
-        
-        logger.info(f"纯文本转录已保存至: {txt_file}")
-        
-        # 生成SRT格式字幕（标准字幕格式）
-        srt_entries = []
-        entry_index = 1
-        
-        # 方法1：片段级别SRT（原有逻辑）
-        for segment in sorted_segments:
-            if segment.transcription:
-                # 转换为SRT时间格式
-                start_time_str = format_timedelta(segment.start_time)
-                end_time_str = format_timedelta(segment.end_time)
+            if speech and current_start is None:
+                current_start = frame_time
+                current_features.append(frame_features[i])
+            elif speech and current_start is not None:
+                current_features.append(frame_features[i])
+            elif not speech and current_start is not None:
+                duration = frame_time - current_start
                 
-                # 创建SRT条目
-                srt_entry = f"{entry_index}\n{start_time_str} --> {end_time_str}\n{segment.transcription}\n"
-                srt_entries.append(srt_entry)
-                entry_index += 1
+                if duration >= self.config.min_speech_duration:
+                    # 聚合特征
+                    segment_info = self._aggregate_features(current_features)
+                    segments.append((current_start, frame_time, segment_info))
+                
+                current_start = None
+                current_features = []
         
-        srt_content = "\n".join(srt_entries)
-        srt_file = self.output_dir / f"{Path(state.original_file).stem}_transcription.srt"
-        with open(srt_file, 'w', encoding='utf-8') as f:
-            f.write(srt_content)
+        # 处理最后一段
+        if current_start is not None:
+            end_time = len(is_speech) * hop_length / sample_rate
+            duration = end_time - current_start
+            if duration >= self.config.min_speech_duration:
+                segment_info = self._aggregate_features(current_features)
+                segments.append((current_start, end_time, segment_info))
         
-        logger.info(f"片段级别SRT字幕已保存至: {srt_file}")
+        return segments
+    
+    def _aggregate_features(self, features_list: List[Dict]) -> Dict[str, Any]:
+        """聚合多个帧的特征"""
+        if not features_list:
+            return {}
         
-        # 方法2：句子级别SRT（如果可用，基于Whisper的句子分段）
-        sentence_srt_entries = []
-        sentence_entry_index = 1
-        
-        for segment in sorted_segments:
-            if segment.segments:  # 如果有Whisper的详细分段信息
-                for whisper_segment in segment.segments:
-                    # 计算绝对时间（片段起始时间 + 句子相对时间）
-                    sentence_start = segment.start_time + whisper_segment['start']
-                    sentence_end = segment.start_time + whisper_segment['end']
-                    
-                    # 转换为SRT时间格式
-                    sentence_start_str = format_timedelta(sentence_start)
-                    sentence_end_str = format_timedelta(sentence_end)
-                    
-                    # 创建句子级别SRT条目
-                    sentence_srt_entry = f"{sentence_entry_index}\n{sentence_start_str} --> {sentence_end_str}\n{whisper_segment['text'].strip()}\n"
-                    sentence_srt_entries.append(sentence_srt_entry)
-                    sentence_entry_index += 1
-        
-        if sentence_srt_entries:  # 如果有句子级别时间戳，则生成句子级别SRT
-            sentence_srt_content = "\n".join(sentence_srt_entries)
-            sentence_srt_file = self.output_dir / f"{Path(state.original_file).stem}_sentence_level.srt"
-            with open(sentence_srt_file, 'w', encoding='utf-8') as f:
-                f.write(sentence_srt_content)
-            
-            logger.info(f"句子级别SRT字幕已保存至: {sentence_srt_file}")
-        else:
-            logger.info("未检测到句子级别时间戳信息，仅生成片段级别SRT字幕")
-        
-        # 同时保存为JSON格式（包含更多信息）
-        json_output = {
-            "original_file": state.original_file,
-            "audio_file": state.audio_file,
-            "model": state.model_name,
-            "language": state.language,
-            "total_duration": state.segments[-1].end_time if state.segments else 0,
-            "segments": [seg.to_dict() for seg in sorted_segments],
-            "full_text": full_text,
-            "srt_content": srt_content,
-            "completed_at": datetime.now().isoformat()
+        aggregated = {
+            'has_moans': any(f['is_moan'] for f in features_list),
+            'has_whispers': any(f['is_whisper'] for f in features_list),
+            'has_screams': any(f['is_scream'] for f in features_list),
+            'has_japanese_phonemes': any(f['is_japanese_phoneme'] for f in features_list),
+            'avg_energy': np.mean([f['energy'] for f in features_list]),
+            'avg_moan_prob': np.mean([f['moan_probability'] for f in features_list]),
+            'avg_vowel_score': np.mean([f['vowel_score'] for f in features_list]),
+            'frame_count': len(features_list)
         }
         
-        json_file = self.output_dir / f"{Path(state.original_file).stem}_transcription.json"
-        with open(json_file, 'w', encoding='utf-8') as f:
-            json.dump(json_output, f, ensure_ascii=False, indent=2)
+        return aggregated
     
-    def _print_summary(self, state: TranscriptionState):
-        """打印转录摘要"""
-        print("\n" + "="*60)
-        print("转录摘要")
-        print("="*60)
-        print(f"原始文件: {state.original_file}")
-        print(f"音频文件: {state.audio_file}")
-        print(f"使用模型: {state.model_name}")
-        print(f"语言: {state.language}")
-        print(f"临时目录: {state.temp_dir}")
-        print(f"总片段数: {state.total_segments}")
-        print(f"成功转录: {state.completed_segments}")
-        print(f"失败片段: {state.failed_segments}")
+    def _merge_segments(self, segments: List[Tuple[float, float, Dict]]) -> List[Tuple[float, float, Dict]]:
+        """合并相邻的语音段"""
+        if not segments:
+            return []
         
-        # 显示详细耗时统计
-        if self.timestamps["total_time"]:
-            print("\n耗时统计:")
-            print(f"  音频提取与分段: {format_simple_timedelta(self.timestamps['audio_extraction_time'])}")
-            print(f"  模型加载: {format_simple_timedelta(self.timestamps['model_loading_time'])}")
-            print(f"  转录处理: {format_simple_timedelta(self.timestamps['transcription_time'])}")
-            print(f"  总耗时: {format_simple_timedelta(self.timestamps['total_time'])}")
+        merged = []
+        current_start, current_end, current_info = segments[0]
+        
+        for start, end, info in segments[1:]:
+            if start - current_end <= self.config.merge_gap:
+                # 合并
+                current_end = end
+                # 合并信息
+                for key in ['has_moans', 'has_whispers', 'has_screams', 'has_japanese_phonemes']:
+                    current_info[key] = current_info[key] or info[key]
+                current_info['avg_energy'] = (current_info['avg_energy'] + info['avg_energy']) / 2
+                current_info['avg_moan_prob'] = (current_info['avg_moan_prob'] + info['avg_moan_prob']) / 2
+                current_info['avg_vowel_score'] = (current_info['avg_vowel_score'] + info['avg_vowel_score']) / 2
+                current_info['frame_count'] += info['frame_count']
+            else:
+                merged.append((current_start, current_end, current_info))
+                current_start, current_end, current_info = start, end, info
+        
+        merged.append((current_start, current_end, current_info))
+        return merged
+    
+    def _filter_segments(self, segments: List[Tuple[float, float, Dict]]) -> List[Tuple[float, float, Dict]]:
+        """过滤和分割过长的段"""
+        filtered_segments = []
+        
+        for start, end, info in segments:
+            duration = end - start
             
-            # 计算各阶段占比
-            total = self.timestamps["total_time"]
-            if total > 0:
-                print(f"\n各阶段耗时占比:")
-                if self.timestamps['audio_extraction_time']:
-                    audio_percent = (self.timestamps['audio_extraction_time'] / total) * 100
-                    print(f"  音频提取与分段: {audio_percent:.1f}%")
-                if self.timestamps['model_loading_time']:
-                    model_percent = (self.timestamps['model_loading_time'] / total) * 100
-                    print(f"  模型加载: {model_percent:.1f}%")
-                if self.timestamps['transcription_time']:
-                    trans_percent = (self.timestamps['transcription_time'] / total) * 100
-                    print(f"  转录处理: {trans_percent:.1f}%")
-        elif state.start_time and state.end_time:
-            duration = (state.end_time - state.start_time).total_seconds()
-            print(f"总耗时: {duration:.1f}秒")
+            if duration > self.config.max_segment_duration:
+                # 分割过长的段
+                num_splits = int(np.ceil(duration / self.config.max_segment_duration))
+                split_duration = duration / num_splits
+                
+                for i in range(num_splits):
+                    split_start = start + i * split_duration
+                    split_end = min(start + (i + 1) * split_duration, end)
+                    
+                    # 复制信息（可能不准确，但保持简单）
+                    filtered_segments.append((split_start, split_end, info.copy()))
+            else:
+                filtered_segments.append((start, end, info))
         
-        # 片段处理时间统计
-        completed_segments_with_time = [s for s in state.segments if s.processing_time is not None]
-        if completed_segments_with_time:
-            total_processing_time = sum(s.processing_time for s in completed_segments_with_time)
-            avg_processing_time = total_processing_time / len(completed_segments_with_time)
-            max_processing_time = max(s.processing_time for s in completed_segments_with_time)
-            min_processing_time = min(s.processing_time for s in completed_segments_with_time)
+        return filtered_segments
+    
+    def _apply_padding(self, segments: List[Tuple[float, float, Dict]], total_duration: float) -> List[Tuple[float, float, Dict]]:
+        """应用时间填充"""
+        padded_segments = []
+        
+        for start, end, info in segments:
+            padded_start = max(0, start - self.config.padding)
+            padded_end = min(total_duration, end + self.config.padding)
             
-            print("\n片段处理时间统计:")
-            print(f"  总处理时间: {format_simple_timedelta(total_processing_time)}")
-            print(f"  平均处理时间: {format_simple_timedelta(avg_processing_time)}")
-            print(f"  最长处理时间: {format_simple_timedelta(max_processing_time)}")
-            print(f"  最短处理时间: {format_simple_timedelta(min_processing_time)}")
+            # 确保填充后的段至少包含原始内容
+            if padded_start <= start and padded_end >= end:
+                padded_segments.append((padded_start, padded_end, info))
+            else:
+                padded_segments.append((start, end, info))
         
-        if state.completed_segments == state.total_segments:
-            print("状态: 已完成 ✓")
+        return padded_segments
+    
+    def analyze_audio(self, audio_path: str, output_json: Optional[str] = None, 
+                     chunk_duration: float = 10.0, stream_mode: bool = True) -> Dict[str, Any]:
+        """分析音频并返回VAD结果（支持流式操作）"""
+        logger.info(f"开始VAD分析: {audio_path}")
+        
+        try:
+            if stream_mode:
+                # 流式处理模式
+                segments = self._analyze_audio_streaming(audio_path, chunk_duration)
+                
+                # 获取音频总时长 - 使用load_audio方法兼容视频文件
+                audio, sr = self.load_audio(audio_path, self.config.sample_rate)
+                total_duration = len(audio) / sr
+            else:
+                # 传统批量处理模式（保持向后兼容）
+                audio, sr = self.load_audio(audio_path, self.config.sample_rate)
+                total_duration = len(audio) / sr
+                segments = self.detect_voice_activity(audio, sr)
+            
+            # 统计信息
+            speech_duration = sum(end - start for start, end, _ in segments)
+            speech_ratio = speech_duration / total_duration if total_duration > 0 else 0
+            
+            # 特殊声音统计
+            special_counts = {
+                'moans': sum(1 for _, _, info in segments if info.get('has_moans', False)),
+                'whispers': sum(1 for _, _, info in segments if info.get('has_whispers', False)),
+                'screams': sum(1 for _, _, info in segments if info.get('has_screams', False)),
+                'japanese_phonemes': sum(1 for _, _, info in segments if info.get('has_japanese_phonemes', False))
+            }
+            
+            # 整理结果
+            results = {
+                'audio_path': audio_path,
+                'total_duration': total_duration,
+                'speech_duration': speech_duration,
+                'speech_ratio': speech_ratio,
+                'segment_count': len(segments),
+                'special_sounds': special_counts,
+                'segments': [
+                    {
+                        'start': start,
+                        'end': end,
+                        'duration': end - start,
+                        'metadata': info
+                    }
+                    for start, end, info in segments
+                ],
+                'vad_config': self.config.__dict__,
+                'analysis_time': datetime.now().isoformat(),
+                'processing_mode': 'streaming' if stream_mode else 'batch'
+            }
+            
+            # 保存结果
+            if output_json:
+                os.makedirs(os.path.dirname(output_json) if os.path.dirname(output_json) else '.', exist_ok=True)
+                with open(output_json, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2)
+                logger.info(f"VAD结果已保存到: {output_json}")
+            
+            logger.info(f"VAD分析完成: 检测到 {len(segments)} 个语音段, 语音比例: {speech_ratio:.1%}")
+            return results
+            
+        except Exception as e:
+            logger.error(f"VAD分析失败: {e}")
+            raise
+    
+    def _analyze_audio_streaming(self, audio_path: str, chunk_duration: float = 10.0) -> List[Tuple[float, float, Dict]]:
+        """流式分析音频/视频文件"""
+        logger.info(f"开始流式VAD分析: {audio_path}, 块时长: {chunk_duration}s")
+        
+        try:
+            # 首先加载整个音频以获取信息（兼容视频文件）
+            logger.info("加载音频以获取基本信息...")
+            full_audio, sample_rate = self.load_audio(audio_path, self.config.sample_rate)
+            total_duration = len(full_audio) / sample_rate
+            
+            logger.info(f"音频信息: 总时长 {total_duration:.1f}s, 采样率 {sample_rate}Hz")
+            
+            # 计算块大小
+            chunk_size = int(chunk_duration * sample_rate)
+            logger.info(f"块大小: {chunk_size} 样本, 约 {chunk_duration}s")
+            
+            # 初始化状态
+            all_segments = []
+            current_segment = None
+            current_time_offset = 0.0
+            chunk_count = 0
+            total_segments_detected = 0
+            
+            # 手动分块处理（替代soundfile的流式读取）
+            total_samples = len(full_audio)
+            current_sample = 0
+            
+            while current_sample < total_samples:
+                chunk_count += 1
+                
+                # 读取音频块
+                end_sample = min(current_sample + chunk_size, total_samples)
+                audio_chunk = full_audio[current_sample:end_sample]
+                
+                if len(audio_chunk) == 0:
+                    logger.info("音频处理完成")
+                    break
+                
+                logger.info(f"处理第 {chunk_count} 个音频块, 当前时间偏移: {current_time_offset:.1f}s")
+                
+                # 处理当前音频块
+                chunk_segments = self._process_audio_chunk(
+                    audio_chunk, sample_rate, current_time_offset, current_segment
+                )
+                
+                # 记录块处理结果
+                if chunk_segments:
+                    logger.info(f"块 {chunk_count}: 检测到 {len(chunk_segments)} 个语音段")
+                    total_segments_detected += len(chunk_segments)
+                else:
+                    logger.debug(f"块 {chunk_count}: 未检测到语音活动")
+                
+                # 更新状态
+                if chunk_segments:
+                    # 处理跨块语音段
+                    if current_segment is not None:
+                        # 检查是否需要合并最后一个段
+                        last_segment = chunk_segments[-1]
+                        if (last_segment[0] - current_segment[1] <= self.config.merge_gap and
+                            last_segment[2].get('has_moans') == current_segment[2].get('has_moans')):
+                            # 合并段
+                            merged_start = current_segment[0]
+                            merged_end = last_segment[1]
+                            merged_info = self._merge_segment_info(current_segment[2], last_segment[2])
+                            
+                            logger.info(f"跨块合并: 段 {current_segment[0]:.1f}s-{current_segment[1]:.1f}s 与段 {last_segment[0]:.1f}s-{last_segment[1]:.1f}s 合并")
+                            
+                            # 替换最后一个段
+                            chunk_segments[-1] = (merged_start, merged_end, merged_info)
+                            
+                            # 移除已合并的当前段
+                            if current_segment in all_segments:
+                                all_segments.remove(current_segment)
+                        
+                        current_segment = None
+                    
+                    # 添加新段
+                    all_segments.extend(chunk_segments)
+                    
+                    # 更新当前段状态
+                    if chunk_segments:
+                        current_segment = chunk_segments[-1]
+                        logger.debug(f"当前活跃段: {current_segment[0]:.1f}s-{current_segment[1]:.1f}s")
+                
+                # 更新时间偏移和样本位置
+                chunk_duration_actual = len(audio_chunk) / sample_rate
+                current_time_offset += chunk_duration_actual
+                current_sample += len(audio_chunk)
+                
+                # 进度日志
+                progress = min(current_time_offset / total_duration, 1.0)
+                if int(progress * 100) % 5 == 0:  # 每5%记录一次进度
+                    logger.info(f"流式分析进度: {progress:.1%} ({current_time_offset:.1f}s/{total_duration:.1f}s), 已检测 {len(all_segments)} 个语音段")
+            
+            # 处理最后一个未完成的段
+            if current_segment is not None:
+                all_segments.append(current_segment)
+                logger.info(f"处理最后一个未完成段: {current_segment[0]:.1f}s-{current_segment[1]:.1f}s")
+            
+            logger.info(f"流式处理完成: 共处理 {chunk_count} 个音频块, 累计检测 {total_segments_detected} 个语音段")
+            
+            # 后处理：合并、过滤、填充
+            logger.info("开始后处理: 合并相邻语音段")
+            all_segments = self._merge_segments(all_segments)
+            logger.info(f"合并后语音段数量: {len(all_segments)}")
+            
+            logger.info("开始后处理: 过滤短语音段")
+            all_segments = self._filter_segments(all_segments)
+            logger.info(f"过滤后语音段数量: {len(all_segments)}")
+            
+            logger.info("开始后处理: 应用时间填充")
+            all_segments = self._apply_padding(all_segments, total_duration)
+            
+            logger.info(f"流式VAD分析完成: 处理了 {total_duration:.1f}s 音频, 检测到 {len(all_segments)} 个语音段")
+            return all_segments
+            
+        except Exception as e:
+            logger.error(f"流式分析失败: {e}")
+            raise
+    
+    def _process_audio_chunk(self, audio_chunk: np.ndarray, sample_rate: int, 
+                           time_offset: float, current_segment: Optional[Tuple[float, float, Dict]]) -> List[Tuple[float, float, Dict]]:
+        """处理单个音频块"""
+        if len(audio_chunk) == 0:
+            return []
+        
+        # 检测当前块的语音活动
+        chunk_segments = self.detect_voice_activity(audio_chunk, sample_rate)
+        
+        # 调整时间戳以匹配全局时间
+        adjusted_segments = []
+        for start, end, info in chunk_segments:
+            adjusted_start = time_offset + start
+            adjusted_end = time_offset + end
+            adjusted_segments.append((adjusted_start, adjusted_end, info))
+        
+        return adjusted_segments
+    
+    def _merge_segment_info(self, info1: Dict, info2: Dict) -> Dict:
+        """合并两个段的元数据信息"""
+        merged = {}
+        
+        # 布尔值：使用逻辑或
+        for key in ['has_moans', 'has_whispers', 'has_screams', 'has_japanese_phonemes']:
+            if key in info1 or key in info2:
+                merged[key] = info1.get(key, False) or info2.get(key, False)
+        
+        # 数值：取平均值
+        for key in ['avg_energy', 'avg_moan_prob', 'avg_vowel_score']:
+            if key in info1 or key in info2:
+                val1 = info1.get(key, 0)
+                val2 = info2.get(key, 0)
+                merged[key] = (val1 + val2) / 2
+        
+        # 计数：求和
+        if 'frame_count' in info1 or 'frame_count' in info2:
+            merged['frame_count'] = info1.get('frame_count', 0) + info2.get('frame_count', 0)
+        
+        return merged
+
+class TranscriptionWithVAD:
+    """集成VAD的Whisper转录系统（支持断点续传）"""
+    
+    def __init__(self, vad_config: Optional[VADConfig] = None, 
+                 trans_config: Optional[TranscriptionConfig] = None):
+        self.vad_config = vad_config or VADConfig()
+        self.trans_config = trans_config or TranscriptionConfig()
+        
+        # 初始化组件
+        self.vad = JapaneseAdultVAD(self.vad_config)
+        
+        # 初始化Whisper模型
+        if WHISPER_AVAILABLE:
+            logger.info(f"加载Whisper模型: {self.trans_config.model_size}")
+            self.model = whisper.load_model(
+                self.trans_config.model_size,
+                device=self.trans_config.device
+            )
         else:
-            print("状态: 部分完成（可恢复）")
+            self.model = None
+            logger.warning("Whisper未安装，转录功能不可用")
         
-        # 临时文件说明
-        print(f"\n临时文件保存在: {state.temp_dir}")
-        print("注意: 临时文件默认不会自动清理，可以用于恢复转录")
-        print("如需清理临时文件，可以使用 --cleanup 参数")
-        print("="*60)
+        # 创建输出目录和临时目录
+        os.makedirs(self.trans_config.output_dir, exist_ok=True)
+        os.makedirs(self.trans_config.temp_dir, exist_ok=True)
+        os.makedirs(self.trans_config.checkpoint_dir, exist_ok=True)
+        
+        # 断点状态
+        self.checkpoint_state = {}
     
-    def get_progress(self, video_file: str) -> Dict:
-        """获取转录进度"""
-        state = self.load_state(video_file)
-        if not state:
-            return {"error": "未找到转录任务"}
+    def get_checkpoint_path(self, audio_path: str) -> str:
+        """获取检查点文件路径"""
+        audio_name = Path(audio_path).stem
+        checkpoint_name = f"{audio_name}_checkpoint.json"
+        return os.path.join(self.trans_config.checkpoint_dir, checkpoint_name)
+    
+    def load_checkpoint(self, audio_path: str) -> Optional[Dict]:
+        """加载检查点"""
+        checkpoint_path = self.get_checkpoint_path(audio_path)
         
-        completed = len([s for s in state.segments if s.status == TranscriptionStatus.COMPLETED])
-        total = len(state.segments)
+        if os.path.exists(checkpoint_path):
+            try:
+                with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                    checkpoint = json.load(f)
+                logger.info(f"加载检查点: {checkpoint_path}")
+                return checkpoint
+            except Exception as e:
+                logger.warning(f"加载检查点失败: {e}")
+        
+        return None
+    
+    def save_checkpoint(self, audio_path: str, state: Dict):
+        """保存检查点"""
+        checkpoint_path = self.get_checkpoint_path(audio_path)
+        
+        try:
+            with open(checkpoint_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            
+            # 同时备份一份
+            backup_path = checkpoint_path.replace('.json', f'_backup_{int(time.time())}.json')
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"检查点已保存: {checkpoint_path}")
+        except Exception as e:
+            logger.error(f"保存检查点失败: {e}")
+    
+    def extract_audio_segment(self, audio_path: str, start_time: float, 
+                            end_time: float, temp_dir: Optional[str] = None) -> Optional[str]:
+        """提取音频段到临时文件"""
+        try:
+            if temp_dir is None:
+                temp_dir = self.trans_config.temp_dir
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # 加载完整音频
+            audio, sr = self.vad.load_audio(audio_path, self.vad_config.sample_rate)
+            
+            # 计算样本索引
+            start_sample = int(start_time * sr)
+            end_sample = int(end_time * sr)
+            
+            if start_sample >= len(audio) or end_sample > len(audio):
+                logger.warning(f"时间范围超出音频长度: {start_time}-{end_time}")
+                return None
+            
+            # 提取段
+            segment_audio = audio[start_sample:end_sample]
+            
+            # 保存到临时文件
+            temp_filename = f"segment_{int(start_time)}_{int(end_time)}.wav"
+            temp_path = os.path.join(temp_dir, temp_filename)
+            
+            sf.write(temp_path, segment_audio, sr)
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"提取音频段失败: {e}")
+            return None
+    
+    def transcribe_segment(self, audio_path: str, segment_index: int, 
+                          start_time: float, end_time: float) -> Tuple[Dict[str, Any], float]:
+        """转录单个音频段，返回结果和处理时间"""
+        if not self.model:
+            raise ValueError("Whisper模型未加载")
+        
+        start_time_processing = time.time()
+        
+        # 提取音频段
+        temp_audio_path = self.extract_audio_segment(audio_path, start_time, end_time)
+        if not temp_audio_path:
+            result = {
+                'index': segment_index,
+                'start_time': start_time,
+                'end_time': end_time,
+                'success': False,
+                'error': '提取音频段失败'
+            }
+            return result, 0.0
+        
+        try:
+            # 转录
+            result = self.model.transcribe(
+                temp_audio_path,
+                language=self.trans_config.language,
+                task=self.trans_config.task,
+                beam_size=self.trans_config.beam_size,
+                best_of=self.trans_config.best_of,
+                temperature=self.trans_config.temperature,
+                compression_ratio_threshold=self.trans_config.compression_ratio_threshold,
+                logprob_threshold=self.trans_config.logprob_threshold,
+                no_speech_threshold=self.trans_config.no_speech_threshold,
+                condition_on_previous_text=self.trans_config.condition_on_previous_text,
+                initial_prompt=self.trans_config.initial_prompt,
+                word_timestamps=self.trans_config.word_timestamps,
+                prepend_punctuations=self.trans_config.prepend_punctuations,
+                append_punctuations=self.trans_config.append_punctuations
+            )
+            
+            # 调整时间戳
+            for segment in result.get('segments', []):
+                segment['start'] += start_time
+                segment['end'] += start_time
+            
+            # 清理临时文件
+            try:
+                os.remove(temp_audio_path)
+            except:
+                pass
+            
+            processing_time = time.time() - start_time_processing
+            
+            return {
+                'index': segment_index,
+                'start_time': start_time,
+                'end_time': end_time,
+                'success': True,
+                'result': result
+            }, processing_time
+            
+        except Exception as e:
+            logger.error(f"转录段 {segment_index} 失败: {e}")
+            
+            # 清理临时文件
+            try:
+                os.remove(temp_audio_path)
+            except:
+                pass
+            
+            processing_time = time.time() - start_time_processing
+            
+            return {
+                'index': segment_index,
+                'start_time': start_time,
+                'end_time': end_time,
+                'success': False,
+                'error': str(e)
+            }, processing_time
+    
+    def transcribe_with_vad(self, audio_path: str, 
+                           vad_results: Optional[Dict] = None,
+                           force_redo: bool = False) -> Dict[str, Any]:
+        """使用VAD进行转录（支持断点续传）"""
+        logger.info(f"开始转录: {audio_path}")
+        
+        # 加载或执行VAD分析
+        if vad_results is None:
+            # 尝试从检查点加载VAD结果
+            checkpoint = None if force_redo else self.load_checkpoint(audio_path)
+            
+            if checkpoint and 'vad_results' in checkpoint:
+                vad_results = checkpoint['vad_results']
+                logger.info("使用检查点中的VAD结果")
+            else:
+                # 执行VAD分析
+                vad_json_path = os.path.join(
+                    self.trans_config.output_dir,
+                    f"{Path(audio_path).stem}_vad.json"
+                )
+                vad_results = self.vad.analyze_audio(audio_path, vad_json_path)
+        
+        # 准备转录任务
+        segments = vad_results.get('segments', [])
+        if not segments:
+            logger.warning("未检测到语音段")
+            return {
+                'audio_path': audio_path,
+                'success': False,
+                'error': 'No speech segments detected',
+                'vad_results': vad_results
+            }
+        
+        # 加载检查点状态
+        checkpoint_state = {}
+        if not force_redo:
+            checkpoint = self.load_checkpoint(audio_path)
+            if checkpoint:
+                checkpoint_state = checkpoint.get('transcription_state', {})
+        
+        # 初始化状态
+        total_segments = len(segments)
+        completed_segments = checkpoint_state.get('completed_segments', [])
+        failed_segments = checkpoint_state.get('failed_segments', [])
+        results = checkpoint_state.get('results', [])
+        
+        # 确定需要转录的段
+        pending_segments = []
+        for i, seg in enumerate(segments):
+            if i not in completed_segments and i not in failed_segments:
+                pending_segments.append((i, seg))
+        
+        logger.info(f"转录进度: {len(completed_segments)}/{total_segments} 完成, "
+                   f"{len(failed_segments)} 失败, {len(pending_segments)} 待处理")
+        
+        # 转录待处理的段
+        total_start_time = time.time()
+        cumulative_time = 0.0
+        
+        for i, seg in pending_segments:
+            start_time = seg['start']
+            end_time = seg['end']
+            metadata = seg.get('metadata', {})
+            
+            # 转录
+            segment_result, segment_time = self.transcribe_segment(audio_path, i, start_time, end_time)
+            
+            # 更新累计时间
+            cumulative_time += segment_time
+            
+            # 格式化时间显示
+            segment_time_formatted = format_time(segment_time)
+            cumulative_time_formatted = format_time(cumulative_time)
+            segment_duration = end_time - start_time
+            progress_percent = (len(completed_segments) + len(failed_segments) + 1) / total_segments * 100
+            
+            # 更新状态
+            if segment_result['success']:
+                completed_segments.append(i)
+                results.append(segment_result)
+                logger.info(f"片段 {i+1}/{total_segments} - 耗时: {segment_time_formatted} - "
+                           f"进度: {len(completed_segments) + len(failed_segments)}/{total_segments} ({progress_percent:.1f}%) - "
+                           f"累计: {cumulative_time_formatted}")
+            else:
+                failed_segments.append(i)
+                logger.error(f"片段 {i+1}/{total_segments} - 耗时: {segment_time_formatted} - "
+                           f"进度: {len(completed_segments) + len(failed_segments)}/{total_segments} ({progress_percent:.1f}%) - "
+                           f"累计: {cumulative_time_formatted} - 失败: {segment_result.get('error', 'Unknown error')}")
+            
+            # 定期保存检查点
+            if len(completed_segments) % self.trans_config.save_checkpoint_interval == 0:
+                self._save_transcription_checkpoint(
+                    audio_path, vad_results, completed_segments, 
+                    failed_segments, results
+                )
+        
+        # 最终保存检查点
+        self._save_transcription_checkpoint(
+            audio_path, vad_results, completed_segments, 
+            failed_segments, results
+        )
+        
+        # 合并结果
+        final_result = self._merge_transcription_results(results, vad_results)
+        
+        # 保存输出
+        output_paths = self._save_output_files(audio_path, final_result)
+        
+        logger.info(f"转录完成: {audio_path}")
         
         return {
-            "original_file": state.original_file,
-            "audio_file": state.audio_file,
-            "temp_dir": state.temp_dir,
-            "completed": completed,
-            "total": total,
-            "progress": f"{completed}/{total}",
-            "percentage": (completed / total * 100) if total > 0 else 0,
-            "status": "completed" if completed == total else "in_progress"
+            'audio_path': audio_path,
+            'success': True,
+            'vad_results': vad_results,
+            'transcription_results': final_result,
+            'output_paths': output_paths,
+            'statistics': {
+                'total_segments': total_segments,
+                'completed_segments': len(completed_segments),
+                'failed_segments': len(failed_segments),
+                'success_rate': len(completed_segments) / total_segments if total_segments > 0 else 0
+            }
         }
-
-
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="日语视频转录工具（支持断点续传）")
     
-    parser.add_argument("video_file", help="视频文件路径")
-    parser.add_argument("--model", "-m", default="base", 
-                       choices=["tiny", "base", "small", "medium", "large", "large-v3-turbo"],
-                       help="Whisper模型大小（默认：base）")
-    parser.add_argument("--segment-duration", "-d", type=int, default=180,
-                       help="分段时长（秒，默认：180）")
-    parser.add_argument("--language", "-l", default="ja",
-                       help="语言代码（默认：ja）")
-    parser.add_argument("--cleanup", action="store_true",
-                       help="清理临时文件（程序运行前清理）")
+    def _save_transcription_checkpoint(self, audio_path: str, vad_results: Dict,
+                                      completed_segments: List[int], 
+                                      failed_segments: List[int],
+                                      results: List[Dict]):
+        """保存转录检查点"""
+        checkpoint_state = {
+            'audio_path': audio_path,
+            'timestamp': datetime.now().isoformat(),
+            'vad_results': vad_results,
+            'transcription_state': {
+                'completed_segments': completed_segments,
+                'failed_segments': failed_segments,
+                'results': results
+            }
+        }
+        
+        self.save_checkpoint(audio_path, checkpoint_state)
     
-    return parser.parse_args()
-
+    def _merge_transcription_results(self, segment_results: List[Dict], 
+                                    vad_results: Dict) -> Dict[str, Any]:
+        """合并所有段的转录结果，确保句子级别的时间戳"""
+        all_segments = []
+        all_text = []
+        
+        # 按时间排序
+        segment_results.sort(key=lambda x: x['start_time'])
+        
+        for seg_result in segment_results:
+            if not seg_result['success']:
+                continue
+            
+            result_data = seg_result.get('result', {})
+            text = result_data.get('text', '').strip()
+            
+            if text:
+                all_text.append(text)
+            
+            # 添加段，确保保留句子级别的时间戳
+            for seg in result_data.get('segments', []):
+                # 确保每个segment都有正确的时间戳
+                segment_copy = seg.copy()
+                
+                # 如果segment有words字段（单词级别时间戳），则保留
+                if 'words' in segment_copy:
+                    # 确保单词时间戳正确
+                    for word in segment_copy['words']:
+                        word['start'] = max(0, word.get('start', 0))
+                        word['end'] = max(0, word.get('end', 0))
+                
+                # 确保segment时间戳正确
+                segment_copy['start'] = max(0, segment_copy.get('start', 0))
+                segment_copy['end'] = max(0, segment_copy.get('end', 0))
+                
+                all_segments.append(segment_copy)
+        
+        # 合并文本
+        full_text = ' '.join(all_text)
+        
+        return {
+            'vad_metadata': {
+                'total_duration': vad_results.get('total_duration', 0),
+                'speech_duration': vad_results.get('speech_duration', 0),
+                'segment_count': vad_results.get('segment_count', 0),
+                'special_sounds': vad_results.get('special_sounds', {})
+            },
+            'text': full_text,
+            'segments': all_segments,
+            'language': self.trans_config.language,
+            'transcription_time': datetime.now().isoformat()
+        }
+    
+    def _save_output_files(self, audio_path: str, result: Dict) -> Dict[str, str]:
+        """保存输出文件"""
+        audio_name = Path(audio_path).stem
+        
+        # 所有输出文件都放在temp目录下
+        base_path = os.path.join(self.trans_config.temp_dir, audio_name)
+        
+        output_paths = {}
+        
+        if WHISPER_AVAILABLE:
+            # 使用Whisper的writer保存各种格式，但输出到temp目录
+            for format_type in self.trans_config.output_formats:
+                output_path = f"{base_path}.{format_type}"
+                
+                try:
+                    writer = get_writer(format_type, self.trans_config.temp_dir)
+                    writer(result, audio_path)
+                    
+                    output_paths[format_type] = output_path
+                    logger.info(f"保存 {format_type.upper()} 格式: {output_path}")
+                except Exception as e:
+                    logger.error(f"保存 {format_type} 格式失败: {e}")
+        
+        # 保存JSON结果（包含VAD元数据）
+        json_path = f"{base_path}_full.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        output_paths['json_full'] = json_path
+        
+        return output_paths
+    
+    def process_batch(self, audio_files: List[str], 
+                     force_redo: bool = False) -> Dict[str, Any]:
+        """批量处理音频文件"""
+        results = {}
+        
+        for audio_file in audio_files:
+            if not os.path.exists(audio_file):
+                logger.warning(f"文件不存在: {audio_file}")
+                continue
+            
+            try:
+                logger.info(f"处理文件: {audio_file}")
+                result = self.transcribe_with_vad(audio_file, force_redo=force_redo)
+                results[audio_file] = result
+                
+                # 生成摘要日志
+                if result.get('success'):
+                    stats = result.get('statistics', {})
+                    logger.info(f"完成: {audio_file} - "
+                               f"成功率: {stats.get('success_rate', 0):.1%}")
+            
+            except Exception as e:
+                logger.error(f"处理失败 {audio_file}: {e}")
+                results[audio_file] = {
+                    'success': False,
+                    'error': str(e)
+                }
+        
+        return results
 
 def main():
-    """命令行入口"""
-    args = parse_args()
+    """主函数：示例使用"""
+    import argparse
     
-    # 创建转录器
-    transcriber = VideoTranscriber(model_name=args.model)
+    parser = argparse.ArgumentParser(description="日语成人视频转录工具（集成VAD）")
+    parser.add_argument("input", help="输入音频/视频文件或目录")
+    parser.add_argument("--model", default="large-v3-turbo", help="Whisper模型大小")
+    parser.add_argument("--language", default="ja", help="语言代码")
+    parser.add_argument("--force-redo", action="store_true", help="强制重新处理")
+    parser.add_argument("--vad-only", action="store_true", help="仅执行VAD分析")
+    parser.add_argument("--batch", action="store_true", help="批量处理目录")
     
-    try:
-        # 开始转录
-        state = transcriber.transcribe(
-            video_file=args.video_file,
-            segment_duration=args.segment_duration,
-            language=args.language,
-            cleanup=args.cleanup
-        )
+    args = parser.parse_args()
+    
+    # 配置VAD（针对成人视频优化）
+    vad_config = VADConfig(
+        threshold=0.35,
+        min_speech_duration=0.18,
+        low_freq=65,
+        energy_threshold=0.004,
+        merge_gap=0.6,
+        padding=0.3,
+        max_segment_duration=180.0,
+        japanese_phoneme_threshold=0.25,
+        vowel_detection=True
+    )
+    
+    # 配置转录 - 所有目录都放在temp下
+    trans_config = TranscriptionConfig(
+        model_size=args.model,
+        language=args.language,
+        output_dir="./temp",  # 输出目录改为temp
+        checkpoint_dir="./temp/checkpoints",  # 检查点目录放在temp下
+        temp_dir="./temp"
+    )
+    
+    # 创建处理器
+    processor = TranscriptionWithVAD(vad_config, trans_config)
+    
+    # 处理输入
+    input_path = args.input
+    
+    if os.path.isdir(input_path) and args.batch:
+        # 批量处理目录
+        import glob
         
-        # 检查进度
-        progress = transcriber.get_progress(args.video_file)
-        if "error" not in progress:
-            print(f"\n当前进度: {progress['progress']} ({progress['percentage']:.1f}%)")
-            print(f"临时文件目录: {progress['temp_dir']}")
+        audio_extensions = ['*.mp3', '*.wav', '*.flac', '*.m4a', 
+                           '*.mp4', '*.avi', '*.mkv', '*.mov']
+        audio_files = []
         
-    except KeyboardInterrupt:
-        print("\n转录被中断，下次运行会自动恢复进度")
-    except Exception as e:
-        print(f"转录失败: {e}")
-        import traceback
-        traceback.print_exc()
-
+        for ext in audio_extensions:
+            audio_files.extend(glob.glob(os.path.join(input_path, ext)))
+        
+        logger.info(f"找到 {len(audio_files)} 个音频/视频文件")
+        
+        results = processor.process_batch(audio_files, force_redo=args.force_redo)
+        
+        # 保存批量处理摘要到temp目录
+        summary_path = os.path.join("./temp", "batch_summary.json")
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'processed_files': list(results.keys()),
+                'success_count': sum(1 for r in results.values() if r.get('success')),
+                'failure_count': sum(1 for r in results.values() if not r.get('success')),
+                'details': results
+            }, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"批量处理完成！摘要已保存到: {summary_path}")
+        
+    else:
+            # 处理单个文件
+            if args.vad_only:
+                # 仅VAD分析，结果保存到temp目录
+                vad_results = processor.vad.analyze_audio(
+                    input_path,
+                    os.path.join("./temp", f"{Path(input_path).stem}_vad.json")
+                )
+                logger.info(f"VAD分析完成: {input_path}")
+                logger.info(f"检测到 {vad_results.get('segment_count', 0)} 个语音段")
+                logger.info(f"语音比例: {vad_results.get('speech_ratio', 0):.1%}")
+                logger.info(f"特殊声音统计: {vad_results.get('special_sounds', {})}")
+            else:
+                # 完整转录
+                result = processor.transcribe_with_vad(
+                    input_path, 
+                    force_redo=args.force_redo
+                )
+                
+                if result.get('success'):
+                    logger.info(f"转录成功: {input_path}")
+                    logger.info(f"输出文件: {result.get('output_paths', {})}")
+                else:
+                    logger.error(f"转录失败: {result.get('error', 'Unknown error')}")
 
 if __name__ == "__main__":
     main()
