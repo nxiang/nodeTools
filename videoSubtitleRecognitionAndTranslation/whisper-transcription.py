@@ -641,8 +641,8 @@ def main():
                        help="Whisper模型大小 (默认: base)")
     parser.add_argument("--language", "-l", default="ja", 
                        help="音频语言代码 (默认: ja - 日语)")
-    parser.add_argument("--segment-duration", "-s", type=int, default=60,
-                       help="音频分段时长（秒），默认60秒（1分钟）")
+    parser.add_argument("--segment-duration", "-s", type=int, default=180,
+                       help="音频分段时长（秒），默认180秒（3分钟）")
     parser.add_argument("--venv-path", help="虚拟环境路径（可选，默认自动检测）")
     parser.add_argument("--cleanup", action="store_true",
                        help="在程序开始前清理临时文件（默认不清理）")
