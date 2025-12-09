@@ -66,6 +66,7 @@ class VADConfig:
     sample_rate: int = 16000
     frame_duration: int = 30  # 毫秒
     threshold: float = 0.4  # 更低的阈值以适应成人内容
+    model_name: str = "default"  # 模型名称，用于临时文件隔离
     
     # 成人视频特定参数
     min_speech_duration: float = 0.2  # 更短的最小持续时间
@@ -638,10 +639,30 @@ class JapaneseAdultVAD:
         except Exception as e:
             logger.error(f"VAD分析失败: {e}")
             raise
-    
-    def _analyze_audio_streaming(self, audio_path: str, chunk_duration: float = 10.0) -> List[Tuple[float, float, Dict]]:
-        """流式分析音频/视频文件"""
+
+    def _analyze_audio_streaming(self, audio_path: str, chunk_duration: float = 30.0, 
+                               checkpoint_file: Optional[str] = None) -> List[Tuple[float, float, Dict]]:
+        """流式分析音频/视频文件（支持断点续传）"""
         logger.info(f"开始流式VAD分析: {audio_path}, 块时长: {chunk_duration}s")
+        
+        # 创建临时目录结构：temp/视频名_模型名/ 用于检查点文件，temp/ 用于srt文件
+        audio_name = Path(audio_path).stem
+        model_name = self.config.model_name if hasattr(self.config, 'model_name') else 'default'
+        
+        # 主临时目录
+        temp_dir = os.path.join(os.path.dirname(audio_path), "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # 隔离目录：按视频名+模型名创建子目录
+        isolation_dir = os.path.join(temp_dir, f"{audio_name}_{model_name}")
+        os.makedirs(isolation_dir, exist_ok=True)
+        
+        # 如果没有指定检查点文件，使用隔离目录中的默认路径
+        if checkpoint_file is None:
+            checkpoint_file = os.path.join(isolation_dir, f"{audio_name}_vad_checkpoint.json")
+        
+        # 尝试加载检查点
+        checkpoint_data = self._load_vad_checkpoint(checkpoint_file)
         
         try:
             # 首先加载整个音频以获取信息（兼容视频文件）
@@ -655,16 +676,28 @@ class JapaneseAdultVAD:
             chunk_size = int(chunk_duration * sample_rate)
             logger.info(f"块大小: {chunk_size} 样本, 约 {chunk_duration}s")
             
-            # 初始化状态
-            all_segments = []
-            current_segment = None
-            current_time_offset = 0.0
-            chunk_count = 0
-            total_segments_detected = 0
+            # 初始化状态（从检查点恢复或新建）
+            if checkpoint_data:
+                logger.info(f"从检查点恢复: {checkpoint_file}")
+                all_segments = checkpoint_data.get('all_segments', [])
+                current_segment = checkpoint_data.get('current_segment')
+                current_time_offset = checkpoint_data.get('current_time_offset', 0.0)
+                chunk_count = checkpoint_data.get('chunk_count', 0)
+                total_segments_detected = checkpoint_data.get('total_segments_detected', 0)
+                current_sample = checkpoint_data.get('current_sample', 0)
+                
+                logger.info(f"恢复状态: 已处理 {chunk_count} 个块, 时间偏移 {current_time_offset:.1f}s, 已检测 {total_segments_detected} 个语音段")
+            else:
+                logger.info("未找到检查点，从头开始处理")
+                all_segments = []
+                current_segment = None
+                current_time_offset = 0.0
+                chunk_count = 0
+                total_segments_detected = 0
+                current_sample = 0
             
             # 手动分块处理（替代soundfile的流式读取）
             total_samples = len(full_audio)
-            current_sample = 0
             
             while current_sample < total_samples:
                 chunk_count += 1
@@ -728,10 +761,24 @@ class JapaneseAdultVAD:
                 current_time_offset += chunk_duration_actual
                 current_sample += len(audio_chunk)
                 
+                # 保存检查点
+                self._save_vad_checkpoint(checkpoint_file, {
+                    'all_segments': all_segments,
+                    'current_segment': current_segment,
+                    'current_time_offset': current_time_offset,
+                    'chunk_count': chunk_count,
+                    'total_segments_detected': total_segments_detected,
+                    'current_sample': current_sample,
+                    'total_duration': total_duration,
+                    'sample_rate': sample_rate,
+                    'last_saved': datetime.now().isoformat()
+                })
+                logger.info(f"检查点已保存: {checkpoint_file}")
+                
                 # 进度日志
                 progress = min(current_time_offset / total_duration, 1.0)
-                if int(progress * 100) % 5 == 0:  # 每5%记录一次进度
-                    logger.info(f"流式分析进度: {progress:.1%} ({current_time_offset:.1f}s/{total_duration:.1f}s), 已检测 {len(all_segments)} 个语音段")
+                
+                logger.info(f"流式分析进度: {progress:.1%} ({current_time_offset:.1f}s/{total_duration:.1f}s), 已检测 {len(all_segments)} 个语音段")
             
             # 处理最后一个未完成的段
             if current_segment is not None:
@@ -752,11 +799,31 @@ class JapaneseAdultVAD:
             logger.info("开始后处理: 应用时间填充")
             all_segments = self._apply_padding(all_segments, total_duration)
             
+            # 处理完成后删除检查点文件
+            if os.path.exists(checkpoint_file):
+                os.remove(checkpoint_file)
+                logger.info(f"处理完成，删除检查点文件: {checkpoint_file}")
+            
             logger.info(f"流式VAD分析完成: 处理了 {total_duration:.1f}s 音频, 检测到 {len(all_segments)} 个语音段")
             return all_segments
             
         except Exception as e:
             logger.error(f"流式分析失败: {e}")
+            # 保存错误检查点以便恢复
+            if checkpoint_file:
+                self._save_vad_checkpoint(checkpoint_file, {
+                    'all_segments': all_segments,
+                    'current_segment': current_segment,
+                    'current_time_offset': current_time_offset,
+                    'chunk_count': chunk_count,
+                    'total_segments_detected': total_segments_detected,
+                    'current_sample': current_sample,
+'total_duration': total_duration,
+                    'sample_rate': sample_rate,
+                    'error': str(e),
+                    'last_saved': datetime.now().isoformat()
+                })
+                logger.error(f"错误检查点已保存: {checkpoint_file}")
             raise
     
     def _process_audio_chunk(self, audio_chunk: np.ndarray, sample_rate: int, 
@@ -798,6 +865,93 @@ class JapaneseAdultVAD:
             merged['frame_count'] = info1.get('frame_count', 0) + info2.get('frame_count', 0)
         
         return merged
+    
+    def _load_vad_checkpoint(self, checkpoint_file: str) -> Optional[Dict]:
+        """加载VAD检查点文件"""
+        if not os.path.exists(checkpoint_file):
+            return None
+        
+        try:
+            with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                checkpoint_data = json.load(f)
+            
+            # 验证检查点数据的完整性
+            required_fields = ['all_segments', 'current_time_offset', 'chunk_count', 'current_sample']
+            if all(field in checkpoint_data for field in required_fields):
+                logger.info(f"成功加载检查点: {checkpoint_file}")
+                return checkpoint_data
+            else:
+                logger.warning(f"检查点文件不完整: {checkpoint_file}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"加载检查点失败: {e}")
+            return None
+    
+    def _save_vad_checkpoint(self, checkpoint_file: str, checkpoint_data: Dict) -> bool:
+        """保存VAD检查点文件"""
+        try:
+            # 确保临时目录存在
+            temp_dir = os.path.dirname(checkpoint_file)
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # 保存检查点数据
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
+            
+            logger.debug(f"检查点保存成功: {checkpoint_file}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"保存检查点失败: {e}")
+            return False
+    
+    def analyze_audio_with_checkpoint(self, audio_path: str, chunk_duration: float = 30.0, 
+                                    checkpoint_file: Optional[str] = None) -> List[Tuple[float, float, Dict]]:
+        """
+        支持断点续传的音频分析
+        
+        Args:
+            audio_path: 音频/视频文件路径
+            chunk_duration: 每个处理块的时间长度（秒）
+            checkpoint_file: 检查点文件路径，如果为None则自动生成
+            
+        Returns:
+            语音段列表，每个段包含开始时间、结束时间和元数据
+        """
+        return self._analyze_audio_streaming(audio_path, chunk_duration, checkpoint_file)
+    
+    def resume_from_checkpoint(self, audio_path: str, checkpoint_file: str) -> List[Tuple[float, float, Dict]]:
+        """
+        从检查点恢复分析
+        
+        Args:
+            audio_path: 音频/视频文件路径
+            checkpoint_file: 检查点文件路径
+            
+        Returns:
+            语音段列表
+        """
+        logger.info(f"从检查点恢复分析: {checkpoint_file}")
+        
+        # 验证检查点文件是否存在
+        if not os.path.exists(checkpoint_file):
+            raise FileNotFoundError(f"检查点文件不存在: {checkpoint_file}")
+        
+        # 使用检查点文件进行分析
+        return self.analyze_audio_with_checkpoint(audio_path, checkpoint_file=checkpoint_file)
+    
+    def cleanup_checkpoint(self, checkpoint_file: str) -> bool:
+        """清理检查点文件"""
+        try:
+            if os.path.exists(checkpoint_file):
+                os.remove(checkpoint_file)
+                logger.info(f"检查点文件已清理: {checkpoint_file}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"清理检查点失败: {e}")
+            return False
 
 class TranscriptionWithVAD:
     """集成VAD的Whisper转录系统（支持断点续传）"""
@@ -821,19 +975,26 @@ class TranscriptionWithVAD:
             self.model = None
             logger.warning("Whisper未安装，转录功能不可用")
         
-        # 创建输出目录和临时目录
+        # 创建输出目录和临时目录（不创建checkpoints目录）
         os.makedirs(self.trans_config.output_dir, exist_ok=True)
         os.makedirs(self.trans_config.temp_dir, exist_ok=True)
-        os.makedirs(self.trans_config.checkpoint_dir, exist_ok=True)
+        # 注释掉checkpoint目录创建：os.makedirs(self.trans_config.checkpoint_dir, exist_ok=True)
         
         # 断点状态
         self.checkpoint_state = {}
     
     def get_checkpoint_path(self, audio_path: str) -> str:
-        """获取检查点文件路径"""
+        """获取检查点文件路径（不创建checkpoints目录）"""
         audio_name = Path(audio_path).stem
+        model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
+        
+        # 创建隔离目录：temp/视频名_模型名（不创建checkpoints子目录）
+        isolation_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
+        os.makedirs(isolation_dir, exist_ok=True)
+        
+        # 检查点文件直接放在隔离目录中，不创建checkpoints子目录
         checkpoint_name = f"{audio_name}_checkpoint.json"
-        return os.path.join(self.trans_config.checkpoint_dir, checkpoint_name)
+        return os.path.join(isolation_dir, checkpoint_name)
     
     def load_checkpoint(self, audio_path: str) -> Optional[Dict]:
         """加载检查点"""
@@ -872,7 +1033,11 @@ class TranscriptionWithVAD:
         """提取音频段到临时文件"""
         try:
             if temp_dir is None:
-                temp_dir = self.trans_config.temp_dir
+                # 按视频名+模型名创建隔离目录
+                audio_name = Path(audio_path).stem
+                model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
+                temp_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
+            
             os.makedirs(temp_dir, exist_ok=True)
             
             # 加载完整音频
@@ -994,10 +1159,17 @@ class TranscriptionWithVAD:
                 vad_results = checkpoint['vad_results']
                 logger.info("使用检查点中的VAD结果")
             else:
-                # 执行VAD分析
+                # 执行VAD分析，按视频名+模型名隔离保存VAD结果
+                audio_name = Path(audio_path).stem
+                model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
+                
+                # 创建隔离目录：temp/视频名_模型名/
+                isolation_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
+                os.makedirs(isolation_dir, exist_ok=True)
+                
                 vad_json_path = os.path.join(
-                    self.trans_config.output_dir,
-                    f"{Path(audio_path).stem}_vad.json"
+                    isolation_dir,
+                    f"{audio_name}_vad.json"
                 )
                 vad_results = self.vad.analyze_audio(audio_path, vad_json_path)
         
@@ -1177,34 +1349,88 @@ class TranscriptionWithVAD:
     def _save_output_files(self, audio_path: str, result: Dict) -> Dict[str, str]:
         """保存输出文件"""
         audio_name = Path(audio_path).stem
+        model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
         
-        # 所有输出文件都放在temp目录下
-        base_path = os.path.join(self.trans_config.temp_dir, audio_name)
+        # 创建隔离目录：temp/视频名_模型名
+        isolation_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
+        os.makedirs(isolation_dir, exist_ok=True)
+        
+        # 转录文本文件放在隔离目录下，命名为"transcription.txt"（与video-translation.py期望一致）
+        transcription_path = os.path.join(isolation_dir, "transcription.txt")
+        
+        # 其他临时文件放在隔离目录下
+        isolation_base_path = os.path.join(isolation_dir, audio_name)
         
         output_paths = {}
         
         if WHISPER_AVAILABLE:
-            # 使用Whisper的writer保存各种格式，但输出到temp目录
+            # 使用Whisper的writer保存各种格式
             for format_type in self.trans_config.output_formats:
-                output_path = f"{base_path}.{format_type}"
-                
-                try:
-                    writer = get_writer(format_type, self.trans_config.temp_dir)
-                    writer(result, audio_path)
+                if format_type == 'srt':
+                    # 对于SRT格式，我们生成转录文本文件而不是SRT文件
+                    output_path = transcription_path
+                    writer_dir = isolation_dir
                     
-                    output_paths[format_type] = output_path
-                    logger.info(f"保存 {format_type.upper()} 格式: {output_path}")
-                except Exception as e:
-                    logger.error(f"保存 {format_type} 格式失败: {e}")
+                    # 生成转录文本内容
+                    transcription_text = self._generate_transcription_text(result)
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.write(transcription_text)
+                    
+                    output_paths['txt'] = output_path
+                    logger.info(f"保存转录文本格式: {output_path}")
+                else:
+                    # 其他格式放在隔离目录下
+                    output_path = f"{isolation_base_path}.{format_type}"
+                    writer_dir = isolation_dir
+                    
+                    try:
+                        writer = get_writer(format_type, writer_dir)
+                        writer(result, audio_path)
+                        
+                        output_paths[format_type] = output_path
+                        logger.info(f"保存 {format_type.upper()} 格式: {output_path}")
+                    except Exception as e:
+                        logger.error(f"保存 {format_type} 格式失败: {e}")
         
-        # 保存JSON结果（包含VAD元数据）
-        json_path = f"{base_path}_full.json"
+        # 保存JSON结果（包含VAD元数据）到隔离目录
+        json_path = f"{isolation_base_path}_full.json"
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         output_paths['json_full'] = json_path
         
         return output_paths
     
+    def _generate_transcription_text(self, result: Dict) -> str:
+        """生成转录文本内容"""
+        text = ""
+        segments = result.get('segments', [])
+        
+        for i, segment in enumerate(segments, 1):
+            start_time = segment.get('start', 0)
+            end_time = segment.get('end', 0)
+            segment_text = segment.get('text', '').strip()
+            
+            # 格式化时间戳
+            start_str = self._format_timestamp(start_time)
+            end_str = self._format_timestamp(end_time)
+            
+            text += f"[{start_str} - {end_str}] {segment_text}\n"
+        
+        return text
+    
+    def _format_timestamp(self, seconds: float) -> str:
+        """格式化时间戳，参照JUQ-587-C.srt文件的正确格式"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        
+        # 将秒数拆分为整数秒和小数秒（毫秒）
+        int_seconds = int(secs)
+        milliseconds = int((secs - int_seconds) * 1000)
+        
+        # 使用逗号分隔毫秒，符合SRT标准格式
+        return f"{hours:02d}:{minutes:02d}:{int_seconds:02d},{milliseconds:03d}"
+
     def process_batch(self, audio_files: List[str], 
                      force_redo: bool = False) -> Dict[str, Any]:
         """批量处理音频文件"""
@@ -1259,7 +1485,8 @@ def main():
         padding=0.3,
         max_segment_duration=180.0,
         japanese_phoneme_threshold=0.25,
-        vowel_detection=True
+        vowel_detection=True,
+        model_name=args.model  # 使用实际的Whisper模型名称
     )
     
     # 配置转录 - 所有目录都放在temp下

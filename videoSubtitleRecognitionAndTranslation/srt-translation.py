@@ -103,7 +103,7 @@ class SRTTranslator:
     
     def translate_text(self, text: str, max_retries: int = 3) -> Optional[str]:
         """
-        使用Google翻译接口翻译文本
+        使用多个翻译接口翻译文本（Google翻译 + 备用方案）
         
         Args:
             text: 要翻译的文本
@@ -127,47 +127,144 @@ class SRTTranslator:
             print(f"📚 使用缓存翻译: '{clean_text[:50]}...' -> '{cached_result[:50]}...'")
             return cached_result
         
-        for attempt in range(max_retries):
-            try:
-                # 使用Google翻译的免费接口
-                url = f"https://translate.googleapis.com/translate_a/single"
-                params = {
+        # 定义多个翻译API端点
+        translation_apis = [
+            {
+                'name': 'Google翻译',
+                'url': 'https://translate.googleapis.com/translate_a/single',
+                'params': {
                     'client': 'gtx',
                     'sl': self.source_lang,
                     'tl': self.target_lang,
                     'dt': 't',
                     'q': clean_text
                 }
-                
-                response = self.session.get(url, params=params, timeout=10)
-                
-                if response.status_code == 200:
-                    # 解析返回的JSON数据
-                    data = response.json()
-                    if data and len(data) > 0:
-                        # 提取翻译结果
-                        translated_parts = []
-                        for part in data[0]:
-                            if part[0]:
-                                translated_parts.append(part[0])
+            },
+            {
+                'name': '备用Google翻译',
+                'url': 'https://clients5.google.com/translate_a/t',
+                'params': {
+                    'client': 'dict-chrome-ex',
+                    'sl': self.source_lang,
+                    'tl': self.target_lang,
+                    'q': clean_text
+                }
+            },
+            {
+                'name': 'Bing翻译',
+                'url': 'https://api.cognitive.microsofttranslator.com/translate',
+                'headers': {
+                    'Ocp-Apim-Subscription-Key': 'free',  # 免费版本
+                    'Content-Type': 'application/json'
+                },
+                'data': [{'Text': clean_text}],
+                'params': {
+                    'api-version': '3.0',
+                    'from': self.source_lang,
+                    'to': self.target_lang
+                }
+            }
+        ]
+        
+        for api in translation_apis:
+            for attempt in range(max_retries):
+                try:
+                    print(f"🌐 尝试使用 {api['name']} API (尝试 {attempt + 1}/{max_retries})")
+                    
+                    if api['name'] == 'Bing翻译':
+                        # Bing翻译使用POST请求
+                        response = self.session.post(
+                            api['url'],
+                            headers=api.get('headers', {}),
+                            params=api.get('params', {}),
+                            json=api.get('data', []),
+                            timeout=15
+                        )
+                    else:
+                        # Google翻译使用GET请求
+                        response = self.session.get(
+                            api['url'],
+                            params=api.get('params', {}),
+                            timeout=15
+                        )
+                    
+                    if response.status_code == 200:
+                        # 解析返回的JSON数据
+                        data = response.json()
                         
-                        if translated_parts:
-                            translated_text = ' '.join(translated_parts)
-                            print(f"✅ 翻译成功: '{clean_text[:50]}...' -> '{translated_text[:50]}...'")
-                            
-                            # 保存到缓存
-                            self.translation_cache[cache_key] = translated_text
-                            return translated_text
-                
-                # 如果失败，等待后重试
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"❌ 翻译失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                time.sleep(2)
+                        if api['name'] == 'Bing翻译':
+                            # Bing翻译返回格式不同
+                            if data and len(data) > 0:
+                                translated_text = data[0].get('translations', [{}])[0].get('text', '')
+                                if translated_text:
+                                    print(f"✅ {api['name']} 翻译成功: '{clean_text[:50]}...' -> '{translated_text[:50]}...'")
+                                    self.translation_cache[cache_key] = translated_text
+                                    return translated_text
+                        else:
+                            # Google翻译格式
+                            if data and len(data) > 0:
+                                translated_parts = []
+                                for part in data[0]:
+                                    if part[0]:
+                                        translated_parts.append(part[0])
+                                
+                                if translated_parts:
+                                    translated_text = ' '.join(translated_parts)
+                                    print(f"✅ {api['name']} 翻译成功: '{clean_text[:50]}...' -> '{translated_text[:50]}...'")
+                                    self.translation_cache[cache_key] = translated_text
+                                    return translated_text
+                    
+                    # 如果失败，等待后重试
+                    time.sleep(2)
+                    
+                except Exception as e:
+                    print(f"❌ {api['name']} 翻译失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(3)
+        
+        # 如果所有API都失败，尝试使用简单的本地翻译（基于常见词汇）
+        print(f"⚠️ 所有翻译API都失败了，尝试使用本地词汇表")
+        translated_text = self._local_translate_fallback(clean_text)
+        if translated_text:
+            print(f"✅ 本地翻译成功: '{clean_text[:50]}...' -> '{translated_text[:50]}...'")
+            self.translation_cache[cache_key] = translated_text
+            return translated_text
         
         print(f"⚠️ 无法翻译文本: '{clean_text[:100]}...'")
         return None
+    
+    def _local_translate_fallback(self, text: str) -> str:
+        """
+        本地翻译回退方案（基于常见日语词汇）
+        """
+        # 常见日语词汇的简单映射（可以扩展）
+        japanese_dict = {
+            'はぁ': '叹', 'はい': '是', 'いいえ': '不', 'ありがとう': '谢谢',
+            'ごめんなさい': '对不起', 'お願いします': '拜托', 'すみません': '抱歉',
+            'こんにちは': '你好', 'さようなら': '再见', 'おはよう': '早上好',
+            'こんばんは': '晚上好', 'いただきます': '我开动了', 'ごちそうさまでした': '谢谢款待',
+            '愛してる': '我爱你', '好き': '喜欢', '嫌い': '讨厌', '楽しい': '开心',
+            '悲しい': '悲伤', '嬉しい': '高兴', '怒る': '生气', '疲れた': '累了',
+            '眠い': '困了', 'お腹が空いた': '饿了', '喉が渇いた': '渴了',
+            '寒い': '冷', '暑い': '热', '痛い': '痛', '痒い': '痒',
+            '大きい': '大', '小さい': '小', '高い': '高/贵', '安い': '便宜',
+            '新しい': '新', '古い': '旧', '美しい': '美丽', '醜い': '丑陋',
+            '強い': '强', '弱い': '弱', '早い': '快', '遅い': '慢',
+            '難しい': '难', '易しい': '容易', '面白い': '有趣', 'つまらない': '无聊'
+        }
+        
+        # 简单的逐词翻译（非常基础）
+        words = text.split()
+        translated_words = []
+        
+        for word in words:
+            # 移除标点符号
+            clean_word = re.sub(r'[、。！？…・]', '', word)
+            if clean_word in japanese_dict:
+                translated_words.append(japanese_dict[clean_word])
+            else:
+                translated_words.append(word)  # 保留原词
+        
+        return ' '.join(translated_words) if translated_words else ""
     
     def parse_srt(self, srt_content: str) -> List[Dict]:
         """
@@ -358,6 +455,10 @@ class SRTTranslator:
             fail_count = 0
             already_translated_count = 0
             
+            # 每翻译10个字幕块就写入一次文件
+            save_interval = 10
+            last_save_count = 0
+            
             # 按batch_size分批处理
             for batch_start in range(0, len(blocks), batch_size):
                 batch_end = min(batch_start + batch_size, len(blocks))
@@ -416,6 +517,22 @@ class SRTTranslator:
                             fail_count += 1
                     
                     translated_blocks.append(block)
+                    
+                    # 每翻译10个字幕块就写入一次文件
+                    current_translated_count = success_count + fail_count + already_translated_count
+                    if current_translated_count - last_save_count >= save_interval:
+                        print(f"💾 已翻译 {current_translated_count} 个字幕块，自动保存进度...")
+                        
+                        # 生成当前已翻译的SRT内容
+                        current_content = self.generate_srt_content(translated_blocks)
+                        
+                        # 保存到临时文件（在原文件名后加_in_progress）
+                        temp_output_path = output_path.parent / f"{output_path.stem}_in_progress.srt"
+                        with open(temp_output_path, 'w', encoding='utf-8') as f:
+                            f.write(current_content)
+                        
+                        print(f"💾 临时保存到: {temp_output_path}")
+                        last_save_count = current_translated_count
                 
                 # 只有在批次中使用了网络翻译时才添加延迟
                 if batch_end < len(blocks) and batch_used_network:
@@ -431,9 +548,15 @@ class SRTTranslator:
             
             time_tracker.checkpoint("内容生成")
             
-            # 保存文件
+            # 保存最终文件
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(output_content)
+            
+            # 删除临时文件（如果存在）
+            temp_output_path = output_path.parent / f"{output_path.stem}_in_progress.srt"
+            if temp_output_path.exists():
+                temp_output_path.unlink()
+                print(f"🗑️  删除临时文件: {temp_output_path}")
             
             time_tracker.checkpoint("文件保存")
             

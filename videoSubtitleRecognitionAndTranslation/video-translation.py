@@ -448,11 +448,9 @@ class VideoTranslator:
                         
                         # 将时间格式转换为SRT格式（HH:MM:SS,mmm）
                         def convert_time_format(time_str):
-                            # 格式: HH:MM:SS -> HH:MM:SS,000
-                            parts = time_str.split(':')
-                            if len(parts) == 3:
-                                return f"{parts[0]}:{parts[1]}:{parts[2]},000"
-                            return time_str
+                            # transcription.txt文件中的时间戳已经是正确格式：00:00:02,719
+                            # 直接返回原始时间戳，不需要额外转换
+                            return time_str.strip()
                         
                         srt_start = convert_time_format(start_time.strip())
                         srt_end = convert_time_format(end_time.strip())
