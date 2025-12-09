@@ -218,15 +218,12 @@ class VideoTranslator:
             
             # 构建命令行参数 - 根据use_vad选择不同的脚本和参数
             if self.use_vad:
-                # whisper-transcription.vad.py 的参数
+                # whisper-transcription.vad.py 的参数（只支持基本参数）
                 cmd = [
                     sys.executable, 'whisper-transcription.vad.py',
                     video_path,
                     '--model', self.whisper_model,
-                    '--language', self.source_lang,
-                    '--segment-duration', str(max_chunk_duration),
-                    '--batch-size', '4',  # VAD版本建议使用较小的批处理大小
-                    '--compute-type', 'int8'  # CPU优化
+                    '--language', self.source_lang
                 ]
             else:
                 # whisper-transcription.py 的参数

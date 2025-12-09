@@ -11,6 +11,11 @@ import numpy as np
 import wave
 import contextlib
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 # 虚拟环境管理类
 class VirtualEnvironmentManager:
     """管理虚拟环境的激活和退出"""
@@ -148,15 +153,19 @@ def get_audio_duration(audio_path):
 class SegmentTranscriber:
     """处理音频分段的转录"""
     
-    def __init__(self, temp_base, model, language):
+    def __init__(self, temp_base, model, language, model_size="base"):
         self.temp_base = temp_base
-        self.model = model
+        self.model = model  # 现在model可能为None，将在需要时懒加载
         self.language = language
+        self.model_size = model_size  # 存储模型大小参数
         self.segments_dir = temp_base / "segments"
         self.segments_dir.mkdir(exist_ok=True)
         
         # 延迟导入的whisper模块
         self.whisper_module = None
+        
+        # 懒加载状态
+        self.model_loaded = model is not None
     
     def split_audio(self, audio_file, segment_duration=600):
         """将音频分割成多个片段（默认10分钟一个片段）"""
@@ -182,9 +191,13 @@ class SegmentTranscriber:
         segment_files = sorted(list(self.segments_dir.glob("segment_*.wav")))
         return segment_files
     
-    def transcribe_segment(self, segment_file, segment_index, start_time=0):
-        """转录单个音频片段"""
-        print(f"转录片段 {segment_index}: {segment_file.name}")
+    def _lazy_load_whisper_model(self):
+        """懒加载Whisper模型"""
+        if self.model is not None:
+            return True
+        
+        print("懒加载Whisper模型...")
+        model_start = time.time()
         
         try:
             # 延迟导入whisper模块
@@ -192,7 +205,37 @@ class SegmentTranscriber:
                 self.whisper_module = import_whisper()
                 if self.whisper_module is None:
                     print("错误: 无法导入whisper模块")
-                    return []
+                    return False
+            
+            # 使用正确的模型大小进行加载
+            self.model = self.whisper_module.load_model(self.model_size)
+            
+            # 记录内存使用情况
+            if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                memory_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+                print(f"GPU内存使用: 已分配 {memory_allocated:.2f}GB, 已保留 {memory_reserved:.2f}GB")
+            
+            model_time = time.time() - model_start
+            print(f"模型加载完成，耗时: {format_timedelta(model_time)}")
+            self.model_loaded = True
+            return True
+            
+        except Exception as e:
+            print(f"模型加载失败: {e}")
+            self.model = None
+            self.model_loaded = False
+            return False
+
+    def transcribe_segment(self, segment_file, segment_index, start_time=0):
+        """转录单个音频片段"""
+        print(f"转录片段 {segment_index}: {segment_file.name}")
+        
+        try:
+            # 懒加载Whisper模型
+            if not self._lazy_load_whisper_model():
+                print("错误: Whisper模型加载失败")
+                return []
             
             # 加载音频
             audio = self.whisper_module.load_audio(str(segment_file))
@@ -389,15 +432,17 @@ class WhisperTranscriber:
             self.segment_transcriber = SegmentTranscriber(
                 self.temp_base, 
                 self.model, 
-                self.language
+                self.language,
+                self.model_size  # 传递模型大小参数
             )
             return True
         
-        # 创建分段器并分割音频
+        # 创建分段器并分割音频（模型将在需要时懒加载）
         self.segment_transcriber = SegmentTranscriber(
             self.temp_base, 
-            self.model, 
-            self.language
+            None,  # 模型将在需要时懒加载
+            self.language,
+            self.model_size  # 传递模型大小参数
         )
         
         segment_files = self.segment_transcriber.split_audio(self.audio_file, self.segment_duration)
@@ -527,6 +572,39 @@ class WhisperTranscriber:
         except Exception as e:
             print(f"清理临时文件时出错: {e}")
     
+    def _lazy_load_whisper_model(self):
+        """懒加载Whisper模型"""
+        if self.model is not None:
+            return True
+        
+        print("懒加载Whisper模型...")
+        model_start = time.time()
+        
+        try:
+            # 延迟导入whisper模块
+            if self.whisper_module is None:
+                self.whisper_module = import_whisper()
+                if self.whisper_module is None:
+                    print("错误: 无法导入whisper模块")
+                    return False
+            
+            self.model = self.whisper_module.load_model(self.model_size)
+            
+            # 记录内存使用情况
+            if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                memory_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+                print(f"GPU内存使用: 已分配 {memory_allocated:.2f}GB, 已保留 {memory_reserved:.2f}GB")
+            
+            model_time = time.time() - model_start
+            print(f"模型加载完成，耗时: {format_timedelta(model_time)}")
+            return True
+            
+        except Exception as e:
+            print(f"模型加载失败: {e}")
+            self.model = None
+            return False
+
     def transcribe(self):
         """执行转录过程"""
         print(f"开始转录视频: {self.video_path.name}")
@@ -550,24 +628,8 @@ class WhisperTranscriber:
             if not self._extract_audio():
                 return False
             
-            # 阶段2: 加载Whisper模型
-            print("加载Whisper模型...")
-            model_start = time.time()
-            
-            try:
-                # 延迟导入whisper模块
-                if self.whisper_module is None:
-                    self.whisper_module = import_whisper()
-                    if self.whisper_module is None:
-                        print("错误: 无法导入whisper模块")
-                        return False
-                
-                self.model = self.whisper_module.load_model(self.model_size)
-                self.timestamps["model_loading_time"] = time.time() - model_start
-                print(f"模型加载完成，耗时: {format_timedelta(self.timestamps['model_loading_time'])}")
-            except Exception as e:
-                print(f"模型加载失败: {e}")
-                return False
+            # 阶段2: 懒加载Whisper模型（仅在需要时加载）
+            # 模型加载将在实际转录时进行
             
             # 阶段3: 准备音频片段
             if not self._prepare_segments():

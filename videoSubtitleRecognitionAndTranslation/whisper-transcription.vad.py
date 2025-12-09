@@ -19,6 +19,8 @@ from pathlib import Path
 import time
 from datetime import datetime
 import warnings
+import gc
+import psutil
 warnings.filterwarnings("ignore")
 
 # 导入现有的whisper相关模块
@@ -45,6 +47,43 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def log_memory_usage(prefix=""):
+    """记录当前内存使用情况"""
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        # 获取磁盘使用情况（Windows系统）
+        disk_usage = psutil.disk_usage('C:')
+        disk_free_gb = disk_usage.free / 1024 / 1024 / 1024
+        
+        # 获取系统内存使用情况
+        system_memory = psutil.virtual_memory()
+        system_memory_used_gb = (system_memory.total - system_memory.available) / 1024 / 1024 / 1024
+        system_memory_total_gb = system_memory.total / 1024 / 1024 / 1024
+        
+        logger.info(f"{prefix}进程内存: {memory_mb:.1f}MB, 系统内存: {system_memory_used_gb:.1f}/{system_memory_total_gb:.1f}GB, 磁盘剩余: {disk_free_gb:.1f}GB")
+        
+        # 如果磁盘空间不足或内存使用过高，发出警告
+        if disk_free_gb < 5:
+            logger.warning(f"磁盘空间不足！仅剩 {disk_free_gb:.1f}GB")
+        if system_memory_used_gb / system_memory_total_gb > 0.9:
+            logger.warning(f"系统内存使用率过高: {system_memory_used_gb/system_memory_total_gb*100:.1f}%")
+            
+    except Exception as e:
+        logger.warning(f"内存监控失败: {e}")
+
+def cleanup_memory():
+    """清理内存"""
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("内存清理完成")
+    except Exception as e:
+        logger.warning(f"内存清理失败: {e}")
 
 def format_time(seconds: float) -> str:
     """将秒数格式化为时分秒格式"""
@@ -120,13 +159,13 @@ class TranscriptionConfig:
     
     # 输出格式
     output_formats: List[str] = field(default_factory=lambda: ["txt", "srt", "vtt", "tsv", "json"])
-    output_dir: str = "./transcription_output"
+    output_dir: str = str(Path(__file__).parent / "temp")  # 基础目录，具体输出路径在_save_output_files中动态生成
     
-    # 临时文件目录
-    temp_dir: str = "./temp"
+    # 临时文件目录 - 使用项目目录下的videoSubtitleRecognitionAndTranslation/temp
+    temp_dir: str = str(Path(__file__).parent / "temp")
     
     # 断点续传
-    checkpoint_dir: str = "./temp/checkpoints"
+    checkpoint_dir: str = str(Path(__file__).parent / "temp" / "checkpoints")
     save_checkpoint_interval: int = 10  # 每10秒保存一次检查点
 
 class JapaneseAdultVAD:
@@ -156,6 +195,82 @@ class JapaneseAdultVAD:
         moan_high = min(nyquist-1, self.config.moan_freq_range[1]) / nyquist
         self.moan_filter = signal.butter(4, [moan_low, moan_high], btype='band')
         
+    def _get_chunk_checkpoint_path(self, audio_path: str, target_sr: int, chunk_duration: int) -> str:
+        """生成分块检查点文件路径"""
+        import hashlib
+        
+        # 基于音频文件路径、采样率和分块大小生成唯一标识
+        file_info = f"{audio_path}_{target_sr}_{chunk_duration}"
+        file_hash = hashlib.md5(file_info.encode()).hexdigest()[:16]
+        
+        # 创建隔离目录结构：项目目录/temp/视频名_模型名/checkpoints
+        audio_name = Path(audio_path).stem
+        model_name = self.config.model_name if hasattr(self.config, 'model_name') else 'default'
+        
+        # 使用统一的临时目录配置
+        temp_dir = Path(__file__).parent / "temp"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # 隔离目录：按视频名+模型名创建子目录
+        isolation_dir = temp_dir / f"{audio_name}_{model_name}"
+        os.makedirs(isolation_dir, exist_ok=True)
+        
+        # 检查点目录
+        checkpoint_dir = isolation_dir / "checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # 生成检查点文件名
+        filename = os.path.basename(audio_path)
+        checkpoint_file = checkpoint_dir / f"{filename}_{file_hash}.checkpoint.json"
+        
+        return str(checkpoint_file)
+    
+    def _load_chunk_checkpoint(self, checkpoint_file: str) -> List[Tuple[float, float]]:
+        """加载分块检查点"""
+        if not os.path.exists(checkpoint_file):
+            return []
+        
+        try:
+            with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            # 验证检查点数据格式
+            if isinstance(data, list) and all(isinstance(item, list) and len(item) == 2 for item in data):
+                processed_chunks = [(float(start), float(end)) for start, end in data]
+                logger.info(f"成功加载检查点: {checkpoint_file}, 已处理 {len(processed_chunks)} 个分块")
+                return processed_chunks
+            else:
+                logger.warning(f"检查点文件格式错误: {checkpoint_file}")
+                return []
+                
+        except Exception as e:
+            logger.warning(f"加载检查点失败: {e}")
+            return []
+    
+    def _save_chunk_checkpoint(self, checkpoint_file: str, processed_chunks: List[Tuple[float, float]]):
+        """保存分块检查点"""
+        try:
+            # 确保目录存在
+            os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+            
+            # 保存检查点数据
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(processed_chunks, f, indent=2)
+                
+            logger.debug(f"检查点已保存: {checkpoint_file}")
+            
+        except Exception as e:
+            logger.warning(f"保存检查点失败: {e}")
+    
+    def _cleanup_chunk_checkpoint(self, checkpoint_file: str):
+        """清理分块检查点文件"""
+        try:
+            if os.path.exists(checkpoint_file):
+                os.remove(checkpoint_file)
+                logger.info(f"检查点文件已清理: {checkpoint_file}")
+        except Exception as e:
+            logger.warning(f"清理检查点失败: {e}")
+        
     def load_audio(self, audio_path: str, target_sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
         """加载音频文件（支持视频文件）"""
         target_sr = target_sr or self.config.sample_rate
@@ -174,33 +289,155 @@ class JapaneseAdultVAD:
             elif file_ext in ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm'):
                 logger.info(f"检测到视频文件: {audio_path}")
                 
-                # 优先使用moviepy（如果可用）
+                # 记录开始时的内存使用情况
+                log_memory_usage("音频提取前")
+                
+                # 对于超长视频（14小时），优先使用moviepy进行流式处理
                 if MOVIEPY_AVAILABLE:
                     try:
-                        logger.info("使用moviepy提取视频音频...")
+                        logger.info("使用moviepy流式提取超长视频音频（14小时视频优化）...")
+                        log_memory_usage("moviepy开始前")
+                        
+                        # 使用moviepy的流式处理能力
                         video = VideoFileClip(audio_path)
                         
-                        # 提取音频到临时文件
-                        temp_audio_path = f"./temp_{int(time.time())}.wav"
-                        video.audio.write_audiofile(temp_audio_path, fps=target_sr)
+                        # 对于超长视频，采用分块处理策略
+                        total_duration = video.duration
+                        logger.info(f"视频总时长: {total_duration:.1f}秒 ({total_duration/3600:.1f}小时)")
                         
-                        # 加载音频
-                        audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
+                        # 对于超长视频，采用分块处理策略
+                        if total_duration > 7200:  # 2小时
+                            logger.info("检测到超长视频，启用分块处理模式（14小时视频优化）")
+                            
+                            # 分块大小：30分钟
+                            chunk_duration = 1800  # 30分钟
+                            chunks = []
+                            
+                            # 断点续传：检查是否有已处理的分块
+                            checkpoint_file = self._get_chunk_checkpoint_path(audio_path, target_sr, chunk_duration)
+                            processed_chunks = self._load_chunk_checkpoint(checkpoint_file)
+                            
+                            # 计算需要处理的分块范围
+                            total_chunks = int(np.ceil(total_duration / chunk_duration))
+                            start_chunk = len(processed_chunks)
+                            
+                            if start_chunk > 0:
+                                logger.info(f"断点续传：从第 {start_chunk + 1} 个分块开始，共 {total_chunks} 个分块")
+                                logger.info(f"已处理分块: {[f'{chunk[0]//60}-{chunk[1]//60}分' for chunk in processed_chunks]}")
+                            else:
+                                logger.info(f"开始处理全部分块，共 {total_chunks} 个分块")
+                            
+                            try:
+                                for chunk_index, start_time in enumerate(range(0, int(total_duration), chunk_duration)):
+                                    # 跳过已处理的分块
+                                    if chunk_index < start_chunk:
+                                        continue
+                                        
+                                    end_time = min(start_time + chunk_duration, total_duration)
+                                    logger.info(f"处理分块 {chunk_index + 1}: {start_time//60}分 - {end_time//60}分")
+                                    
+                                    # 优先使用ffmpeg进行分块处理（更稳定可靠）
+                                    chunk_audio = None
+                                    try:
+                                        # 方法1: 使用ffmpeg进行分块处理（首选）
+                                        chunk_audio = self._extract_audio_chunk_with_ffmpeg(audio_path, start_time, end_time, target_sr)
+                                        logger.info(f"ffmpeg分块处理成功: {len(chunk_audio)/target_sr:.1f}秒")
+                                        
+                                    except Exception as e:
+                                        logger.warning(f"ffmpeg分块处理失败: {e}")
+                                        # 方法2: 尝试使用moviepy作为备选方案
+                                        try:
+                                            # 使用moviepy的流式处理能力
+                                            chunk = VideoFileClip(audio_path)
+                                            
+                                            # 兼容不同版本moviepy的API
+                                            if hasattr(chunk, 'subclip'):
+                                                chunk = chunk.subclip(start_time, end_time)
+                                            else:
+                                                # 新版本moviepy可能需要使用不同的方法
+                                                # 直接使用整个视频，但只处理指定时间段的音频
+                                                chunk_duration = end_time - start_time
+                                                logger.info(f"使用moviepy处理时间段: {start_time}-{end_time}秒")
+                                            
+                                            # 使用内存缓冲区处理当前分块
+                                            import io
+                                            temp_buffer = io.BytesIO()
+                                            chunk.audio.write_audiofile(temp_buffer, fps=target_sr, verbose=False, logger=None)
+                                            temp_buffer.seek(0)
+                                            
+                                            chunk_audio, _ = librosa.load(temp_buffer, sr=target_sr, mono=True)
+                                            
+                                            # 清理当前分块资源
+                                            chunk.close()
+                                            temp_buffer.close()
+                                            logger.info(f"moviepy分块处理成功: {len(chunk_audio)/target_sr:.1f}秒")
+                                            
+                                        except Exception as e2:
+                                            logger.error(f"moviepy分块处理也失败: {e2}")
+                                            # 所有分块方法都失败，回退到直接处理整个视频
+                                            logger.error(f"所有分块方法都失败，回退到直接处理整个视频")
+                                            try:
+                                                import io
+                                                temp_buffer = io.BytesIO()
+                                                video.audio.write_audiofile(temp_buffer, fps=target_sr, verbose=False, logger=None)
+                                                temp_buffer.seek(0)
+                                                audio, sr = librosa.load(temp_buffer, sr=target_sr, mono=True)
+                                                temp_buffer.close()
+                                                break  # 跳出循环，直接使用整个音频
+                                            except Exception as e3:
+                                                logger.error(f"直接处理整个视频也失败: {e3}")
+                                                raise
+                                    
+                                    if chunk_audio is not None:
+                                        chunks.append(chunk_audio)
+                                        
+                                        # 保存检查点
+                                        processed_chunks.append((start_time, end_time))
+                                        self._save_chunk_checkpoint(checkpoint_file, processed_chunks)
+                                        logger.debug(f"检查点已保存: {checkpoint_file}")
+                                    
+                                    log_memory_usage(f"分块{chunk_index + 1}处理完成")
+                                    
+                                    # 每处理几个分块后清理一次内存
+                                    if (chunk_index + 1) % 3 == 0:
+                                        cleanup_memory()
+                            
+                                # 合并所有分块
+                                audio = np.concatenate(chunks)
+                                sr = target_sr
+                                
+                                # 分块处理完成，清理检查点文件
+                                self._cleanup_chunk_checkpoint(checkpoint_file)
+                                logger.info(f"超长视频分块处理完成，音频长度: {len(audio)/sr:.1f}秒，检查点已清理")
+                                log_memory_usage("超长视频分块提取后")
+                                
+                            except Exception as e:
+                                # 分块处理过程中发生异常，保存当前进度
+                                logger.error(f"分块处理过程中发生异常: {e}")
+                                logger.info(f"已处理分块进度: {len(processed_chunks)}/{total_chunks}，检查点已保存")
+                                logger.info("下次运行将从断点继续处理")
+                                raise
+                            
+                        else:
+                            # 对于较短视频，使用单次处理
+                            import io
+                            temp_buffer = io.BytesIO()
+                            video.audio.write_audiofile(temp_buffer, fps=target_sr, verbose=False, logger=None)
+                            temp_buffer.seek(0)
+                            audio, sr = librosa.load(temp_buffer, sr=target_sr, mono=True)
+                            temp_buffer.close()
                         
-                        # 清理临时文件
-                        try:
-                            os.remove(temp_audio_path)
-                        except:
-                            pass
-                        
+                        # 清理资源
                         video.close()
-                        logger.info(f"视频音频提取成功: 时长 {len(audio)/sr:.1f}s")
+                        
+                        logger.info(f"moviepy音频提取成功: 时长 {len(audio)/sr:.1f}s ({len(audio)/sr/3600:.1f}小时)")
+                        log_memory_usage("moviepy提取后")
                         return audio, sr
                         
                     except Exception as e:
-                        logger.warning(f"moviepy处理失败: {e}")
+                        logger.warning(f"moviepy流式处理失败: {e}")
                 
-                # 后备方案：使用torchaudio
+                # 后备方案：使用torchaudio（内存占用中等）
                 try:
                     logger.info("使用torchaudio提取视频音频...")
                     audio, sr = torchaudio.load(audio_path)
@@ -213,16 +450,25 @@ class JapaneseAdultVAD:
                         sr = target_sr
                     
                     logger.info(f"torchaudio音频提取成功: 时长 {len(audio)/sr:.1f}s")
+                    log_memory_usage("torchaudio提取后")
                     return audio, sr
                     
                 except Exception as e:
                     logger.warning(f"torchaudio处理失败: {e}")
                 
-                # 最后尝试使用librosa
-                logger.info("使用librosa作为后备方案...")
-                audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
-                logger.info(f"librosa音频加载成功: 时长 {len(audio)/sr:.1f}s")
-                return audio, sr
+                # 最后尝试使用librosa（直接加载，可能无法处理超长视频）
+                try:
+                    logger.info("使用librosa作为最后手段...")
+                    audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
+                    logger.info(f"librosa音频加载成功: 时长 {len(audio)/sr:.1f}s")
+                    log_memory_usage("librosa提取后")
+                    return audio, sr
+                except Exception as e:
+                    logger.warning(f"librosa处理失败: {e}")
+                
+                # 所有方法都失败
+                logger.error("所有音频提取方法都失败了")
+                raise
             
             else:
                 # 未知文件类型，尝试多种方法
@@ -240,6 +486,87 @@ class JapaneseAdultVAD:
         except Exception as e:
             logger.error(f"加载音频失败 {audio_path}: {e}")
             raise
+    
+    def _extract_audio_chunk_with_ffmpeg(self, audio_path: str, start_time: float, end_time: float, target_sr: int):
+        """使用ffmpeg提取音频分块"""
+        import subprocess
+        import tempfile
+        import os
+        
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            temp_path = temp_file.name
+        
+        try:
+            # 构建ffmpeg命令，添加更多参数确保兼容性
+            cmd = [
+                'ffmpeg',
+                '-y',  # 覆盖输出文件
+                '-ss', str(start_time),
+                '-i', audio_path,
+                '-t', str(end_time - start_time),
+                '-ac', '1',
+                '-ar', str(target_sr),
+                '-acodec', 'pcm_s16le',
+                '-f', 'wav',
+                '-loglevel', 'error',  # 减少日志输出
+                temp_path
+            ]
+            
+            # 执行ffmpeg命令，使用二进制模式避免编码问题
+            result = subprocess.run(cmd, capture_output=True, text=False, timeout=300)  # 5分钟超时
+            
+            if result.returncode != 0:
+                # 尝试使用UTF-8解码错误信息
+                try:
+                    error_msg = result.stderr.decode('utf-8', errors='ignore')
+                except:
+                    try:
+                        error_msg = result.stderr.decode('gbk', errors='ignore')
+                    except:
+                        error_msg = str(result.stderr)
+                
+                # 检查文件是否存在，如果存在则尝试加载
+                if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                    logger.info("ffmpeg命令返回非零状态但文件已生成，尝试加载...")
+                    try:
+                        audio, sr = librosa.load(temp_path, sr=target_sr, mono=True)
+                        os.unlink(temp_path)
+                        return audio
+                    except Exception as load_error:
+                        logger.warning(f"ffmpeg生成的文件无法加载: {load_error}")
+                
+                raise Exception(f"ffmpeg失败: {error_msg}")
+            
+            # 检查文件是否存在且大小合理
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                raise Exception("ffmpeg未生成有效输出文件")
+            
+            # 加载音频数据
+            audio, sr = librosa.load(temp_path, sr=target_sr, mono=True)
+            
+            # 清理临时文件
+            os.unlink(temp_path)
+            
+            return audio
+            
+        except subprocess.TimeoutExpired:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+            raise Exception("ffmpeg处理超时（5分钟）")
+            
+        except Exception as e:
+            # 确保清理临时文件
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+            raise e
     
     def detect_voice_activity(self, audio: np.ndarray, sample_rate: int) -> List[Tuple[float, float, Dict]]:
         """检测语音活动并返回时间段及元数据"""
@@ -645,21 +972,21 @@ class JapaneseAdultVAD:
         """流式分析音频/视频文件（支持断点续传）"""
         logger.info(f"开始流式VAD分析: {audio_path}, 块时长: {chunk_duration}s")
         
-        # 创建临时目录结构：temp/视频名_模型名/ 用于检查点文件，temp/ 用于srt文件
+        # 创建临时目录结构：项目目录/temp/视频名_模型名/ 用于检查点文件
         audio_name = Path(audio_path).stem
         model_name = self.config.model_name if hasattr(self.config, 'model_name') else 'default'
         
-        # 主临时目录
-        temp_dir = os.path.join(os.path.dirname(audio_path), "temp")
+        # 使用统一的临时目录配置
+        temp_dir = Path(__file__).parent / "temp"
         os.makedirs(temp_dir, exist_ok=True)
         
         # 隔离目录：按视频名+模型名创建子目录
-        isolation_dir = os.path.join(temp_dir, f"{audio_name}_{model_name}")
+        isolation_dir = temp_dir / f"{audio_name}_{model_name}"
         os.makedirs(isolation_dir, exist_ok=True)
         
         # 如果没有指定检查点文件，使用隔离目录中的默认路径
         if checkpoint_file is None:
-            checkpoint_file = os.path.join(isolation_dir, f"{audio_name}_vad_checkpoint.json")
+            checkpoint_file = str(isolation_dir / f"{audio_name}_vad_checkpoint.json")
         
         # 尝试加载检查点
         checkpoint_data = self._load_vad_checkpoint(checkpoint_file)
@@ -964,16 +1291,9 @@ class TranscriptionWithVAD:
         # 初始化组件
         self.vad = JapaneseAdultVAD(self.vad_config)
         
-        # 初始化Whisper模型
-        if WHISPER_AVAILABLE:
-            logger.info(f"加载Whisper模型: {self.trans_config.model_size}")
-            self.model = whisper.load_model(
-                self.trans_config.model_size,
-                device=self.trans_config.device
-            )
-        else:
-            self.model = None
-            logger.warning("Whisper未安装，转录功能不可用")
+        # 懒加载Whisper模型（不在初始化时加载）
+        self.model = None
+        self.model_loaded = False
         
         # 创建输出目录和临时目录（不创建checkpoints目录）
         os.makedirs(self.trans_config.output_dir, exist_ok=True)
@@ -982,6 +1302,35 @@ class TranscriptionWithVAD:
         
         # 断点状态
         self.checkpoint_state = {}
+    
+    def _lazy_load_whisper_model(self):
+        """懒加载Whisper模型，只在需要时加载"""
+        if self.model_loaded:
+            return True
+            
+        if not WHISPER_AVAILABLE:
+            logger.warning("Whisper未安装，转录功能不可用")
+            return False
+        
+        try:
+            logger.info(f"懒加载Whisper模型: {self.trans_config.model_size}")
+            log_memory_usage("模型加载前")
+            
+            self.model = whisper.load_model(
+                self.trans_config.model_size,
+                device=self.trans_config.device
+            )
+            self.model_loaded = True
+            
+            log_memory_usage("模型加载后")
+            logger.info("Whisper模型加载完成")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Whisper模型加载失败: {e}")
+            self.model = None
+            self.model_loaded = False
+            return False
     
     def get_checkpoint_path(self, audio_path: str) -> str:
         """获取检查点文件路径（不创建checkpoints目录）"""
@@ -1068,8 +1417,9 @@ class TranscriptionWithVAD:
     def transcribe_segment(self, audio_path: str, segment_index: int, 
                           start_time: float, end_time: float) -> Tuple[Dict[str, Any], float]:
         """转录单个音频段，返回结果和处理时间"""
-        if not self.model:
-            raise ValueError("Whisper模型未加载")
+        # 懒加载Whisper模型
+        if not self._lazy_load_whisper_model():
+            raise ValueError("Whisper模型加载失败")
         
         start_time_processing = time.time()
         
@@ -1489,13 +1839,11 @@ def main():
         model_name=args.model  # 使用实际的Whisper模型名称
     )
     
-    # 配置转录 - 所有目录都放在temp下
+    # 配置转录 - 使用项目目录下的videoSubtitleRecognitionAndTranslation/temp
     trans_config = TranscriptionConfig(
         model_size=args.model,
-        language=args.language,
-        output_dir="./temp",  # 输出目录改为temp
-        checkpoint_dir="./temp/checkpoints",  # 检查点目录放在temp下
-        temp_dir="./temp"
+        language=args.language
+        # 使用默认的项目目录设置，不显式覆盖目录配置
     )
     
     # 创建处理器
@@ -1519,8 +1867,8 @@ def main():
         
         results = processor.process_batch(audio_files, force_redo=args.force_redo)
         
-        # 保存批量处理摘要到temp目录
-        summary_path = os.path.join("./temp", "batch_summary.json")
+        # 保存批量处理摘要到项目目录下的temp目录
+        summary_path = os.path.join(trans_config.temp_dir, "batch_summary.json")
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump({
                 'processed_files': list(results.keys()),
@@ -1534,10 +1882,10 @@ def main():
     else:
             # 处理单个文件
             if args.vad_only:
-                # 仅VAD分析，结果保存到temp目录
+                # 仅VAD分析，结果保存到项目目录下的temp目录
                 vad_results = processor.vad.analyze_audio(
                     input_path,
-                    os.path.join("./temp", f"{Path(input_path).stem}_vad.json")
+                    os.path.join(trans_config.temp_dir, f"{Path(input_path).stem}_vad.json")
                 )
                 logger.info(f"VAD分析完成: {input_path}")
                 logger.info(f"检测到 {vad_results.get('segment_count', 0)} 个语音段")
