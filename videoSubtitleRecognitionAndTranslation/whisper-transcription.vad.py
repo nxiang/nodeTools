@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Whisper转录 + 日语成人向视频VAD检测
-集成断点续传功能的完整解决方案
+集成断点续传功能的完整解决方案 - 统一分块处理版本
 """
 
 import os
@@ -20,6 +20,7 @@ from datetime import datetime
 import warnings
 import gc
 import psutil
+import shutil
 warnings.filterwarnings("ignore")
 
 # 导入现有的whisper相关模块
@@ -163,6 +164,11 @@ class VADConfig:
     # 针对日语语音的特殊参数
     japanese_phoneme_threshold: float = 0.3
     vowel_detection: bool = True  # 日语元音检测
+    
+    # 分块处理参数
+    chunk_duration: float = 180.0  # 默认3分钟一个分块
+    min_chunk_duration: float = 60.0  # 最小1分钟
+    max_chunk_duration: float = 360.0  # 最大6分钟
 
 @dataclass
 class TranscriptionConfig:
@@ -194,7 +200,7 @@ class TranscriptionConfig:
     save_checkpoint_interval: int = 10  # 每10个片段保存一次检查点
 
 class JapaneseAdultVAD:
-    """日语成人视频专用的VAD检测器"""
+    """日语成人视频专用的VAD检测器 - 统一分块处理版本"""
     
     def __init__(self, config: Optional[VADConfig] = None):
         self.config = config or VADConfig()
@@ -219,83 +225,46 @@ class JapaneseAdultVAD:
         moan_low = max(10, self.config.moan_freq_range[0]) / nyquist
         moan_high = min(nyquist-1, self.config.moan_freq_range[1]) / nyquist
         self.moan_filter = signal.butter(4, [moan_low, moan_high], btype='band')
-        
-    def _get_chunk_checkpoint_path(self, audio_path: str, target_sr: int, chunk_duration: int) -> str:
-        """生成分块检查点文件路径"""
-        import hashlib
-        
-        # 基于音频文件路径、采样率和分块大小生成唯一标识
-        file_info = f"{audio_path}_{target_sr}_{chunk_duration}"
-        file_hash = hashlib.md5(file_info.encode()).hexdigest()[:16]
-        
-        # 创建隔离目录结构：项目目录/temp/视频名_模型名/checkpoints
+    
+    def _get_audio_chunk_path(self, audio_path: str, chunk_index: int, target_sr: int) -> str:
+        """生成音频分块文件路径"""
         audio_name = Path(audio_path).stem
-        model_name = self.config.model_name if hasattr(self.config, 'model_name') else 'default'
+        model_name = self.config.model_name.replace('/', '_')
         
-        # 使用统一的临时目录配置
+        # 创建项目目录下的temp/视频名_模型名/chunks目录
         temp_dir = Path(__file__).parent / "temp"
-        os.makedirs(temp_dir, exist_ok=True)
+        chunk_dir = temp_dir / f"{audio_name}_{model_name}" / "chunks"
+        os.makedirs(chunk_dir, exist_ok=True)
         
-        # 隔离目录：按视频名+模型名创建子目录
-        isolation_dir = temp_dir / f"{audio_name}_{model_name}"
-        os.makedirs(isolation_dir, exist_ok=True)
+        # 生成分块文件名
+        return str(chunk_dir / f"chunk_{chunk_index:04d}_{target_sr}Hz.wav")
+    
+    def _get_chunk_checkpoint_path(self, audio_path: str) -> str:
+        """生成分块检查点文件路径"""
+        audio_name = Path(audio_path).stem
+        model_name = self.config.model_name.replace('/', '_')
         
-        # 检查点目录
-        checkpoint_dir = isolation_dir / "checkpoints"
+        # 创建项目目录下的temp/视频名_模型名目录
+        temp_dir = Path(__file__).parent / "temp"
+        checkpoint_dir = temp_dir / f"{audio_name}_{model_name}"
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         # 生成检查点文件名
-        filename = os.path.basename(audio_path)
-        checkpoint_file = checkpoint_dir / f"{filename}_{file_hash}.checkpoint.json"
+        return str(checkpoint_dir / f"{audio_name}_chunk_checkpoint.json")
+    
+    def _get_vad_checkpoint_path(self, audio_path: str) -> str:
+        """生成VAD检查点文件路径"""
+        audio_name = Path(audio_path).stem
+        model_name = self.config.model_name.replace('/', '_')
         
-        return str(checkpoint_file)
-    
-    def _load_chunk_checkpoint(self, checkpoint_file: str) -> List[Tuple[float, float]]:
-        """加载分块检查点"""
-        if not os.path.exists(checkpoint_file):
-            return []
+        # 创建项目目录下的temp/视频名_模型名目录
+        temp_dir = Path(__file__).parent / "temp"
+        checkpoint_dir = temp_dir / f"{audio_name}_{model_name}"
+        os.makedirs(checkpoint_dir, exist_ok=True)
         
-        try:
-            with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                
-            # 验证检查点数据格式
-            if isinstance(data, list) and all(isinstance(item, list) and len(item) == 2 for item in data):
-                processed_chunks = [(float(start), float(end)) for start, end in data]
-                logger.info(f"成功加载检查点: {checkpoint_file}, 已处理 {len(processed_chunks)} 个分块")
-                return processed_chunks
-            else:
-                logger.warning(f"检查点文件格式错误: {checkpoint_file}")
-                return []
-                
-        except Exception as e:
-            logger.warning(f"加载检查点失败: {e}")
-            return []
+        # 生成检查点文件名
+        return str(checkpoint_dir / f"{audio_name}_vad_checkpoint.json")
     
-    def _save_chunk_checkpoint(self, checkpoint_file: str, processed_chunks: List[Tuple[float, float]]):
-        """保存分块检查点"""
-        try:
-            # 确保目录存在
-            os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
-            
-            # 保存检查点数据
-            with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(processed_chunks, f, indent=2)
-                
-            logger.debug(f"检查点已保存: {checkpoint_file}")
-            
-        except Exception as e:
-            logger.warning(f"保存检查点失败: {e}")
-    
-    def _cleanup_chunk_checkpoint(self, checkpoint_file: str):
-        """清理分块检查点文件"""
-        try:
-            if os.path.exists(checkpoint_file):
-                os.remove(checkpoint_file)
-                logger.info(f"检查点文件已清理: {checkpoint_file}")
-        except Exception as e:
-            logger.warning(f"清理检查点失败: {e}")
-            
     def _get_video_duration(self, video_path: str) -> float:
         """获取视频总时长"""
         try:
@@ -319,286 +288,290 @@ class JapaneseAdultVAD:
         except Exception as e:
             logger.warning(f"获取视频时长失败: {e}，使用默认值7200秒")
             return 7200.0
-        
-    def _process_long_video(self, video_path: str, target_sr: int, total_duration: float) -> Tuple[np.ndarray, int]:
-        """处理长视频（>2小时），使用分块提取"""
-        logger.info(f"检测到长视频（{total_duration/3600:.1f}小时），启用分块处理模式")
-        
-        # 计算分块大小：目标分成30个分块，每个分块10-60分钟
-        target_chunk_count = 30
-        chunk_duration = total_duration / target_chunk_count
-        chunk_duration = max(min(chunk_duration, 3600), 600)  # 限制在10-60分钟
-        
-        # 计算总分块数
-        total_chunks = int(np.ceil(total_duration / chunk_duration))
-        logger.info(f"动态分块设置：每个分块约{chunk_duration//60}分钟，共{total_chunks}个分块")
-        
-        # 断点续传检查
-        checkpoint_file = self._get_chunk_checkpoint_path(video_path, target_sr, chunk_duration)
-        processed_chunks = self._load_chunk_checkpoint(checkpoint_file)
-        
-        start_chunk = len(processed_chunks)
-        
-        # 安全检查
-        if start_chunk > total_chunks:
-            logger.warning(f"检查点数据异常，重置检查点")
-            processed_chunks = []
-            start_chunk = 0
-            self._cleanup_chunk_checkpoint(checkpoint_file)
-        
-        # 重置内存日志计时器
-        reset_memory_log_timer()
-        
-        # 分块处理
-        chunks = []
-        processed_count = 0
-        
-        for chunk_index in range(total_chunks):
-            # 跳过已处理的分块
-            if chunk_index < start_chunk:
-                continue
-                
-            # 计算分块时间范围
-            start_time = chunk_index * chunk_duration
-            end_time = min((chunk_index + 1) * chunk_duration, total_duration)
-            chunk_duration_actual = end_time - start_time
-            
-            # 跳过太短的分块（小于10秒）
-            if chunk_duration_actual < 10:
-                logger.info(f"跳过过短分块: {start_time//60}分-{end_time//60}分")
-                continue
-            
-            logger.info(f"处理分块 {chunk_index + 1}/{total_chunks}: {start_time//60}分-{end_time//60}分")
-            
-            try:
-                # 使用ffmpeg提取音频分块
-                chunk_audio = self._extract_audio_chunk_with_ffmpeg(
-                    video_path, start_time, end_time, target_sr
-                )
-                
-                if len(chunk_audio) > 0:
-                    chunks.append(chunk_audio)
-                    processed_count += 1
-                    
-                    # 保存检查点
-                    processed_chunks.append((start_time, end_time))
-                    self._save_chunk_checkpoint(checkpoint_file, processed_chunks)
-                    
-                    # 记录内存使用和进度
-                    cumulative_duration = end_time
-                    log_memory_usage(
-                        f"分块{chunk_index + 1}处理完成", 
-                        cumulative_duration, 
-                        total_duration
-                    )
-                    
-                    # 定期清理内存
-                    if (chunk_index + 1) % 3 == 0:
-                        cleanup_memory()
-                        
-                else:
-                    logger.warning(f"分块 {chunk_index + 1} 提取失败，音频长度为0")
-                    
-            except Exception as e:
-                logger.error(f"分块 {chunk_index + 1} 处理失败: {e}")
-                continue
-        
-        # 检查处理结果
-        if len(chunks) == 0:
-            logger.error("没有成功处理任何分块，尝试单次处理")
-            return self._process_short_video(video_path, target_sr)
-        
-        # 合并所有分块
-        audio = np.concatenate(chunks)
-        
-        logger.info(f"长视频处理完成，音频长度: {len(audio)/target_sr:.1f}秒")
-        log_memory_usage("长视频分块提取后")
-        
-        return audio, target_sr
     
-    def _process_short_video(self, video_path: str, target_sr: int) -> Tuple[np.ndarray, int]:
-        """处理短视频（≤2小时），单次提取"""
-        logger.info("处理短视频，单次提取音频")
+    def _extract_audio_chunk(self, audio_path: str, start_time: float, end_time: float, 
+                           target_sr: int, chunk_index: int, force_recreate: bool = False) -> Optional[str]:
+        """提取音频分块到文件，返回文件路径"""
+        chunk_path = self._get_audio_chunk_path(audio_path, chunk_index, target_sr)
         
-        # 创建项目temp目录下的音频文件路径（支持复用）
-        video_name = Path(video_path).stem
-        model_name = self.config.model_name.replace('/', '_')
-        temp_dir = Path("temp") / f"{video_name}_{model_name}"
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        # 如果文件已存在且不需要强制重新创建，则直接返回路径
+        if os.path.exists(chunk_path) and not force_recreate:
+            logger.info(f"使用现有音频分块: {chunk_path}")
+            return chunk_path
         
-        # 生成音频文件名
-        audio_filename = f"{video_name}_{target_sr}Hz.wav"
-        temp_audio_path = str(temp_dir / audio_filename)
-        
-        # 检查是否已存在可复用的音频文件
-        if os.path.exists(temp_audio_path):
-            logger.info(f"发现可复用的音频文件: {temp_audio_path}")
-            audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
-            return audio, sr
-        
-        # 使用ffmpeg提取整个音频
         try:
             import subprocess
+            import tempfile
             
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-i', video_path,
-                '-vn',  # 不处理视频
-                '-acodec', 'pcm_s16le',
-                '-ar', str(target_sr),
-                '-ac', '1',
-                '-y',  # 覆盖输出文件
-                temp_audio_path
-            ]
+            # 创建临时文件，尝试在与目标目录相同的驱动器上创建
+            try:
+                # 获取目标驱动器
+                target_drive = os.path.splitdrive(chunk_path)[0]
+                if target_drive:
+                    # 尝试在目标驱动器上创建临时文件
+                    temp_dir = os.path.join(target_drive, "Temp")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    temp_file = tempfile.NamedTemporaryFile(
+                        suffix='.wav', 
+                        dir=temp_dir,
+                        delete=False
+                    )
+                else:
+                    # 如果无法获取驱动器，使用默认临时目录
+                    temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            except:
+                # 如果失败，回退到默认临时目录
+                temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
             
-            logger.info(f"使用ffmpeg提取音频: {' '.join(ffmpeg_cmd)}")
+            temp_path = temp_file.name
+            temp_file.close()  # 关闭文件句柄，以便ffmpeg可以写入
             
-            # 执行ffmpeg命令
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=False, timeout=300)
-            
-            # 检查执行结果
-            if result.returncode != 0:
-                error_msg = result.stderr.decode('utf-8', errors='ignore') if result.stderr else ""
-                raise Exception(f"ffmpeg提取失败: {error_msg}")
-            
-            # 加载提取的音频文件
-            audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
-            
-            logger.info(f"音频提取成功: 时长 {len(audio)/sr:.1f}s ({len(audio)/sr/3600:.1f}小时)")
-            log_memory_usage("音频提取后")
-            
-            return audio, sr
+            try:
+                # 构建ffmpeg命令
+                cmd = [
+                    'ffmpeg',
+                    '-y',  # 覆盖输出文件
+                    '-ss', str(start_time),
+                    '-i', audio_path,
+                    '-t', str(end_time - start_time),
+                    '-ac', '1',
+                    '-ar', str(target_sr),
+                    '-acodec', 'pcm_s16le',
+                    '-f', 'wav',
+                    '-loglevel', 'error',  # 减少日志输出
+                    temp_path
+                ]
+                
+                # 执行ffmpeg命令
+                result = subprocess.run(cmd, capture_output=True, text=False, timeout=300)
+                
+                if result.returncode != 0:
+                    error_msg = result.stderr.decode('utf-8', errors='ignore') if result.stderr else ""
+                    raise Exception(f"ffmpeg提取失败: {error_msg}")
+                
+                # 检查文件是否存在且大小合理
+                if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                    raise Exception("ffmpeg未生成有效输出文件")
+                
+                # 确保目标目录存在
+                os.makedirs(os.path.dirname(chunk_path), exist_ok=True)
+                
+                # 使用shutil.copy2复制文件（支持跨驱动器）
+                shutil.copy2(temp_path, chunk_path)
+                
+                logger.info(f"音频分块已保存: {chunk_path} ({end_time-start_time:.1f}s)")
+                
+                # 删除临时文件
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+                
+                return chunk_path
+                
+            except subprocess.TimeoutExpired:
+                # 清理临时文件
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except:
+                        pass
+                raise Exception("ffmpeg处理超时（5分钟）")
+                
+            except Exception as e:
+                # 确保清理临时文件
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except:
+                        pass
+                raise e
+                
+        except Exception as e:
+            logger.error(f"提取音频分块失败: {e}")
+            return None
+    
+    def _load_chunk_checkpoint(self, checkpoint_file: str) -> Dict[str, Any]:
+        """加载分块检查点"""
+        if not os.path.exists(checkpoint_file):
+            return {}
+        
+        try:
+            with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            logger.info(f"成功加载检查点: {checkpoint_file}")
+            return data
             
         except Exception as e:
-            logger.error(f"ffmpeg提取失败: {e}")
+            logger.warning(f"加载检查点失败: {e}")
+            return {}
+    
+    def _save_chunk_checkpoint(self, checkpoint_file: str, checkpoint_data: Dict[str, Any]):
+        """保存分块检查点"""
+        try:
+            # 确保目录存在
+            os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
             
-            # 后备方案：尝试直接使用librosa（仅适用于短视频）
-            try:
-                logger.warning("ffmpeg失败，尝试librosa直接加载...")
-                audio, sr = librosa.load(video_path, sr=target_sr, mono=True)
-                logger.info(f"librosa加载成功: 时长 {len(audio)/sr:.1f}s")
-                return audio, sr
-            except Exception as e2:
-                logger.error(f"所有音频提取方法都失败: {e2}")
-                raise Exception(f"无法加载音频文件: {video_path}")
-        
-    def load_audio(self, audio_path: str, target_sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
-        """加载音频文件（支持视频文件）- 简化版，专注于ffmpeg"""
+            # 保存检查点数据
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
+                
+            logger.debug(f"检查点已保存: {checkpoint_file}")
+            
+        except Exception as e:
+            logger.warning(f"保存检查点失败: {e}")
+    
+    def extract_audio_chunks(self, audio_path: str, target_sr: Optional[int] = None, 
+                           force_recreate: bool = False) -> Dict[str, Any]:
+        """提取音频分块，支持断点续传"""
         target_sr = target_sr or self.config.sample_rate
         
         try:
-            file_ext = Path(audio_path).suffix.lower()
+            # 获取视频总时长
+            total_duration = self._get_video_duration(audio_path)
+            logger.info(f"视频总时长: {total_duration:.1f}秒 ({total_duration/3600:.1f}小时)")
             
-            # 音频文件直接使用librosa加载
-            if file_ext in ('.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg'):
-                logger.info(f"加载音频文件: {audio_path}")
-                audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
-                return audio, sr
+            # 计算分块数量
+            chunk_duration = min(max(self.config.chunk_duration, self.config.min_chunk_duration), 
+                                self.config.max_chunk_duration)
+            total_chunks = int(np.ceil(total_duration / chunk_duration))
             
-            # 视频文件使用ffmpeg提取音频
-            elif file_ext in ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm'):
-                logger.info(f"检测到视频文件: {audio_path}")
-                
-                # 获取视频总时长
-                total_duration = self._get_video_duration(audio_path)
-                logger.info(f"视频总时长: {total_duration:.1f}秒 ({total_duration/3600:.1f}小时)")
-                
-                # 根据视频长度决定处理策略
-                if total_duration > 7200:  # 超过2小时的长视频
-                    return self._process_long_video(audio_path, target_sr, total_duration)
-                else:
-                    return self._process_short_video(audio_path, target_sr)
+            logger.info(f"分块设置: 每个分块约{chunk_duration//60}分钟，共{total_chunks}个分块")
             
-            # 未知文件类型尝试librosa加载
-            else:
-                logger.warning(f"未知文件类型: {file_ext}，尝试librosa加载...")
-                audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
-                return audio, sr
+            # 加载检查点
+            checkpoint_file = self._get_chunk_checkpoint_path(audio_path)
+            checkpoint_data = self._load_chunk_checkpoint(checkpoint_file)
+            
+            # 初始化检查点数据
+            if 'extracted_chunks' not in checkpoint_data:
+                checkpoint_data['extracted_chunks'] = []
+            
+            if 'chunk_info' not in checkpoint_data:
+                checkpoint_data['chunk_info'] = []
+            
+            extracted_chunks = checkpoint_data['extracted_chunks']
+            chunk_info_list = checkpoint_data['chunk_info']
+            
+            # 重置内存日志计时器
+            reset_memory_log_timer()
+            
+            # 分块处理
+            for chunk_index in range(total_chunks):
+                # 检查是否已处理
+                if chunk_index in extracted_chunks and not force_recreate:
+                    logger.info(f"跳过已处理分块: {chunk_index + 1}/{total_chunks}")
+                    continue
                 
+                # 计算分块时间范围
+                start_time = chunk_index * chunk_duration
+                end_time = min((chunk_index + 1) * chunk_duration, total_duration)
+                chunk_duration_actual = end_time - start_time
+                
+                # 跳过太短的分块（小于10秒）
+                if chunk_duration_actual < 10:
+                    logger.info(f"跳过过短分块: {chunk_index + 1} ({start_time//60}分-{end_time//60}分)")
+                    extracted_chunks.append(chunk_index)
+                    continue
+                
+                logger.info(f"提取分块 {chunk_index + 1}/{total_chunks}: {start_time//60}分-{end_time//60}分")
+                
+                try:
+                    # 提取音频分块
+                    chunk_path = self._extract_audio_chunk(
+                        audio_path, start_time, end_time, target_sr, 
+                        chunk_index, force_recreate
+                    )
+                    
+                    if chunk_path:
+                        # 更新检查点
+                        extracted_chunks.append(chunk_index)
+                        chunk_info = {
+                            'index': chunk_index,
+                            'start_time': start_time,
+                            'end_time': end_time,
+                            'duration': chunk_duration_actual,
+                            'path': chunk_path
+                        }
+                        
+                        # 更新或添加chunk_info
+                        found = False
+                        for i, info in enumerate(chunk_info_list):
+                            if info['index'] == chunk_index:
+                                chunk_info_list[i] = chunk_info
+                                found = True
+                                break
+                        
+                        if not found:
+                            chunk_info_list.append(chunk_info)
+                        
+                        # 保存检查点
+                        checkpoint_data['extracted_chunks'] = extracted_chunks
+                        checkpoint_data['chunk_info'] = chunk_info_list
+                        checkpoint_data['total_duration'] = total_duration
+                        checkpoint_data['sample_rate'] = target_sr
+                        checkpoint_data['last_updated'] = datetime.now().isoformat()
+                        
+                        self._save_chunk_checkpoint(checkpoint_file, checkpoint_data)
+                        
+                        # 记录内存使用和进度
+                        cumulative_duration = end_time
+                        log_memory_usage(
+                            f"分块{chunk_index + 1}提取完成", 
+                            cumulative_duration, 
+                            total_duration
+                        )
+                        
+                        # 定期清理内存
+                        if (chunk_index + 1) % 3 == 0:
+                            cleanup_memory()
+                    else:
+                        logger.warning(f"分块 {chunk_index + 1} 提取失败")
+                        
+                except Exception as e:
+                    logger.error(f"分块 {chunk_index + 1} 提取失败: {e}")
+                    continue
+            
+            # 按开始时间排序chunk_info
+            chunk_info_list.sort(key=lambda x: x['start_time'])
+            
+            logger.info(f"音频分块提取完成，共 {len(chunk_info_list)} 个分块")
+            log_memory_usage("音频分块提取完成")
+            
+            return {
+                'audio_path': audio_path,
+                'total_duration': total_duration,
+                'sample_rate': target_sr,
+                'total_chunks': total_chunks,
+                'chunks': chunk_info_list,
+                'checkpoint_file': checkpoint_file
+            }
+            
         except Exception as e:
-            logger.error(f"加载音频失败 {audio_path}: {e}")
+            logger.error(f"音频分块提取失败: {e}")
             raise
     
-    def _extract_audio_chunk_with_ffmpeg(self, audio_path: str, start_time: float, end_time: float, target_sr: int):
-        """使用ffmpeg提取音频分块"""
-        import subprocess
-        import tempfile
-        import os
-        
-        # 创建临时文件
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-            temp_path = temp_file.name
+    def load_audio_chunk(self, chunk_path: str, target_sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
+        """加载单个音频分块"""
+        target_sr = target_sr or self.config.sample_rate
         
         try:
-            # 构建ffmpeg命令
-            cmd = [
-                'ffmpeg',
-                '-y',  # 覆盖输出文件
-                '-ss', str(start_time),
-                '-i', audio_path,
-                '-t', str(end_time - start_time),
-                '-ac', '1',
-                '-ar', str(target_sr),
-                '-acodec', 'pcm_s16le',
-                '-f', 'wav',
-                '-loglevel', 'error',  # 减少日志输出
-                temp_path
-            ]
+            if not os.path.exists(chunk_path):
+                raise FileNotFoundError(f"音频分块文件不存在: {chunk_path}")
             
-            # 执行ffmpeg命令，使用二进制模式避免编码问题
-            result = subprocess.run(cmd, capture_output=True, text=False, timeout=300)  # 5分钟超时
+            if os.path.getsize(chunk_path) == 0:
+                raise ValueError(f"音频分块文件为空: {chunk_path}")
             
-            if result.returncode != 0:
-                # 尝试使用UTF-8解码错误信息
-                try:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore')
-                except:
-                    try:
-                        error_msg = result.stderr.decode('gbk', errors='ignore')
-                    except:
-                        error_msg = str(result.stderr)
-                
-                # 检查文件是否存在，如果存在则尝试加载
-                if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                    logger.info("ffmpeg命令返回非零状态但文件已生成，尝试加载...")
-                    try:
-                        audio, sr = librosa.load(temp_path, sr=target_sr, mono=True)
-                        os.unlink(temp_path)
-                        return audio
-                    except Exception as load_error:
-                        logger.warning(f"ffmpeg生成的文件无法加载: {load_error}")
-                
-                raise Exception(f"ffmpeg失败: {error_msg}")
+            audio, sr = librosa.load(chunk_path, sr=target_sr, mono=True)
             
-            # 检查文件是否存在且大小合理
-            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                raise Exception("ffmpeg未生成有效输出文件")
+            if len(audio) == 0:
+                raise ValueError(f"音频分块加载后数据为空: {chunk_path}")
             
-            # 加载音频数据
-            audio, sr = librosa.load(temp_path, sr=target_sr, mono=True)
-            
-            # 清理临时文件
-            os.unlink(temp_path)
-            
-            return audio
-            
-        except subprocess.TimeoutExpired:
-            # 清理临时文件
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
-            raise Exception("ffmpeg处理超时（5分钟）")
-            
+            return audio, sr
         except Exception as e:
-            # 确保清理临时文件
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
-            raise e
+            logger.error(f"加载音频分块失败 {chunk_path}: {e}")
+            # 尝试重新提取音频分块
+            raise
     
     def detect_voice_activity(self, audio: np.ndarray, sample_rate: int) -> List[Tuple[float, float, Dict]]:
         """检测语音活动并返回时间段及元数据"""
@@ -635,7 +608,6 @@ class JapaneseAdultVAD:
         # 后处理
         segments = self._merge_segments(segments)
         segments = self._filter_segments(segments)
-        segments = self._apply_padding(segments, len(audio)/sample_rate)
         
         return segments
     
@@ -932,383 +904,151 @@ class JapaneseAdultVAD:
         
         return padded_segments
     
-    def analyze_audio(self, audio_path: str, output_json: Optional[str] = None, 
-                     chunk_duration: float = 180.0, stream_mode: bool = True) -> Dict[str, Any]:
-        """分析音频并返回VAD结果（支持流式操作）"""
-        logger.info(f"开始VAD分析: {audio_path}")
+    def analyze_audio_with_chunks(self, audio_path: str, output_json: Optional[str] = None,
+                                force_recreate: bool = False) -> Dict[str, Any]:
+        """使用音频分块进行VAD分析（支持断点续传）"""
+        logger.info(f"开始分块VAD分析: {audio_path}")
         
-        try:
-            if stream_mode:
-                # 流式处理模式
-                segments = self._analyze_audio_streaming(audio_path, chunk_duration)
+        # 提取音频分块（支持断点续传）
+        chunk_info = self.extract_audio_chunks(audio_path, force_recreate=force_recreate)
+        
+        # 加载VAD检查点
+        vad_checkpoint_file = self._get_vad_checkpoint_path(audio_path)
+        vad_checkpoint = self._load_chunk_checkpoint(vad_checkpoint_file)
+        
+        # 初始化检查点数据
+        if 'processed_chunks' not in vad_checkpoint:
+            vad_checkpoint['processed_chunks'] = []
+        
+        if 'segments' not in vad_checkpoint:
+            vad_checkpoint['segments'] = []
+        
+        # 重置内存日志计时器
+        reset_memory_log_timer()
+        
+        all_segments = vad_checkpoint['segments']
+        processed_chunks = vad_checkpoint['processed_chunks']
+        
+        # 处理每个音频分块
+        for chunk in chunk_info['chunks']:
+            chunk_index = chunk['index']
+            
+            # 检查是否已处理
+            if chunk_index in processed_chunks and not force_recreate:
+                logger.info(f"跳过已处理VAD分块: {chunk_index + 1}/{len(chunk_info['chunks'])}")
+                continue
+            
+            logger.info(f"处理VAD分块 {chunk_index + 1}/{len(chunk_info['chunks'])}: {chunk['start_time']//60}分-{chunk['end_time']//60}分")
+            
+            try:
+                # 加载音频分块
+                audio, sr = self.load_audio_chunk(chunk['path'])
                 
-                # 获取音频总时长 - 使用load_audio方法兼容视频文件
-                audio, sr = self.load_audio(audio_path, self.config.sample_rate)
-                total_duration = len(audio) / sr
-            else:
-                # 传统批量处理模式（保持向后兼容）
-                audio, sr = self.load_audio(audio_path, self.config.sample_rate)
-                total_duration = len(audio) / sr
-                segments = self.detect_voice_activity(audio, sr)
-            
-            # 统计信息
-            speech_duration = sum(end - start for start, end, _ in segments)
-            speech_ratio = speech_duration / total_duration if total_duration > 0 else 0
-            
-            # 特殊声音统计
-            special_counts = {
-                'moans': sum(1 for _, _, info in segments if info.get('has_moans', False)),
-                'whispers': sum(1 for _, _, info in segments if info.get('has_whispers', False)),
-                'screams': sum(1 for _, _, info in segments if info.get('has_screams', False)),
-                'japanese_phonemes': sum(1 for _, _, info in segments if info.get('has_japanese_phonemes', False))
-            }
-            
-            # 整理结果
-            results = {
-                'audio_path': audio_path,
-                'total_duration': total_duration,
-                'speech_duration': speech_duration,
-                'speech_ratio': speech_ratio,
-                'segment_count': len(segments),
-                'special_sounds': special_counts,
-                'segments': [
-                    {
-                        'start': start,
-                        'end': end,
-                        'duration': end - start,
-                        'metadata': info
-                    }
-                    for start, end, info in segments
-                ],
-                'vad_config': self.config.__dict__,
-                'analysis_time': datetime.now().isoformat(),
-                'processing_mode': 'streaming' if stream_mode else 'batch'
-            }
-            
-            # 保存结果
-            if output_json:
-                os.makedirs(os.path.dirname(output_json) if os.path.dirname(output_json) else '.', exist_ok=True)
-                with open(output_json, 'w', encoding='utf-8') as f:
-                    json.dump(results, f, ensure_ascii=False, indent=2)
-                logger.info(f"VAD结果已保存到: {output_json}")
-            
-            logger.info(f"VAD分析完成: 检测到 {len(segments)} 个语音段, 语音比例: {speech_ratio:.1%}")
-            return results
-            
-        except Exception as e:
-            logger.error(f"VAD分析失败: {e}")
-            raise
-
-    def _analyze_audio_streaming(self, audio_path: str, chunk_duration: float = 180.0, 
-                               checkpoint_file: Optional[str] = None) -> List[Tuple[float, float, Dict]]:
-        """流式分析音频/视频文件（支持断点续传）"""
-        logger.info(f"开始流式VAD分析: {audio_path}, 块时长: {chunk_duration}s")
-        
-        # 创建临时目录结构：项目目录/temp/视频名_模型名/ 用于检查点文件
-        audio_name = Path(audio_path).stem
-        model_name = self.config.model_name if hasattr(self.config, 'model_name') else 'default'
-        
-        # 使用统一的临时目录配置
-        temp_dir = Path(__file__).parent / "temp"
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # 隔离目录：按视频名+模型名创建子目录
-        isolation_dir = temp_dir / f"{audio_name}_{model_name}"
-        os.makedirs(isolation_dir, exist_ok=True)
-        
-        # 如果没有指定检查点文件，使用隔离目录中的默认路径
-        if checkpoint_file is None:
-            checkpoint_file = str(isolation_dir / f"{audio_name}_vad_checkpoint.json")
-        
-        # 尝试加载检查点
-        checkpoint_data = self._load_vad_checkpoint(checkpoint_file)
-        
-        # 初始化变量，避免在异常处理中引用未定义的变量
-        all_segments = []
-        current_segment = None
-        current_time_offset = 0.0
-        chunk_count = 0
-        total_segments_detected = 0
-        current_sample = 0
-        total_duration = 0
-        sample_rate = 0
-        
-        try:
-            # 首先加载整个音频以获取信息（兼容视频文件）
-            logger.info("加载音频以获取基本信息...")
-            full_audio, sample_rate = self.load_audio(audio_path, self.config.sample_rate)
-            total_duration = len(full_audio) / sample_rate
-            
-            logger.info(f"音频信息: 总时长 {total_duration:.1f}s, 采样率 {sample_rate}Hz")
-            
-            # 计算块大小
-            chunk_size = int(chunk_duration * sample_rate)
-            logger.info(f"块大小: {chunk_size} 样本, 约 {chunk_duration}s")
-            
-            # 初始化状态（从检查点恢复或新建）
-            if checkpoint_data:
-                logger.info(f"从检查点恢复: {checkpoint_file}")
-                all_segments = checkpoint_data.get('all_segments', [])
-                current_segment = checkpoint_data.get('current_segment')
-                current_time_offset = checkpoint_data.get('current_time_offset', 0.0)
-                chunk_count = checkpoint_data.get('chunk_count', 0)
-                total_segments_detected = checkpoint_data.get('total_segments_detected', 0)
-                current_sample = checkpoint_data.get('current_sample', 0)
+                # 检测语音活动
+                chunk_segments = self.detect_voice_activity(audio, sr)
                 
-                logger.info(f"恢复状态: 已处理 {chunk_count} 个块, 时间偏移 {current_time_offset:.1f}s, 已检测 {total_segments_detected} 个语音段")
-            else:
-                logger.info("未找到检查点，从头开始处理")
-                all_segments = []
-                current_segment = None
-                current_time_offset = 0.0
-                chunk_count = 0
-                total_segments_detected = 0
-                current_sample = 0
-            
-            # 手动分块处理
-            total_samples = len(full_audio)
-            
-            while current_sample < total_samples:
-                chunk_count += 1
+                # 调整时间戳以匹配全局时间
+                adjusted_segments = []
+                for start, end, info in chunk_segments:
+                    adjusted_start = chunk['start_time'] + start
+                    adjusted_end = chunk['start_time'] + end
+                    adjusted_segments.append((adjusted_start, adjusted_end, info))
                 
-                # 读取音频块
-                end_sample = min(current_sample + chunk_size, total_samples)
-                audio_chunk = full_audio[current_sample:end_sample]
+                # 添加到总结果中
+                all_segments.extend(adjusted_segments)
                 
-                if len(audio_chunk) == 0:
-                    logger.info("音频处理完成")
-                    break
+                # 更新检查点
+                processed_chunks.append(chunk_index)
+                vad_checkpoint['processed_chunks'] = processed_chunks
+                vad_checkpoint['segments'] = all_segments
+                vad_checkpoint['total_duration'] = chunk_info['total_duration']
+                vad_checkpoint['last_updated'] = datetime.now().isoformat()
                 
-                logger.info(f"处理第 {chunk_count} 个音频块, 当前时间偏移: {current_time_offset:.1f}s")
+                self._save_chunk_checkpoint(vad_checkpoint_file, vad_checkpoint)
                 
-                # 处理当前音频块
-                chunk_segments = self._process_audio_chunk(
-                    audio_chunk, sample_rate, current_time_offset, current_segment
+                # 记录进度
+                cumulative_duration = chunk['end_time']
+                log_memory_usage(
+                    f"VAD分块{chunk_index + 1}处理完成", 
+                    cumulative_duration, 
+                    chunk_info['total_duration']
                 )
                 
-                # 记录块处理结果
-                if chunk_segments:
-                    logger.info(f"块 {chunk_count}: 检测到 {len(chunk_segments)} 个语音段")
-                    total_segments_detected += len(chunk_segments)
-                else:
-                    logger.debug(f"块 {chunk_count}: 未检测到语音活动")
-                
-                # 更新状态
-                if chunk_segments:
-                    # 处理跨块语音段
-                    if current_segment is not None:
-                        # 检查是否需要合并最后一个段
-                        last_segment = chunk_segments[-1]
-                        if (last_segment[0] - current_segment[1] <= self.config.merge_gap and
-                            last_segment[2].get('has_moans') == current_segment[2].get('has_moans')):
-                            # 合并段
-                            merged_start = current_segment[0]
-                            merged_end = last_segment[1]
-                            merged_info = self._merge_segment_info(current_segment[2], last_segment[2])
-                            
-                            logger.info(f"跨块合并: 段 {current_segment[0]:.1f}s-{current_segment[1]:.1f}s 与段 {last_segment[0]:.1f}s-{last_segment[1]:.1f}s 合并")
-                            
-                            # 替换最后一个段
-                            chunk_segments[-1] = (merged_start, merged_end, merged_info)
-                            
-                            # 移除已合并的当前段
-                            if current_segment in all_segments:
-                                all_segments.remove(current_segment)
-                        
-                        current_segment = None
+                # 定期清理内存
+                if (chunk_index + 1) % 3 == 0:
+                    cleanup_memory()
                     
-                    # 添加新段
-                    all_segments.extend(chunk_segments)
-                    
-                    # 更新当前段状态
-                    if chunk_segments:
-                        current_segment = chunk_segments[-1]
-                        logger.debug(f"当前活跃段: {current_segment[0]:.1f}s-{current_segment[1]:.1f}s")
-                
-                # 更新时间偏移和样本位置
-                chunk_duration_actual = len(audio_chunk) / sample_rate
-                current_time_offset += chunk_duration_actual
-                current_sample += len(audio_chunk)
-                
-                # 保存检查点
-                self._save_vad_checkpoint(checkpoint_file, {
-                    'all_segments': all_segments,
-                    'current_segment': current_segment,
-                    'current_time_offset': current_time_offset,
-                    'chunk_count': chunk_count,
-                    'total_segments_detected': total_segments_detected,
-                    'current_sample': current_sample,
-                    'total_duration': total_duration,
-                    'sample_rate': sample_rate,
-                    'last_saved': datetime.now().isoformat()
-                })
-                logger.info(f"检查点已保存: {checkpoint_file}")
-                
-                # 进度日志
-                progress = min(current_time_offset / total_duration, 1.0)
-                
-                logger.info(f"流式分析进度: {progress:.1%} ({current_time_offset:.1f}s/{total_duration:.1f}s), 已检测 {len(all_segments)} 个语音段")
-            
-            # 处理最后一个未完成的段
-            if current_segment is not None:
-                all_segments.append(current_segment)
-                logger.info(f"处理最后一个未完成段: {current_segment[0]:.1f}s-{current_segment[1]:.1f}s")
-            
-            logger.info(f"流式处理完成: 共处理 {chunk_count} 个音频块, 累计检测 {total_segments_detected} 个语音段")
-            
-            # 后处理：合并、过滤、填充
-            logger.info("开始后处理: 合并相邻语音段")
-            all_segments = self._merge_segments(all_segments)
-            logger.info(f"合并后语音段数量: {len(all_segments)}")
-            
-            logger.info("开始后处理: 过滤短语音段")
-            all_segments = self._filter_segments(all_segments)
-            logger.info(f"过滤后语音段数量: {len(all_segments)}")
-            
-            logger.info("开始后处理: 应用时间填充")
-            all_segments = self._apply_padding(all_segments, total_duration)
-            
-            # 处理完成后删除检查点文件
-            if os.path.exists(checkpoint_file):
-                os.remove(checkpoint_file)
-                logger.info(f"处理完成，删除检查点文件: {checkpoint_file}")
-            
-            logger.info(f"流式VAD分析完成: 处理了 {total_duration:.1f}s 音频, 检测到 {len(all_segments)} 个语音段")
-            return all_segments
-            
-        except Exception as e:
-            logger.error(f"流式分析失败: {e}")
-            # 保存错误检查点以便恢复
-            if checkpoint_file:
-                self._save_vad_checkpoint(checkpoint_file, {
-                    'all_segments': all_segments,
-                    'current_segment': current_segment,
-                    'current_time_offset': current_time_offset,
-                    'chunk_count': chunk_count,
-                    'total_segments_detected': total_segments_detected,
-                    'current_sample': current_sample,
-                    'total_duration': total_duration,
-                    'sample_rate': sample_rate,
-                    'error': str(e),
-                    'last_saved': datetime.now().isoformat()
-                })
-                logger.error(f"错误检查点已保存: {checkpoint_file}")
-            raise
+            except Exception as e:
+                logger.error(f"VAD分块 {chunk_index + 1} 处理失败: {e}")
+                continue
+        
+        # 后处理：合并、过滤、填充
+        logger.info("开始后处理: 合并相邻语音段")
+        all_segments = self._merge_segments(all_segments)
+        logger.info(f"合并后语音段数量: {len(all_segments)}")
+        
+        logger.info("开始后处理: 过滤短语音段")
+        all_segments = self._filter_segments(all_segments)
+        logger.info(f"过滤后语音段数量: {len(all_segments)}")
+        
+        logger.info("开始后处理: 应用时间填充")
+        all_segments = self._apply_padding(all_segments, chunk_info['total_duration'])
+        
+        # 统计信息
+        speech_duration = sum(end - start for start, end, _ in all_segments)
+        speech_ratio = speech_duration / chunk_info['total_duration'] if chunk_info['total_duration'] > 0 else 0
+        
+        # 特殊声音统计
+        special_counts = {
+            'moans': sum(1 for _, _, info in all_segments if info.get('has_moans', False)),
+            'whispers': sum(1 for _, _, info in all_segments if info.get('has_whispers', False)),
+            'screams': sum(1 for _, _, info in all_segments if info.get('has_screams', False)),
+            'japanese_phonemes': sum(1 for _, _, info in all_segments if info.get('has_japanese_phonemes', False))
+        }
+        
+        # 整理结果
+        results = {
+            'audio_path': audio_path,
+            'total_duration': chunk_info['total_duration'],
+            'speech_duration': speech_duration,
+            'speech_ratio': speech_ratio,
+            'segment_count': len(all_segments),
+            'special_sounds': special_counts,
+            'segments': [
+                {
+                    'start': start,
+                    'end': end,
+                    'duration': end - start,
+                    'metadata': info
+                }
+                for start, end, info in all_segments
+            ],
+            'vad_config': self.config.__dict__,
+            'analysis_time': datetime.now().isoformat(),
+            'processing_mode': 'chunked',
+            'chunk_info': chunk_info
+        }
+        
+        # 保存结果
+        if output_json:
+            os.makedirs(os.path.dirname(output_json) if os.path.dirname(output_json) else '.', exist_ok=True)
+            with open(output_json, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            logger.info(f"VAD结果已保存到: {output_json}")
+        
+        logger.info(f"VAD分析完成: 检测到 {len(all_segments)} 个语音段, 语音比例: {speech_ratio:.1%}")
+        
+        # 可选：处理完成后删除VAD检查点（保留音频分块文件）
+        if os.path.exists(vad_checkpoint_file):
+            os.remove(vad_checkpoint_file)
+            logger.info(f"VAD处理完成，删除检查点文件: {vad_checkpoint_file}")
+        
+        return results
     
-    def _process_audio_chunk(self, audio_chunk: np.ndarray, sample_rate: int, 
-                           time_offset: float, current_segment: Optional[Tuple[float, float, Dict]]) -> List[Tuple[float, float, Dict]]:
-        """处理单个音频块"""
-        if len(audio_chunk) == 0:
-            return []
-        
-        # 检测当前块的语音活动
-        chunk_segments = self.detect_voice_activity(audio_chunk, sample_rate)
-        
-        # 调整时间戳以匹配全局时间
-        adjusted_segments = []
-        for start, end, info in chunk_segments:
-            adjusted_start = time_offset + start
-            adjusted_end = time_offset + end
-            adjusted_segments.append((adjusted_start, adjusted_end, info))
-        
-        return adjusted_segments
-    
-    def _merge_segment_info(self, info1: Dict, info2: Dict) -> Dict:
-        """合并两个段的元数据信息"""
-        merged = {}
-        
-        # 布尔值：使用逻辑或
-        for key in ['has_moans', 'has_whispers', 'has_screams', 'has_japanese_phonemes']:
-            if key in info1 or key in info2:
-                merged[key] = info1.get(key, False) or info2.get(key, False)
-        
-        # 数值：取平均值
-        for key in ['avg_energy', 'avg_moan_prob', 'avg_vowel_score']:
-            if key in info1 or key in info2:
-                val1 = info1.get(key, 0)
-                val2 = info2.get(key, 0)
-                merged[key] = (val1 + val2) / 2
-        
-        # 计数：求和
-        if 'frame_count' in info1 or 'frame_count' in info2:
-            merged['frame_count'] = info1.get('frame_count', 0) + info2.get('frame_count', 0)
-        
-        return merged
-    
-    def _load_vad_checkpoint(self, checkpoint_file: str) -> Optional[Dict]:
-        """加载VAD检查点文件"""
-        if not os.path.exists(checkpoint_file):
-            return None
-        
-        try:
-            with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                checkpoint_data = json.load(f)
-            
-            # 验证检查点数据的完整性
-            required_fields = ['all_segments', 'current_time_offset', 'chunk_count', 'current_sample']
-            if all(field in checkpoint_data for field in required_fields):
-                logger.info(f"成功加载检查点: {checkpoint_file}")
-                return checkpoint_data
-            else:
-                logger.warning(f"检查点文件不完整: {checkpoint_file}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"加载检查点失败: {e}")
-            return None
-    
-    def _save_vad_checkpoint(self, checkpoint_file: str, checkpoint_data: Dict) -> bool:
-        """保存VAD检查点文件"""
-        try:
-            # 确保临时目录存在
-            temp_dir = os.path.dirname(checkpoint_file)
-            os.makedirs(temp_dir, exist_ok=True)
-            
-            # 保存检查点数据
-            with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
-            
-            logger.debug(f"检查点保存成功: {checkpoint_file}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"保存检查点失败: {e}")
-            return False
-    
-    def analyze_audio_with_checkpoint(self, audio_path: str, chunk_duration: float = 180.0, 
-                                    checkpoint_file: Optional[str] = None) -> List[Tuple[float, float, Dict]]:
-        """
-        支持断点续传的音频分析
-        
-        Args:
-            audio_path: 音频/视频文件路径
-            chunk_duration: 每个处理块的时间长度（秒）
-            checkpoint_file: 检查点文件路径，如果为None则自动生成
-            
-        Returns:
-            语音段列表，每个段包含开始时间、结束时间和元数据
-        """
-        return self._analyze_audio_streaming(audio_path, chunk_duration, checkpoint_file)
-    
-    def resume_from_checkpoint(self, audio_path: str, checkpoint_file: str) -> List[Tuple[float, float, Dict]]:
-        """
-        从检查点恢复分析
-        
-        Args:
-            audio_path: 音频/视频文件路径
-            checkpoint_file: 检查点文件路径
-            
-        Returns:
-            语音段列表
-        """
-        logger.info(f"从检查点恢复分析: {checkpoint_file}")
-        
-        # 验证检查点文件是否存在
-        if not os.path.exists(checkpoint_file):
-            raise FileNotFoundError(f"检查点文件不存在: {checkpoint_file}")
-        
-        # 使用检查点文件进行分析
-        return self.analyze_audio_with_checkpoint(audio_path, checkpoint_file=checkpoint_file)
+    def analyze_audio(self, audio_path: str, output_json: Optional[str] = None, 
+                     force_recreate: bool = False) -> Dict[str, Any]:
+        """分析音频并返回VAD结果（统一使用分块处理）"""
+        return self.analyze_audio_with_chunks(audio_path, output_json, force_recreate)
 
 class TranscriptionWithVAD:
     """集成VAD的Whisper转录系统（支持断点续传）"""
@@ -1363,14 +1103,14 @@ class TranscriptionWithVAD:
     def get_checkpoint_path(self, audio_path: str) -> str:
         """获取检查点文件路径"""
         audio_name = Path(audio_path).stem
-        model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
+        model_name = self.vad_config.model_name.replace('/', '_')
         
         # 创建隔离目录：temp/视频名_模型名
         isolation_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
         os.makedirs(isolation_dir, exist_ok=True)
         
         # 检查点文件直接放在隔离目录中
-        checkpoint_name = f"{audio_name}_checkpoint.json"
+        checkpoint_name = f"{audio_name}_transcription_checkpoint.json"
         return os.path.join(isolation_dir, checkpoint_name)
     
     def load_checkpoint(self, audio_path: str) -> Optional[Dict]:
@@ -1405,27 +1145,42 @@ class TranscriptionWithVAD:
         except Exception as e:
             logger.error(f"保存检查点失败: {e}")
     
-    def extract_audio_segment(self, audio_path: str, start_time: float, 
-                            end_time: float, temp_dir: Optional[str] = None) -> Optional[str]:
-        """提取音频段到临时文件"""
+    def extract_audio_segment_from_chunk(self, audio_path: str, chunk_info: Dict, 
+                                       start_time: float, end_time: float) -> Optional[str]:
+        """从音频分块中提取音频段到临时文件"""
         try:
-            if temp_dir is None:
-                # 按视频名+模型名创建隔离目录
-                audio_name = Path(audio_path).stem
-                model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
-                temp_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
+            audio_name = Path(audio_path).stem
+            model_name = self.vad_config.model_name.replace('/', '_')
             
+            # 创建临时目录
+            temp_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}", "segments")
             os.makedirs(temp_dir, exist_ok=True)
             
-            # 加载完整音频
-            audio, sr = self.vad.load_audio(audio_path, self.vad_config.sample_rate)
+            # 查找包含该时间段的音频分块
+            target_chunk = None
+            for chunk in chunk_info['chunks']:
+                if chunk['start_time'] <= start_time < chunk['end_time']:
+                    target_chunk = chunk
+                    break
+            
+            if not target_chunk:
+                logger.warning(f"未找到包含时间 {start_time}s 的音频分块")
+                return None
+            
+            # 加载音频分块
+            audio, sr = self.vad.load_audio_chunk(target_chunk['path'])
+            
+            # 计算相对于分块的开始时间
+            chunk_start_time = target_chunk['start_time']
+            relative_start_time = start_time - chunk_start_time
+            relative_end_time = min(end_time - chunk_start_time, target_chunk['duration'])
             
             # 计算样本索引
-            start_sample = int(start_time * sr)
-            end_sample = int(end_time * sr)
+            start_sample = int(relative_start_time * sr)
+            end_sample = int(relative_end_time * sr)
             
             if start_sample >= len(audio) or end_sample > len(audio):
-                logger.warning(f"时间范围超出音频长度: {start_time}-{end_time}")
+                logger.warning(f"时间范围超出音频分块长度: {relative_start_time}-{relative_end_time}")
                 return None
             
             # 提取段
@@ -1439,11 +1194,11 @@ class TranscriptionWithVAD:
             return temp_path
             
         except Exception as e:
-            logger.error(f"提取音频段失败: {e}")
+            logger.error(f"从音频分块提取音频段失败: {e}")
             return None
     
     def transcribe_segment(self, audio_path: str, segment_index: int, 
-                          start_time: float, end_time: float) -> Tuple[Dict[str, Any], float]:
+                          start_time: float, end_time: float, chunk_info: Optional[Dict] = None) -> Tuple[Dict[str, Any], float]:
         """转录单个音频段，返回结果和处理时间"""
         # 懒加载Whisper模型
         if not self._lazy_load_whisper_model():
@@ -1451,8 +1206,16 @@ class TranscriptionWithVAD:
         
         start_time_processing = time.time()
         
-        # 提取音频段
-        temp_audio_path = self.extract_audio_segment(audio_path, start_time, end_time)
+        # 提取音频段（优先从音频分块中提取）
+        temp_audio_path = None
+        if chunk_info:
+            temp_audio_path = self.extract_audio_segment_from_chunk(audio_path, chunk_info, start_time, end_time)
+        
+        # 如果无法从分块提取，则使用原始方法（从完整音频提取）
+        if not temp_audio_path:
+            # 使用原始方法提取音频段
+            temp_audio_path = self.extract_audio_segment(audio_path, start_time, end_time)
+        
         if not temp_audio_path:
             result = {
                 'index': segment_index,
@@ -1522,6 +1285,43 @@ class TranscriptionWithVAD:
                 'error': str(e)
             }, processing_time
     
+    def extract_audio_segment(self, audio_path: str, start_time: float, 
+                            end_time: float, temp_dir: Optional[str] = None) -> Optional[str]:
+        """提取音频段到临时文件（从完整音频）"""
+        try:
+            if temp_dir is None:
+                # 按视频名+模型名创建隔离目录
+                audio_name = Path(audio_path).stem
+                model_name = self.vad_config.model_name.replace('/', '_')
+                temp_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
+            
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # 加载完整音频
+            audio, sr = self.vad.load_audio_chunk(audio_path)  # 注意：这里假设已经分块
+            
+            # 计算样本索引
+            start_sample = int(start_time * sr)
+            end_sample = int(end_time * sr)
+            
+            if start_sample >= len(audio) or end_sample > len(audio):
+                logger.warning(f"时间范围超出音频长度: {start_time}-{end_time}")
+                return None
+            
+            # 提取段
+            segment_audio = audio[start_sample:end_sample]
+            
+            # 保存到临时文件
+            temp_filename = f"segment_{int(start_time)}_{int(end_time)}.wav"
+            temp_path = os.path.join(temp_dir, temp_filename)
+            
+            sf.write(temp_path, segment_audio, sr)
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"提取音频段失败: {e}")
+            return None
+    
     def transcribe_with_vad(self, audio_path: str, 
                            vad_results: Optional[Dict] = None,
                            force_redo: bool = False) -> Dict[str, Any]:
@@ -1539,7 +1339,7 @@ class TranscriptionWithVAD:
             else:
                 # 执行VAD分析，按视频名+模型名隔离保存VAD结果
                 audio_name = Path(audio_path).stem
-                model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
+                model_name = self.vad_config.model_name.replace('/', '_')
                 
                 # 创建隔离目录：temp/视频名_模型名/
                 isolation_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
@@ -1549,10 +1349,12 @@ class TranscriptionWithVAD:
                     isolation_dir,
                     f"{audio_name}_vad.json"
                 )
-                vad_results = self.vad.analyze_audio(audio_path, vad_json_path)
+                vad_results = self.vad.analyze_audio(audio_path, vad_json_path, force_redo)
         
         # 准备转录任务
         segments = vad_results.get('segments', [])
+        chunk_info = vad_results.get('chunk_info', {})
+        
         if not segments:
             logger.warning("未检测到语音段")
             return {
@@ -1592,8 +1394,15 @@ class TranscriptionWithVAD:
             start_time = seg['start']
             end_time = seg['end']
             
-            # 转录
-            segment_result, segment_time = self.transcribe_segment(audio_path, i, start_time, end_time)
+            # 转录（如果chunk_info可用，则使用分块提取）
+            if chunk_info:
+                segment_result, segment_time = self.transcribe_segment(
+                    audio_path, i, start_time, end_time, chunk_info
+                )
+            else:
+                segment_result, segment_time = self.transcribe_segment(
+                    audio_path, i, start_time, end_time
+                )
             
             # 更新累计时间
             cumulative_time += segment_time
@@ -1725,7 +1534,7 @@ class TranscriptionWithVAD:
     def _save_output_files(self, audio_path: str, result: Dict) -> Dict[str, str]:
         """保存输出文件"""
         audio_name = Path(audio_path).stem
-        model_name = self.vad_config.model_name if hasattr(self.vad_config, 'model_name') else 'default'
+        model_name = self.vad_config.model_name.replace('/', '_')
         
         # 创建隔离目录：temp/视频名_模型名
         isolation_dir = os.path.join(self.trans_config.temp_dir, f"{audio_name}_{model_name}")
@@ -1849,6 +1658,7 @@ def main():
     parser.add_argument("--vad-only", action="store_true", help="仅执行VAD分析")
     parser.add_argument("--batch", action="store_true", help="批量处理目录")
     parser.add_argument("--cleanup", action="store_true", help="程序开始执行前清理临时文件")
+    parser.add_argument("--chunk-duration", type=float, default=1800.0, help="音频分块时长（秒）")
     
     args = parser.parse_args()
     
@@ -1880,7 +1690,8 @@ def main():
         max_segment_duration=180.0,
         japanese_phoneme_threshold=0.25,
         vowel_detection=True,
-        model_name=args.model  # 使用实际的Whisper模型名称
+        model_name=args.model,  # 使用实际的Whisper模型名称
+        chunk_duration=args.chunk_duration  # 使用用户指定的分块时长
     )
     
     # 配置转录 - 使用项目目录下的temp
@@ -1928,12 +1739,18 @@ def main():
             # 仅VAD分析，结果保存到项目目录下的temp目录
             vad_results = processor.vad.analyze_audio(
                 input_path,
-                os.path.join(trans_config.temp_dir, f"{Path(input_path).stem}_vad.json")
+                os.path.join(trans_config.temp_dir, f"{Path(input_path).stem}_vad.json"),
+                args.force_redo
             )
             logger.info(f"VAD分析完成: {input_path}")
             logger.info(f"检测到 {vad_results.get('segment_count', 0)} 个语音段")
             logger.info(f"语音比例: {vad_results.get('speech_ratio', 0):.1%}")
             logger.info(f"特殊声音统计: {vad_results.get('special_sounds', {})}")
+            
+            # 显示分块信息
+            if 'chunk_info' in vad_results:
+                chunk_info = vad_results['chunk_info']
+                logger.info(f"音频分块: 共 {len(chunk_info.get('chunks', []))} 个分块，保存在: {chunk_info.get('checkpoint_file', '')}")
         else:
             # 完整转录
             result = processor.transcribe_with_vad(
@@ -1944,6 +1761,12 @@ def main():
             if result.get('success'):
                 logger.info(f"转录成功: {input_path}")
                 logger.info(f"输出文件: {result.get('output_paths', {})}")
+                
+                # 显示分块信息
+                vad_results = result.get('vad_results', {})
+                if 'chunk_info' in vad_results:
+                    chunk_info = vad_results['chunk_info']
+                    logger.info(f"音频分块: 共 {len(chunk_info.get('chunks', []))} 个分块")
             else:
                 logger.error(f"转录失败: {result.get('error', 'Unknown error')}")
 
