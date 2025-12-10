@@ -202,6 +202,19 @@ class TranscriptionConfig:
     logprob_threshold: float = -1.0
     no_speech_threshold: float = 0.6
     condition_on_previous_text: bool = True
+    initial_prompt: Optional[str] = None
+    word_timestamps: bool = True
+    prepend_punctuations: str = "\"'¿([{-"
+    append_punctuations: str = "\"'.。,，!！?？:：”)]}、"
+    
+    # 输出格式
+    output_formats: List[str] = field(default_factory=lambda: ["txt", "srt", "vtt", "tsv", "json"])
+    
+    # 临时文件目录 - 使用项目目录下的temp
+    temp_dir: str = str(Path(__file__).parent / "temp")
+    
+    # 断点续传
+    save_checkpoint_interval: int = 10  # 每10个片段保存一次检查点
 
 # 成人内容专用配置
 ADULT_CONTENT_CONFIG = VADConfig(
