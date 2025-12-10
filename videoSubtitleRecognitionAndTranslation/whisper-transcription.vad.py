@@ -145,43 +145,47 @@ def format_time(seconds: float) -> str:
 
 @dataclass
 class VADConfig:
-    """针对日语成人视频的VAD配置"""
+    """针对日语成人视频的VAD配置 - 优化版"""
     # 基础参数
     sample_rate: int = 16000
-    frame_duration: int = 30  # 毫秒
-    threshold: float = 0.4  # 更低的阈值以适应成人内容
-    model_name: str = "default"  # 模型名称，用于临时文件隔离
+    frame_duration: int = 40  # 增加帧时长以提高性能（40毫秒）
+    threshold: float = 0.3  # 进一步降低阈值以提高成人内容检测灵敏度
+    model_name: str = "adult_content"  # 模型名称，用于临时文件隔离
     
     # 成人视频特定参数
-    min_speech_duration: float = 0.2  # 更短的最小持续时间
-    min_silence_duration: float = 0.15
+    min_speech_duration: float = 0.15  # 更短的最小持续时间以适应快速声音变化
+    min_silence_duration: float = 0.1  # 更短的静音持续时间
     
-    # 频率范围（针对日语人声和特殊声音优化）
-    low_freq: int = 70  # 更低的低频以检测喘息声
-    high_freq: int = 4500  # 日语语音频率上限
+    # 频率范围（针对成人内容特殊声音优化）
+    low_freq: int = 60  # 更低的低频以检测喘息声和呻吟声
+    high_freq: int = 5000  # 扩展高频范围以检测尖叫和耳语
     
-    # 能量阈值
-    energy_threshold: float = 0.005  # 更低的能量阈值
+    # 能量阈值（大幅优化）
+    energy_threshold: float = 0.0005  # 大幅降低能量阈值以适应成人内容微弱声音
     
-    # 特殊声音检测
-    detect_moans: bool = True
-    detect_whispers: bool = True
-    detect_screams: bool = True
-    moan_freq_range: Tuple[int, int] = (65, 280)  # 呻吟声频率范围
+    # 特殊声音检测（重点优化）
+    detect_moans: bool = True  # 重点检测呻吟声
+    detect_whispers: bool = True  # 重点检测耳语
+    detect_screams: bool = False  # 禁用尖叫检测以提升性能（成人内容较少）
+    moan_freq_range: Tuple[int, int] = (50, 300)  # 扩展呻吟声频率范围
     
     # 后处理
-    merge_gap: float = 0.5  # 合并间隙
-    padding: float = 0.25  # 填充时间
-    max_segment_duration: float = 180.0  # 最大段持续时间
+    merge_gap: float = 0.3  # 缩短合并间隙以适应快速场景切换
+    padding: float = 0.2  # 减少填充时间
+    max_segment_duration: float = 120.0  # 缩短最大段持续时间
     
-    # 针对日语语音的特殊参数
-    japanese_phoneme_threshold: float = 0.3
+    # 针对成人内容的特殊参数
+    japanese_phoneme_threshold: float = 0.1  # 大幅降低阈值以提高日语检测灵敏度
     vowel_detection: bool = True  # 日语元音检测
     
+    # 性能优化参数
+    enable_lightweight_features: bool = True  # 启用轻量级特征计算
+    skip_mfcc_calculation: bool = True  # 跳过MFCC计算以提升性能
+    
     # 分块处理参数
-    chunk_duration: float = 180.0  # 默认3分钟一个分块
-    min_chunk_duration: float = 60.0  # 最小1分钟
-    max_chunk_duration: float = 600.0  # 最大6分钟
+    chunk_duration: float = 120.0  # 缩短分块时长以提高响应速度
+    min_chunk_duration: float = 30.0  # 最小30秒
+    max_chunk_duration: float = 300.0  # 最大5分钟
 
 @dataclass
 class TranscriptionConfig:
@@ -198,19 +202,45 @@ class TranscriptionConfig:
     logprob_threshold: float = -1.0
     no_speech_threshold: float = 0.6
     condition_on_previous_text: bool = True
-    initial_prompt: Optional[str] = None
-    word_timestamps: bool = True
-    prepend_punctuations: str = "\"'¿([{-"
-    append_punctuations: str = "\"'.。,，!！?？:：”)]}、"
+
+# 成人内容专用配置
+ADULT_CONTENT_CONFIG = VADConfig(
+    # 性能优化参数
+    frame_duration=40,
+    skip_mfcc_calculation=True,
+    enable_lightweight_features=True,
     
-    # 输出格式
-    output_formats: List[str] = field(default_factory=lambda: ["txt", "srt", "vtt", "tsv", "json"])
+    # 成人内容检测优化
+    detect_moans=True,
+    detect_whispers=True,
+    detect_screams=False,  # 禁用尖叫检测提升性能
     
-    # 临时文件目录 - 使用项目目录下的temp
-    temp_dir: str = str(Path(__file__).parent / "temp")
+    # 灵敏度优化
+    energy_threshold=0.0005,
+    japanese_phoneme_threshold=0.1,
     
-    # 断点续传
-    save_checkpoint_interval: int = 10  # 每10个片段保存一次检查点
+    # 分块优化
+    chunk_duration=180.0,
+    min_chunk_duration=60.0,
+    max_chunk_duration=600.0
+)
+
+# 标准配置（普通视频）
+STANDARD_CONFIG = VADConfig(
+    # 标准参数
+    frame_duration=30,
+    skip_mfcc_calculation=False,
+    enable_lightweight_features=False,
+    
+    # 标准检测
+    detect_moans=False,
+    detect_whispers=False,
+    detect_screams=False,
+    
+    # 标准灵敏度
+    energy_threshold=0.001,
+    japanese_phoneme_threshold=0.15
+)
 
 class JapaneseAdultVAD:
     """日语成人视频专用的VAD检测器 - 统一分块处理版本"""
@@ -218,6 +248,28 @@ class JapaneseAdultVAD:
     def __init__(self, config: Optional[VADConfig] = None):
         self.config = config or VADConfig()
         self._init_filters()
+    
+    def switch_to_adult_mode(self):
+        """切换到成人内容检测模式"""
+        self.config = ADULT_CONTENT_CONFIG
+        self._init_filters()
+        logger.info("已切换到成人内容检测模式（优化性能+高灵敏度）")
+        
+    def switch_to_standard_mode(self):
+        """切换到标准检测模式"""
+        self.config = STANDARD_CONFIG
+        self._init_filters()
+        logger.info("已切换到标准检测模式（快速处理）")
+    
+    def get_current_mode(self) -> str:
+        """获取当前检测模式"""
+        if (self.config.detect_moans and 
+            self.config.detect_whispers and 
+            not self.config.detect_screams and
+            self.config.energy_threshold <= 0.0005):
+            return "成人内容模式"
+        else:
+            return "标准模式"
         
     def _init_filters(self):
         """初始化滤波器"""
@@ -672,7 +724,7 @@ class JapaneseAdultVAD:
         return segments
     
     def detect_voice_activity(self, audio: np.ndarray, sample_rate: int) -> List[Tuple[float, float, Dict]]:
-        """简化的VAD检测 - 更敏感的设置"""
+        """完整的VAD检测 - 包含特殊声音特征提取"""
         logger.info(f"开始VAD检测: 音频长度 {len(audio)} 样本, 时长 {len(audio)/sample_rate:.2f}秒")
         
         if len(audio) == 0:
@@ -721,35 +773,18 @@ class JapaneseAdultVAD:
         speech_ratio = np.sum(is_speech) / len(is_speech)
         logger.info(f"语音帧比例: {speech_ratio:.1%} ({np.sum(is_speech)}/{len(is_speech)}帧)")
         
-        # 转换为时间段
-        segments = self._frames_to_segments_simple(is_speech, hop_length, sample_rate)
+        # 提取每帧的特征
+        frame_features = []
+        for i in range(frames.shape[1]):
+            frame = frames[:, i]
+            features = self._extract_frame_features(frame, sample_rate)
+            frame_features.append(features)
         
-        # 过滤短片段
-        filtered_segments = []
-        for start, end in segments:
-            duration = end - start
-            if duration >= self.config.min_speech_duration:
-                # 计算该段的平均能量
-                start_sample = int(start * sample_rate)
-                end_sample = int(end * sample_rate)
-                segment_audio = audio[start_sample:end_sample]
-                segment_energy = np.mean(segment_audio ** 2)
-                
-                # 简单元数据
-                metadata = {
-                    'has_moans': False,
-                    'has_whispers': False,
-                    'has_screams': False,
-                    'has_japanese_phonemes': False,
-                    'avg_energy': segment_energy,
-                    'avg_moan_prob': 0.0,
-                    'avg_vowel_score': 0.0,
-                    'frame_count': int(duration * sample_rate / hop_length)
-                }
-                filtered_segments.append((start, end, metadata))
+        # 转换为时间段（使用完整的特征提取）
+        segments = self._frames_to_segments(is_speech, frame_features, frame_size, hop_length, sample_rate)
         
-        logger.info(f"VAD检测完成: 发现 {len(filtered_segments)} 个语音段，总时长: {sum(end-start for start, end, _ in filtered_segments):.1f}s")
-        return filtered_segments
+        logger.info(f"VAD检测完成: 发现 {len(segments)} 个语音段，总时长: {sum(end-start for start, end, _ in segments):.1f}s")
+        return segments
 
     def _frames_to_segments_simple(self, is_speech: np.ndarray, hop_length: int, sample_rate: int):
         """简单的帧到时间段转换"""
@@ -773,36 +808,44 @@ class JapaneseAdultVAD:
         return segments
     
     def _extract_frame_features(self, frame: np.ndarray, sample_rate: int) -> Dict[str, Any]:
-        """提取帧特征"""
+        """提取帧特征 - 成人内容优化版"""
         # 能量特征
         energy = np.mean(frame ** 2)
         log_energy = np.log(energy + 1e-10)
         
-        # 频谱特征
-        stft = librosa.stft(frame, n_fft=512, hop_length=160)
+        # 轻量级频谱特征（性能优化）
+        stft = librosa.stft(frame, n_fft=256, hop_length=160)  # 减少FFT点数
         magnitude = np.abs(stft)
         
-        # 频谱质心
+        # 频谱质心（简化计算）
         spectral_centroid = librosa.feature.spectral_centroid(
-            S=magnitude, sr=sample_rate
+            S=magnitude, sr=sample_rate, n_fft=256
         )[0].mean()
         
-        # 频谱带宽
+        # 频谱带宽（简化计算）
         spectral_bandwidth = librosa.feature.spectral_bandwidth(
-            S=magnitude, sr=sample_rate
+            S=magnitude, sr=sample_rate, n_fft=256
         )[0].mean()
         
         # 过零率
         zero_crossing_rate = librosa.feature.zero_crossing_rate(frame)[0].mean()
         
-        # MFCC特征（针对语音）
-        mfccs = librosa.feature.mfcc(y=frame, sr=sample_rate, n_mfcc=13)
-        mfcc_mean = np.mean(mfccs, axis=1)
+        # 选择性计算MFCC（性能优化）
+        if not self.config.skip_mfcc_calculation:
+            mfccs = librosa.feature.mfcc(y=frame, sr=sample_rate, n_mfcc=8)  # 减少MFCC维度
+            mfcc_mean = np.mean(mfccs, axis=1)
+        else:
+            mfcc_mean = np.zeros(8)
         
-        # 特殊声音检测
+        # 重点检测特殊声音（成人内容优化）
         moan_features = self._detect_moan_features(frame, sample_rate)
         whisper_features = self._detect_whisper_features(frame, sample_rate, magnitude)
-        scream_features = self._detect_scream_features(frame, sample_rate, magnitude)
+        
+        # 选择性检测尖叫（性能优化）
+        if self.config.detect_screams:
+            scream_features = self._detect_scream_features(frame, sample_rate, magnitude)
+        else:
+            scream_features = {'is_scream': False}
         
         # 日语元音检测
         vowel_score = self._detect_japanese_vowels(frame, sample_rate) if self.config.vowel_detection else 0.0
@@ -823,28 +866,48 @@ class JapaneseAdultVAD:
         }
     
     def _detect_moan_features(self, frame: np.ndarray, sample_rate: int) -> Dict[str, Any]:
-        """检测呻吟声特征"""
+        """检测呻吟声特征 - 成人内容优化版"""
         try:
-            # 应用呻吟声滤波器
-            moan_filtered = signal.filtfilt(*self.moan_filter, frame)
+            # 应用呻吟声滤波器（优化性能）
+            moan_filtered = signal.lfilter(*self.moan_filter, frame)  # 使用lfilter替代filtfilt提升性能
             
             # 计算低频能量
             moan_energy = np.mean(moan_filtered ** 2)
             total_energy = np.mean(frame ** 2)
             
-            # 低频能量比
+            # 低频能量比（大幅降低阈值）
             low_freq_ratio = moan_energy / (total_energy + 1e-10)
             
-            # 计算节奏特征（呻吟声通常有节奏）
-            autocorr = np.correlate(moan_filtered, moan_filtered, mode='full')
-            autocorr = autocorr[len(autocorr)//2:]
+            # 简化的节奏特征检测（性能优化）
+            if len(frame) > 100:
+                # 使用简化的自相关计算
+                autocorr = np.correlate(moan_filtered[:500], moan_filtered[:500], mode='valid')
+                if len(autocorr) > 0:
+                    # 寻找主要峰值
+                    peaks, _ = signal.find_peaks(autocorr[:200], height=0.02, distance=20)  # 大幅降低阈值
+                    rhythm_regularity = min(len(peaks) / 3.0, 1.0)  # 简化节奏规律性计算
+                else:
+                    rhythm_regularity = 0.0
+            else:
+                rhythm_regularity = 0.0
             
-            # 寻找峰值
-            peaks, _ = signal.find_peaks(autocorr[:1000], height=0.1)
-            rhythm_regularity = len(peaks) / 10.0  # 简化指标
+            # 成人内容专用检测阈值（大幅提高灵敏度）
+            is_moan = (low_freq_ratio > 0.08 or  # 大幅降低低频能量比阈值
+                      (total_energy > 0.0003 and low_freq_ratio > 0.05) or  # 微弱声音检测
+                      rhythm_regularity > 0.15)  # 降低节奏规律性阈值
             
-            is_moan = (low_freq_ratio > 0.25 and rhythm_regularity > 0.3)
-            probability = min(low_freq_ratio * 2 + rhythm_regularity * 0.5, 1.0)
+            # 优化概率计算，提高对微弱声音的敏感性
+            probability = min(low_freq_ratio * 5 + rhythm_regularity * 1.2 + total_energy * 100, 1.0)
+            
+            # 成人内容专用增强检测
+            if total_energy > 0.0002 and low_freq_ratio > 0.03:  # 检测极微弱呻吟声
+                is_moan = True
+                probability = max(probability, 0.4)
+            
+            # 喘息声和快速呼吸检测
+            if total_energy > 0.0005 and low_freq_ratio > 0.06 and rhythm_regularity > 0.1:
+                is_moan = True
+                probability = max(probability, 0.7)
             
             return {
                 'is_moan': is_moan,
@@ -856,19 +919,37 @@ class JapaneseAdultVAD:
             return {'is_moan': False, 'probability': 0.0}
     
     def _detect_whisper_features(self, frame: np.ndarray, sample_rate: int, magnitude: np.ndarray) -> Dict[str, Any]:
-        """检测耳语特征"""
-        # 耳语通常频谱质心较低，高频能量较少
-        spectral_centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sample_rate)[0].mean()
-        spectral_rolloff = librosa.feature.spectral_rolloff(S=magnitude, sr=sample_rate)[0].mean()
+        """检测耳语特征 - 成人内容优化版"""
+        # 耳语特征（成人内容专用优化）
+        spectral_centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sample_rate, n_fft=256)[0].mean()
+        
+        # 简化的频谱滚降计算（性能优化）
+        spectral_rolloff = librosa.feature.spectral_rolloff(S=magnitude, sr=sample_rate, roll_percent=0.85)[0].mean()
         
         # 耳语通常能量较低但过零率较高
         energy = np.mean(frame ** 2)
         zcr = librosa.feature.zero_crossing_rate(frame)[0].mean()
         
-        is_whisper = (spectral_centroid < 1000 and 
-                     spectral_rolloff < 4000 and 
-                     energy < 0.01 and 
-                     zcr > 0.05)
+        # 成人内容专用耳语检测阈值（大幅提高灵敏度）
+        is_whisper = (spectral_centroid < 1500 and  # 大幅提高频谱质心阈值
+                     spectral_rolloff < 5000 and    # 大幅提高频谱滚降阈值
+                     energy < 0.02 and             # 大幅提高能量阈值
+                     zcr > 0.02)                   # 大幅降低过零率阈值
+        
+        # 成人内容专用增强检测
+        if energy < 0.008 and spectral_centroid < 1000:  # 微弱耳语检测
+            is_whisper = True
+        
+        # 亲密对话场景检测
+        if (energy < 0.015 and 
+            spectral_centroid < 1200 and 
+            zcr > 0.015 and 
+            spectral_rolloff < 4000):
+            is_whisper = True
+        
+        # 呼吸声检测（成人内容常见）
+        if energy < 0.003 and spectral_centroid < 800 and zcr < 0.1:
+            is_whisper = True
         
         return {'is_whisper': is_whisper}
     
@@ -878,41 +959,49 @@ class JapaneseAdultVAD:
         spectral_bandwidth = librosa.feature.spectral_bandwidth(S=magnitude, sr=sample_rate)[0].mean()
         energy = np.mean(frame ** 2)
         
-        is_scream = (spectral_centroid > 2000 and 
-                    spectral_bandwidth > 1500 and 
-                    energy > 0.05)
+        # 大幅降低尖叫检测阈值，提高成人内容检测灵敏度
+        is_scream = (spectral_centroid > 1500 and  # 降低频谱质心阈值
+                    spectral_bandwidth > 1000 and  # 降低频谱带宽阈值
+                    energy > 0.01)                # 大幅降低能量阈值
         
+        # 添加额外的尖叫检测条件
+        if spectral_centroid > 1800 and energy > 0.005:
+            is_scream = True
+            
         return {'is_scream': is_scream}
     
     def _detect_japanese_vowels(self, frame: np.ndarray, sample_rate: int) -> float:
         """检测日语元音特征"""
-        # 简化的日语元音检测（あ、い、う、え、お）
+        # 优化的日语元音检测（あ、い、う、え、お）
         try:
             # 计算频谱包络
             stft = librosa.stft(frame, n_fft=512)
             magnitude = np.abs(stft)
             
             # 日语元音通常在某些频率有特征峰
-            # 这里使用简化的检测方法
+            # 优化检测方法，提高灵敏度
             freq_bins = librosa.fft_frequencies(sr=sample_rate, n_fft=512)
             
-            # 检查日语元音特征频率（简化版）
+            # 扩展日语元音特征频率范围，提高检测灵敏度
             vowel_ranges = [
-                (250, 350),    # あ
-                (300, 400),    # い
-                (200, 300),    # う
-                (400, 500),    # え
-                (350, 450),    # お
+                (200, 400),    # あ（扩展范围）
+                (280, 450),    # い（扩展范围）
+                (180, 350),    # う（扩展范围）
+                (350, 550),    # え（扩展范围）
+                (300, 500),    # お（扩展范围）
             ]
             
             vowel_score = 0.0
             for low, high in vowel_ranges:
                 mask = (freq_bins >= low) & (freq_bins <= high)
                 if np.any(mask):
-                    range_energy = np.mean(magnitude[mask, :])
-                    total_energy = np.mean(magnitude)
+                    # 使用最大能量而不是平均能量，提高对峰值特征的敏感性
+                    range_energy = np.max(magnitude[mask, :])
+                    total_energy = np.max(magnitude)
                     if total_energy > 0:
-                        vowel_score = max(vowel_score, range_energy / total_energy)
+                        # 使用对数缩放提高低能量信号的检测
+                        ratio = range_energy / total_energy
+                        vowel_score = max(vowel_score, ratio * 1.5)  # 提高权重
             
             return min(vowel_score, 1.0)
         except:
@@ -922,26 +1011,34 @@ class JapaneseAdultVAD:
         """判断是否为语音/声音"""
         is_voice = False
         
-        # 规则1：基础能量阈值
+        # 规则1：基础能量阈值（大幅降低）
         if features['energy'] > self.config.energy_threshold:
             is_voice = True
         
-        # 规则2：特殊声音检测
-        if features['is_moan'] or features['is_scream']:
+        # 规则2：特殊声音检测（降低阈值）
+        if features['is_moan'] or features['is_scream'] or features['is_whisper']:
             is_voice = True
         
-        # 规则3：日语语音特征
-        if features['is_japanese_phoneme']:
+        # 规则3：日语语音特征（降低阈值）
+        if features['is_japanese_phoneme'] or features['vowel_score'] > 0.05:
             is_voice = True
         
-        # 规则4：频谱特征
-        if (features['spectral_centroid'] > 85 and 
-            features['spectral_centroid'] < 4500 and
-            features['spectral_bandwidth'] > 300):
+        # 规则4：频谱特征（放宽范围）
+        if (features['spectral_centroid'] > 50 and 
+            features['spectral_centroid'] < 5000 and
+            features['spectral_bandwidth'] > 200):
             is_voice = True
         
-        # 规则5：过零率（适用于呼吸声等）
-        if features['zero_crossing_rate'] < 0.15 and features['energy'] > 0.002:
+        # 规则5：过零率（适用于呼吸声等，降低阈值）
+        if features['zero_crossing_rate'] < 0.2 and features['energy'] > 0.0005:
+            is_voice = True
+        
+        # 规则6：呻吟声概率检测
+        if features['moan_probability'] > 0.3:
+            is_voice = True
+            
+        # 规则7：最低能量检测（确保极低能量声音也能被检测）
+        if features['energy'] > 0.0001 and features['spectral_centroid'] > 30:
             is_voice = True
         
         return is_voice
