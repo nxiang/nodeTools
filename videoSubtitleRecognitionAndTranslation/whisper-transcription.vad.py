@@ -34,8 +34,8 @@ except ImportError:
 
 # 检查moviepy可用性（用于视频文件支持）
 try:
-    # 新版本moviepy (2.2.1+) 中VideoFileClip直接位于moviepy包中
-    from moviepy import VideoFileClip
+    # moviepy 2.1.2版本中VideoFileClip位于moviepy.video.io.VideoFileClip
+    from moviepy.video.io.VideoFileClip import VideoFileClip
     MOVIEPY_AVAILABLE = True
 except ImportError:
     MOVIEPY_AVAILABLE = False
@@ -48,8 +48,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def log_memory_usage(prefix=""):
-    """记录当前内存使用情况"""
+# 全局变量记录处理开始时间
+_start_time = None
+_last_chunk_time = None
+
+def log_memory_usage(prefix="", chunk_duration=None, total_duration=None):
+    """记录当前内存使用情况，支持显示耗时和累计耗时"""
+    global _start_time, _last_chunk_time
+    
     try:
         process = psutil.Process()
         memory_info = process.memory_info()
@@ -64,7 +70,37 @@ def log_memory_usage(prefix=""):
         system_memory_used_gb = (system_memory.total - system_memory.available) / 1024 / 1024 / 1024
         system_memory_total_gb = system_memory.total / 1024 / 1024 / 1024
         
-        logger.info(f"{prefix}进程内存: {memory_mb:.1f}MB, 系统内存: {system_memory_used_gb:.1f}/{system_memory_total_gb:.1f}GB, 磁盘剩余: {disk_free_gb:.1f}GB")
+        # 构建日志消息
+        log_message = f"{prefix}进程内存: {memory_mb:.1f}MB, 系统内存: {system_memory_used_gb:.1f}/{system_memory_total_gb:.1f}GB, 磁盘剩余: {disk_free_gb:.1f}GB"
+        
+        # 添加耗时信息
+        current_time = time.time()
+        if _start_time is None:
+            _start_time = current_time
+            _last_chunk_time = current_time
+        
+        # 计算当前分块耗时和累计耗时
+        chunk_elapsed = current_time - _last_chunk_time
+        total_elapsed = current_time - _start_time
+        
+        # 格式化时间为时分秒
+        chunk_time_str = format_time(chunk_elapsed)
+        total_time_str = format_time(total_elapsed)
+        
+        # 添加耗时信息到日志消息
+        log_message += f", 耗时: {chunk_time_str}, 累计: {total_time_str}"
+        
+        # 如果提供了分块时长和总时长，显示进度百分比
+        if chunk_duration is not None and total_duration is not None:
+            # 计算累计进度：当前分块结束时间占总时长的比例
+            # 这里假设chunk_duration是累计时长，而不是单个分块时长
+            progress_percent = (chunk_duration / total_duration) * 100
+            log_message += f", 进度: {progress_percent:.1f}%"
+        
+        logger.info(log_message)
+        
+        # 更新最后分块时间
+        _last_chunk_time = current_time
         
         # 如果磁盘空间不足或内存使用过高，发出警告
         if disk_free_gb < 5:
@@ -74,6 +110,12 @@ def log_memory_usage(prefix=""):
             
     except Exception as e:
         logger.warning(f"内存监控失败: {e}")
+
+def reset_memory_log_timer():
+    """重置内存日志计时器"""
+    global _start_time, _last_chunk_time
+    _start_time = None
+    _last_chunk_time = None
 
 def cleanup_memory():
     """清理内存"""
@@ -292,151 +334,391 @@ class JapaneseAdultVAD:
                 # 记录开始时的内存使用情况
                 log_memory_usage("音频提取前")
                 
-                # 对于超长视频（14小时），优先使用moviepy进行流式处理
-                if MOVIEPY_AVAILABLE:
+                # 首先尝试使用ffmpeg直接提取音频（最稳定可靠）
+                try:
+                    import subprocess
+                    import tempfile
+                    
+                    # 创建临时音频文件
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+                        temp_audio_path = temp_audio.name
+                    
+                    # 使用ffmpeg直接提取音频
+                    ffmpeg_cmd = [
+                        'ffmpeg',
+                        '-i', audio_path,
+                        '-vn',  # 不处理视频
+                        '-acodec', 'pcm_s16le',  # PCM编码
+                        '-ar', str(target_sr),  # 目标采样率
+                        '-ac', '1',  # 单声道
+                        '-y',  # 覆盖输出文件
+                        temp_audio_path
+                    ]
+                    
+                    logger.info(f"使用ffmpeg提取音频: {' '.join(ffmpeg_cmd)}")
+                    
+                    # 执行ffmpeg命令
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+                    
+                    if result.returncode != 0:
+                        logger.error(f"ffmpeg提取音频失败: {result.stderr}")
+                        raise Exception(f"ffmpeg提取音频失败: {result.stderr}")
+                    
+                    # 加载提取的音频文件
+                    logger.info("ffmpeg音频提取成功，加载音频文件...")
+                    audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
+                    
+                    # 清理临时文件
                     try:
-                        logger.info("使用moviepy流式提取超长视频音频（14小时视频优化）...")
-                        log_memory_usage("moviepy开始前")
+                        os.unlink(temp_audio_path)
+                    except:
+                        pass
                         
-                        # 使用moviepy的流式处理能力
-                        video = VideoFileClip(audio_path)
+                    logger.info(f"音频加载成功: {len(audio)}个样本，采样率{sr}Hz")
+                    return audio, sr
+                    
+                except Exception as ffmpeg_error:
+                    logger.warning(f"ffmpeg直接提取失败: {ffmpeg_error}")
+                    
+                    # 对于超长视频，采用分块处理策略
+                    # 首先需要获取视频总时长，使用ffprobe
+                    try:
+                        import subprocess
                         
-                        # 对于超长视频，采用分块处理策略
-                        total_duration = video.duration
-                        logger.info(f"视频总时长: {total_duration:.1f}秒 ({total_duration/3600:.1f}小时)")
+                        # 使用ffprobe获取视频时长
+                        ffprobe_cmd = [
+                            'ffprobe',
+                            '-v', 'error',
+                            '-show_entries', 'format=duration',
+                            '-of', 'default=noprint_wrappers=1:nokey=1',
+                            audio_path
+                        ]
                         
-                        # 对于超长视频，采用分块处理策略
-                        if total_duration > 7200:  # 2小时
-                            logger.info("检测到超长视频，启用分块处理模式（14小时视频优化）")
+                        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=30)
+                        if result.returncode == 0:
+                            total_duration = float(result.stdout.strip())
+                        else:
+                            # 如果ffprobe失败，使用默认时长（2小时）
+                            total_duration = 7200
+                            logger.warning(f"ffprobe获取时长失败，使用默认时长: {total_duration}秒")
                             
-                            # 分块大小：30分钟
-                            chunk_duration = 1800  # 30分钟
-                            chunks = []
+                    except Exception as e:
+                        total_duration = 7200
+                        logger.warning(f"获取视频时长失败，使用默认时长: {total_duration}秒")
+                    
+                    logger.info(f"视频总时长: {total_duration:.1f}秒 ({total_duration/3600:.1f}小时)")
+                    
+                    # 对于超长视频，采用分块处理策略（调整为2小时以上）
+                    if total_duration > 7200:  # 2小时
+                        logger.info(f"检测到超长视频（{total_duration/3600:.1f}小时），启用分块处理模式")
+                        
+                        # 动态计算分块大小，确保每个分块长度相近
+                        # 目标：将视频分成约30个分块，避免出现短分块
+                        target_chunk_count = 30
+                        chunk_duration = total_duration / target_chunk_count
+                        
+                        # 确保分块长度在合理范围内（10-60分钟）
+                        min_chunk_duration = 600  # 10分钟
+                        max_chunk_duration = 3600  # 60分钟
+                        chunk_duration = max(min(chunk_duration, max_chunk_duration), min_chunk_duration)
+                        
+                        # 重新计算实际分块数量
+                        # 使用向下取整，确保range循环的分块数与实际计算一致
+                        total_chunks = int(np.floor(total_duration / chunk_duration))
+                        
+                        # 如果还有剩余时间，增加一个分块
+                        if total_duration % chunk_duration > 0:
+                            total_chunks += 1
+                        
+                        logger.info(f"动态分块设置：每个分块约{chunk_duration//60}分钟，共{total_chunks}个分块")
+                        
+                        chunks = []
+                        
+                        # 断点续传：检查是否有已处理的分块
+                        checkpoint_file = self._get_chunk_checkpoint_path(audio_path, target_sr, chunk_duration)
+                        processed_chunks = self._load_chunk_checkpoint(checkpoint_file)
+                        
+                        start_chunk = len(processed_chunks)
+                        
+                        # 安全检查：如果已处理分块数超过总分块数，重置检查点
+                        if start_chunk > total_chunks:
+                            logger.warning(f"检查点数据异常：已处理{start_chunk}个分块，但总分块数只有{total_chunks}，重置检查点")
+                            processed_chunks = []
+                            start_chunk = 0
+                            # 清理错误的检查点文件
+                            self._cleanup_chunk_checkpoint(checkpoint_file)
+                        
+                        if start_chunk > 0:
+                            logger.info(f"断点续传：从第 {start_chunk + 1} 个分块开始，共 {total_chunks} 个分块")
+                            logger.info(f"已处理分块: {[f'{chunk[0]//60}-{chunk[1]//60}分' for chunk in processed_chunks]}")
+                        else:
+                            logger.info(f"开始处理全部分块，共 {total_chunks} 个分块")
+                        
+                        try:
+                            # 重置内存日志计时器
+                            reset_memory_log_timer()
                             
-                            # 断点续传：检查是否有已处理的分块
-                            checkpoint_file = self._get_chunk_checkpoint_path(audio_path, target_sr, chunk_duration)
-                            processed_chunks = self._load_chunk_checkpoint(checkpoint_file)
+                            # 简化分块数计算：直接使用range循环生成的分块数
+                            chunk_start_times = list(range(0, int(total_duration), int(chunk_duration)))
+                            actual_total_chunks = len(chunk_start_times)
                             
-                            # 计算需要处理的分块范围
-                            total_chunks = int(np.ceil(total_duration / chunk_duration))
-                            start_chunk = len(processed_chunks)
+                            # 如果最后一个分块很小（小于1分钟），则合并到前一个分块
+                            if actual_total_chunks > 0:
+                                last_start_time = chunk_start_times[-1]
+                                last_chunk_duration = total_duration - last_start_time
+                                
+                                if last_chunk_duration < 60:  # 小于1分钟的分块
+                                    actual_total_chunks -= 1
+                                    logger.info(f"检测到短尾分块({last_chunk_duration:.1f}秒)，合并到前一个分块，实际总分块数: {actual_total_chunks}")
                             
-                            if start_chunk > 0:
-                                logger.info(f"断点续传：从第 {start_chunk + 1} 个分块开始，共 {total_chunks} 个分块")
-                                logger.info(f"已处理分块: {[f'{chunk[0]//60}-{chunk[1]//60}分' for chunk in processed_chunks]}")
-                            else:
-                                logger.info(f"开始处理全部分块，共 {total_chunks} 个分块")
+                            # 更新总分块数以匹配实际循环
+                            if actual_total_chunks != total_chunks:
+                                logger.info(f"调整总分块数: {total_chunks} -> {actual_total_chunks}")
+                                total_chunks = actual_total_chunks
                             
-                            try:
-                                for chunk_index, start_time in enumerate(range(0, int(total_duration), chunk_duration)):
-                                    # 跳过已处理的分块
-                                    if chunk_index < start_chunk:
-                                        continue
-                                        
-                                    end_time = min(start_time + chunk_duration, total_duration)
-                                    logger.info(f"处理分块 {chunk_index + 1}: {start_time//60}分 - {end_time//60}分")
+                            # 重新检查检查点数据
+                            if start_chunk > total_chunks:
+                                logger.warning(f"检查点数据异常：已处理{start_chunk}个分块，但总分块数只有{total_chunks}，重置检查点")
+                                processed_chunks = []
+                                start_chunk = 0
+                                # 清理错误的检查点文件
+                                self._cleanup_chunk_checkpoint(checkpoint_file)
+                            
+                            # 分块处理计数器
+                            processed_count = 0
+                            
+                            for chunk_index, start_time in enumerate(chunk_start_times):
+                                # 跳过已处理的分块
+                                if chunk_index < start_chunk:
+                                    continue
                                     
-                                    # 优先使用ffmpeg进行分块处理（更稳定可靠）
-                                    chunk_audio = None
+                                # 如果是最后一个分块且很小，则跳过（合并到前一个分块）
+                                if chunk_index == actual_total_chunks - 1 and (total_duration - start_time) < 60:
+                                    logger.info(f"跳过短尾分块: {start_time//60}分 - {total_duration//60}分 (时长: {total_duration - start_time:.1f}秒)")
+                                    continue
+                                    
+                                end_time = min(start_time + chunk_duration, total_duration)
+                                current_chunk_duration = end_time - start_time
+                                
+                                # 跳过太短的分块（小于10秒）
+                                if current_chunk_duration < 10:
+                                    logger.info(f"跳过过短分块: {start_time//60}分 - {end_time//60}分 (时长: {current_chunk_duration:.1f}秒)")
+                                    continue
+                                
+                                logger.info(f"处理分块 {chunk_index + 1}: {start_time//60}分 - {end_time//60}分 (时长: {current_chunk_duration//60}分)")
+                                
+                                # 优先使用ffmpeg进行分块处理（更稳定可靠）
+                                chunk_audio = None
+                                try:
+                                    # 方法1: 使用ffmpeg进行分块处理（首选）
+                                    chunk_audio = self._extract_audio_chunk_with_ffmpeg(audio_path, start_time, end_time, target_sr)
+                                    logger.info(f"ffmpeg分块处理成功: {len(chunk_audio)/target_sr:.1f}秒")
+                                    
+                                except Exception as e:
+                                    logger.warning(f"ffmpeg分块处理失败: {e}")
+                                    # 方法2: 使用ffmpeg直接提取分块音频
                                     try:
-                                        # 方法1: 使用ffmpeg进行分块处理（首选）
-                                        chunk_audio = self._extract_audio_chunk_with_ffmpeg(audio_path, start_time, end_time, target_sr)
-                                        logger.info(f"ffmpeg分块处理成功: {len(chunk_audio)/target_sr:.1f}秒")
+                                        import subprocess
+                                        import tempfile
                                         
-                                    except Exception as e:
-                                        logger.warning(f"ffmpeg分块处理失败: {e}")
-                                        # 方法2: 尝试使用moviepy作为备选方案
+                                        # 创建临时音频文件
+                                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+                                            temp_audio_path = temp_audio.name
+                                        
+                                        # 使用ffmpeg提取指定时间段的音频
+                                        ffmpeg_cmd = [
+                                            'ffmpeg',
+                                            '-i', audio_path,
+                                            '-ss', str(start_time),  # 开始时间
+                                            '-t', str(end_time - start_time),  # 持续时间
+                                            '-vn',  # 不处理视频
+                                            '-acodec', 'pcm_s16le',  # PCM编码
+                                            '-ar', str(target_sr),  # 目标采样率
+                                            '-ac', '1',  # 单声道
+                                            '-y',  # 覆盖输出文件
+                                            temp_audio_path
+                                        ]
+                                        
+                                        logger.info(f"使用ffmpeg提取分块音频: {' '.join(ffmpeg_cmd)}")
+                                        
+                                        # 执行ffmpeg命令
+                                        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+                                        
+                                        if result.returncode != 0:
+                                            logger.error(f"ffmpeg分块提取失败: {result.stderr}")
+                                            raise Exception(f"ffmpeg分块提取失败: {result.stderr}")
+                                        
+                                        # 加载提取的音频文件
+                                        chunk_audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
+                                        
+                                        # 清理临时文件
                                         try:
-                                            # 使用moviepy的流式处理能力
-                                            chunk = VideoFileClip(audio_path)
-                                            
-                                            # 兼容不同版本moviepy的API
-                                            if hasattr(chunk, 'subclip'):
-                                                chunk = chunk.subclip(start_time, end_time)
-                                            else:
-                                                # 新版本moviepy可能需要使用不同的方法
-                                                # 直接使用整个视频，但只处理指定时间段的音频
-                                                chunk_duration = end_time - start_time
-                                                logger.info(f"使用moviepy处理时间段: {start_time}-{end_time}秒")
-                                            
-                                            # 使用内存缓冲区处理当前分块
-                                            import io
-                                            temp_buffer = io.BytesIO()
-                                            chunk.audio.write_audiofile(temp_buffer, fps=target_sr, verbose=False, logger=None)
-                                            temp_buffer.seek(0)
-                                            
-                                            chunk_audio, _ = librosa.load(temp_buffer, sr=target_sr, mono=True)
-                                            
-                                            # 清理当前分块资源
-                                            chunk.close()
-                                            temp_buffer.close()
-                                            logger.info(f"moviepy分块处理成功: {len(chunk_audio)/target_sr:.1f}秒")
-                                            
-                                        except Exception as e2:
-                                            logger.error(f"moviepy分块处理也失败: {e2}")
-                                            # 所有分块方法都失败，回退到直接处理整个视频
-                                            logger.error(f"所有分块方法都失败，回退到直接处理整个视频")
-                                            try:
-                                                import io
-                                                temp_buffer = io.BytesIO()
-                                                video.audio.write_audiofile(temp_buffer, fps=target_sr, verbose=False, logger=None)
-                                                temp_buffer.seek(0)
-                                                audio, sr = librosa.load(temp_buffer, sr=target_sr, mono=True)
-                                                temp_buffer.close()
-                                                break  # 跳出循环，直接使用整个音频
-                                            except Exception as e3:
-                                                logger.error(f"直接处理整个视频也失败: {e3}")
-                                                raise
-                                    
-                                    if chunk_audio is not None:
-                                        chunks.append(chunk_audio)
+                                            os.unlink(temp_audio_path)
+                                        except:
+                                            pass
                                         
-                                        # 保存检查点
-                                        processed_chunks.append((start_time, end_time))
-                                        self._save_chunk_checkpoint(checkpoint_file, processed_chunks)
-                                        logger.debug(f"检查点已保存: {checkpoint_file}")
+                                        logger.info(f"ffmpeg分块提取成功: {len(chunk_audio)/target_sr:.1f}秒")
+                                        
+                                    except Exception as ffmpeg_error:
+                                        logger.warning(f"ffmpeg直接分块提取失败: {ffmpeg_error}")
+                                        # 方法3: 尝试使用torchaudio作为备选方案
+                                        try:
+                                            # 使用torchaudio加载整个音频，然后截取分块
+                                            full_audio, full_sr = torchaudio.load(audio_path)
+                                            full_audio = full_audio.numpy()
+                                            if len(full_audio.shape) > 1:
+                                                full_audio = full_audio.mean(axis=0)
+                                            
+                                            # 计算分块的样本范围
+                                            start_sample = int(start_time * full_sr)
+                                            end_sample = int(end_time * full_sr)
+                                            
+                                            # 确保不超出范围
+                                            end_sample = min(end_sample, len(full_audio))
+                                            
+                                            chunk_audio = full_audio[start_sample:end_sample]
+                                            
+                                            # 重采样到目标采样率
+                                            if full_sr != target_sr:
+                                                chunk_audio = librosa.resample(chunk_audio, orig_sr=full_sr, target_sr=target_sr)
+                                            
+                                            logger.info(f"torchaudio分块处理成功: {len(chunk_audio)/target_sr:.1f}秒")
+                                            
+                                        except Exception as torchaudio_error:
+                                            logger.error(f"torchaudio分块处理也失败: {torchaudio_error}")
+                                            # 分块处理失败，但继续尝试下一个分块
+                                            logger.warning(f"分块 {chunk_index + 1} 处理失败，跳过此分块，继续处理后续分块")
+                                            continue
+                                
+                                if chunk_audio is not None:
+                                    chunks.append(chunk_audio)
+                                    processed_count += 1
                                     
-                                    log_memory_usage(f"分块{chunk_index + 1}处理完成")
-                                    
-                                    # 每处理几个分块后清理一次内存
-                                    if (chunk_index + 1) % 3 == 0:
-                                        cleanup_memory()
+                                    # 保存检查点
+                                    processed_chunks.append((start_time, end_time))
+                                    self._save_chunk_checkpoint(checkpoint_file, processed_chunks)
+                                    logger.debug(f"检查点已保存: {checkpoint_file}")
+                                
+                                # 更新内存使用日志，显示耗时和累计耗时
+                                # 计算累计时长：当前分块的结束时间
+                                cumulative_duration = end_time
+                                log_memory_usage(f"分块{chunk_index + 1}处理完成", cumulative_duration, total_duration)
+                                
+                                # 每处理几个分块后清理一次内存
+                                if (chunk_index + 1) % 3 == 0:
+                                    cleanup_memory()
                             
                                 # 合并所有分块
-                                audio = np.concatenate(chunks)
-                                sr = target_sr
-                                
+                                if len(chunks) == 0:
+                                    logger.error("没有成功处理任何分块，尝试使用单次处理模式")
+                                    # 分块处理失败，回退到单次处理
+                                    try:
+                                        # 使用ffmpeg直接提取整个音频
+                                        import subprocess
+                                        import tempfile
+                                        
+                                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+                                            temp_audio_path = temp_audio.name
+                                        
+                                        ffmpeg_cmd = [
+                                            'ffmpeg',
+                                            '-i', audio_path,
+                                            '-vn',
+                                            '-acodec', 'pcm_s16le',
+                                            '-ar', str(target_sr),
+                                            '-ac', '1',
+                                            '-y',
+                                            temp_audio_path
+                                        ]
+                                        
+                                        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+                                        
+                                        if result.returncode != 0:
+                                            raise Exception(f"ffmpeg单次提取失败: {result.stderr}")
+                                        
+                                        audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
+                                        
+                                        try:
+                                            os.unlink(temp_audio_path)
+                                        except:
+                                            pass
+                                        
+                                        logger.info("回退到单次处理模式成功")
+                                    except Exception as single_error:
+                                        logger.error(f"单次处理模式也失败: {single_error}")
+                                        raise Exception("所有音频提取方法都失败了")
+                                else:
+                                    # 检查分块处理情况
+                                    actual_chunks = len(chunks)
+                                    if actual_chunks < total_chunks:
+                                        # 计算实际处理的音频时长
+                                        actual_duration = sum(len(chunk) for chunk in chunks) / target_sr
+                                        total_expected_duration = total_duration
+                                        
+                                        logger.warning(f"部分分块处理失败，成功处理了 {actual_chunks}/{total_chunks} 个分块")
+                                        logger.info(f"实际处理时长: {actual_duration:.1f}秒 ({actual_duration/3600:.1f}小时)")
+                                        logger.info(f"预期总时长: {total_expected_duration:.1f}秒 ({total_expected_duration/3600:.1f}小时)")
+                                        
+                                        # 如果最后一个短分块被跳过，这是正常情况
+                                        if actual_chunks == total_chunks - 1:
+                                            logger.info("最后一个短分块被跳过，这是正常处理")
+                                        else:
+                                            logger.warning("使用已成功处理的分块继续后续处理")
+                                    
+                                    audio = np.concatenate(chunks)
+                                    sr = target_sr
+                                    
                                 # 分块处理完成，清理检查点文件
-                                self._cleanup_chunk_checkpoint(checkpoint_file)
-                                logger.info(f"超长视频分块处理完成，音频长度: {len(audio)/sr:.1f}秒，检查点已清理")
+                                # self._cleanup_chunk_checkpoint(checkpoint_file)
+                                logger.info(f"超长视频处理完成，音频长度: {len(audio)/sr:.1f}秒")
                                 log_memory_usage("超长视频分块提取后")
-                                
-                            except Exception as e:
-                                # 分块处理过程中发生异常，保存当前进度
-                                logger.error(f"分块处理过程中发生异常: {e}")
-                                logger.info(f"已处理分块进度: {len(processed_chunks)}/{total_chunks}，检查点已保存")
-                                logger.info("下次运行将从断点继续处理")
-                                raise
                             
                         else:
                             # 对于较短视频，使用单次处理
-                            import io
-                            temp_buffer = io.BytesIO()
-                            video.audio.write_audiofile(temp_buffer, fps=target_sr, verbose=False, logger=None)
-                            temp_buffer.seek(0)
-                            audio, sr = librosa.load(temp_buffer, sr=target_sr, mono=True)
-                            temp_buffer.close()
+                            try:
+                                # 使用ffmpeg直接提取整个音频
+                                import subprocess
+                                import tempfile
+                                
+                                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+                                    temp_audio_path = temp_audio.name
+                                
+                                ffmpeg_cmd = [
+                                    'ffmpeg',
+                                    '-i', audio_path,
+                                    '-vn',
+                                    '-acodec', 'pcm_s16le',
+                                    '-ar', str(target_sr),
+                                    '-ac', '1',
+                                    '-y',
+                                    temp_audio_path
+                                ]
+                                
+                                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+                                
+                                if result.returncode != 0:
+                                    raise Exception(f"ffmpeg单次提取失败: {result.stderr}")
+                                
+                                audio, sr = librosa.load(temp_audio_path, sr=target_sr, mono=True)
+                                
+                                try:
+                                    os.unlink(temp_audio_path)
+                                except:
+                                    pass
+                                
+                                logger.info(f"音频提取成功: 时长 {len(audio)/sr:.1f}s ({len(audio)/sr/3600:.1f}小时)")
+                                log_memory_usage("音频提取后")
+                                return audio, sr
+                                
+                            except Exception as single_error:
+                                logger.error(f"单次处理模式失败: {single_error}")
+                                raise Exception("音频提取失败")
                         
-                        # 清理资源
-                        video.close()
-                        
-                        logger.info(f"moviepy音频提取成功: 时长 {len(audio)/sr:.1f}s ({len(audio)/sr/3600:.1f}小时)")
-                        log_memory_usage("moviepy提取后")
+                        # 分块处理完成后返回音频数据
                         return audio, sr
                         
-                    except Exception as e:
-                        logger.warning(f"moviepy流式处理失败: {e}")
-                
+                    # 如果分块处理失败，继续尝试其他方法
+                    
                 # 后备方案：使用torchaudio（内存占用中等）
                 try:
                     logger.info("使用torchaudio提取视频音频...")
@@ -901,7 +1183,7 @@ class JapaneseAdultVAD:
         return padded_segments
     
     def analyze_audio(self, audio_path: str, output_json: Optional[str] = None, 
-                     chunk_duration: float = 10.0, stream_mode: bool = True) -> Dict[str, Any]:
+                     chunk_duration: float = 30.0, stream_mode: bool = True) -> Dict[str, Any]:
         """分析音频并返回VAD结果（支持流式操作）"""
         logger.info(f"开始VAD分析: {audio_path}")
         
@@ -1270,15 +1552,9 @@ class JapaneseAdultVAD:
     
     def cleanup_checkpoint(self, checkpoint_file: str) -> bool:
         """清理检查点文件"""
-        try:
-            if os.path.exists(checkpoint_file):
-                os.remove(checkpoint_file)
-                logger.info(f"检查点文件已清理: {checkpoint_file}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"清理检查点失败: {e}")
-            return False
+        # 禁用自动清理检查点功能，以支持长时间运行的断点续传
+        logger.info(f"检查点清理功能已禁用，保留检查点文件: {checkpoint_file}")
+        return False
 
 class TranscriptionWithVAD:
     """集成VAD的Whisper转录系统（支持断点续传）"""
@@ -1822,8 +2098,26 @@ def main():
     parser.add_argument("--force-redo", action="store_true", help="强制重新处理")
     parser.add_argument("--vad-only", action="store_true", help="仅执行VAD分析")
     parser.add_argument("--batch", action="store_true", help="批量处理目录")
+    parser.add_argument("--cleanup", action="store_true", help="程序开始执行前清理临时文件")
     
     args = parser.parse_args()
+    
+    # 如果指定了--cleanup参数，在程序开始前清理临时文件
+    if args.cleanup:
+        import shutil
+        # 只清理当前视频对应的临时目录（视频名+模型名）
+        video_name = Path(args.input).stem
+        model_name = args.model
+        isolation_dir_name = f"{video_name}_{model_name}"
+        
+        temp_dir = Path(__file__).parent / "temp"
+        target_dir = temp_dir / isolation_dir_name
+        
+        if target_dir.exists():
+            logger.info(f"清理视频临时目录: {target_dir}")
+            shutil.rmtree(target_dir)
+        else:
+            logger.info(f"视频临时目录不存在，无需清理: {target_dir}")
     
     # 配置VAD（针对成人视频优化）
     vad_config = VADConfig(
@@ -1880,29 +2174,29 @@ def main():
         logger.info(f"批量处理完成！摘要已保存到: {summary_path}")
         
     else:
-            # 处理单个文件
-            if args.vad_only:
-                # 仅VAD分析，结果保存到项目目录下的temp目录
-                vad_results = processor.vad.analyze_audio(
-                    input_path,
-                    os.path.join(trans_config.temp_dir, f"{Path(input_path).stem}_vad.json")
-                )
-                logger.info(f"VAD分析完成: {input_path}")
-                logger.info(f"检测到 {vad_results.get('segment_count', 0)} 个语音段")
-                logger.info(f"语音比例: {vad_results.get('speech_ratio', 0):.1%}")
-                logger.info(f"特殊声音统计: {vad_results.get('special_sounds', {})}")
+        # 处理单个文件
+        if args.vad_only:
+            # 仅VAD分析，结果保存到项目目录下的temp目录
+            vad_results = processor.vad.analyze_audio(
+                input_path,
+                os.path.join(trans_config.temp_dir, f"{Path(input_path).stem}_vad.json")
+            )
+            logger.info(f"VAD分析完成: {input_path}")
+            logger.info(f"检测到 {vad_results.get('segment_count', 0)} 个语音段")
+            logger.info(f"语音比例: {vad_results.get('speech_ratio', 0):.1%}")
+            logger.info(f"特殊声音统计: {vad_results.get('special_sounds', {})}")
+        else:
+            # 完整转录
+            result = processor.transcribe_with_vad(
+                input_path, 
+                force_redo=args.force_redo
+            )
+            
+            if result.get('success'):
+                logger.info(f"转录成功: {input_path}")
+                logger.info(f"输出文件: {result.get('output_paths', {})}")
             else:
-                # 完整转录
-                result = processor.transcribe_with_vad(
-                    input_path, 
-                    force_redo=args.force_redo
-                )
-                
-                if result.get('success'):
-                    logger.info(f"转录成功: {input_path}")
-                    logger.info(f"输出文件: {result.get('output_paths', {})}")
-                else:
-                    logger.error(f"转录失败: {result.get('error', 'Unknown error')}")
+                logger.error(f"转录失败: {result.get('error', 'Unknown error')}")
 
 if __name__ == "__main__":
     main()
