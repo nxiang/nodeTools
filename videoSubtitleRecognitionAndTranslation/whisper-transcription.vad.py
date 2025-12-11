@@ -644,6 +644,9 @@ class OptimizedTranscriber:
             # 4. 转录处理
             self.performance.start_stage("转录处理")
             
+            # 初始化累计耗时统计
+            total_elapsed_time = 0
+            
             for chunk_id, chunk_path in chunks:
                 # 跳过已完成的chunk
                 if chunk_id in completed_chunks:
@@ -663,7 +666,8 @@ class OptimizedTranscriber:
                     completed_results[str(chunk_id)] = result
                     
                     chunk_time = time.time() - chunk_start
-                    logging.info(f"完成chunk {chunk_id}，耗时: {TimeFormatter.format_seconds(chunk_time)}")
+                    total_elapsed_time += chunk_time
+                    logging.info(f"完成chunk {chunk_id}，耗时: {TimeFormatter.format_seconds(chunk_time)}，累计耗时: {TimeFormatter.format_seconds(total_elapsed_time)}")
                 else:
                     logging.warning(f"chunk {chunk_id} 转录失败，跳过")
             
@@ -680,7 +684,7 @@ class OptimizedTranscriber:
             self.progress.mark_complete()
             self.performance.end_stage()
             
-            # 7. 打印统计信息
+            # 7. 打印详细统计信息
             total_time = time.time() - total_start
             audio_duration = self.audio_processor.audio_info['duration']
             
@@ -699,7 +703,36 @@ class OptimizedTranscriber:
             print(f"临时文件位置: {self.temp_dir}")
             print("="*60)
             
-            # 性能摘要
+            # 详细耗时统计
+            print("\n" + "="*50)
+            print("详细耗时统计")
+            print("="*50)
+            
+            # 获取性能追踪器的数据
+            performance_data = self.performance.get_summary()
+            
+            # 打印各阶段耗时
+            print("各阶段耗时详情:")
+            for stage, duration in performance_data["各阶段耗时"].items():
+                print(f"  {stage}: {duration}")
+            
+            # 计算并打印累计耗时
+            cumulative_time = 0
+            print("\n累计耗时分析:")
+            for stage, duration_str in performance_data["各阶段耗时"].items():
+                # 将时间字符串转换回秒数
+                time_parts = duration_str.split(':')
+                if len(time_parts) == 3:
+                    hours, minutes, seconds = map(int, time_parts)
+                    stage_seconds = hours * 3600 + minutes * 60 + seconds
+                    cumulative_time += stage_seconds
+                    print(f"  {stage}: {TimeFormatter.format_seconds(cumulative_time)}")
+            
+            print(f"\n总累计耗时: {performance_data['总耗时']}")
+            print(f"实时因子: {performance_data['实时因子']}")
+            print("="*50)
+            
+            # 性能摘要（保持原有格式）
             self.performance.print_summary()
             
             return True
