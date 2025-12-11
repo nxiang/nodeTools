@@ -140,8 +140,8 @@ class SileroVADProcessor:
             traceback.print_exc()
     
     def get_speech_timestamps(self, audio: np.ndarray, sr: int = 16000, 
-                             threshold: float = 0.5, min_speech_duration_ms: int = 250,
-                             min_silence_duration_ms: int = 100, window_size_samples: int = 512,
+                             threshold: float = 0.3, min_speech_duration_ms: int = 400,
+                             min_silence_duration_ms: int = 200, window_size_samples: int = 512,
                              speech_pad_ms: int = 100) -> List[Dict[str, float]]:
         """使用Silero VAD检测语音时间戳"""
         if not self.available or self.model is None:
@@ -209,7 +209,7 @@ class SileroVADProcessor:
             
             # 3. 动态范围压缩（增强弱语音）
             # 使用对数压缩，增强低音量部分
-            compressed_audio = np.sign(filtered_audio) * np.log1p(np.abs(filtered_audio) * 5)
+            compressed_audio = np.sign(filtered_audio) * np.log1p(np.abs(filtered_audio) * 2)
             
             # 4. 再次标准化
             max_abs = np.max(np.abs(compressed_audio))
@@ -560,7 +560,7 @@ class OptimizedTranscriber:
     
     def __init__(self, input_file: str, model_name: str, language: str = "ja", 
                  overlap_seconds: float = 2.0, use_silero_vad: bool = True,
-                 vad_threshold: float = 0.5, min_speech_duration_ms: int = 250):
+                 vad_threshold: float = 0.3, min_speech_duration_ms: int = 250):
         self.input_file = os.path.abspath(input_file)
         self.model_name = model_name
         self.language = language
@@ -648,14 +648,12 @@ class OptimizedTranscriber:
         # 基础参数
         options = {
             "language": self.language,
-            "beam_size": 5,  # 增加束搜索宽度，提高准确性
-            "best_of": 3,    # 增加采样次数
-            "temperature": 0.0,
-            "patience": 1.0,
-            "condition_on_previous_text": False,  # 关闭以加速处理
+            "beam_size": 3,  # 降低束搜索宽度
+            "no_speech_threshold": 0.6,  # 提高无语音阈值
+            "compression_ratio_threshold": 1.8,  # 降低压缩比阈值
+            "condition_on_previous_text": True,  # 启用上下文依赖
             "word_timestamps": False,
-            "compression_ratio_threshold": 2.4,  # 增加压缩比阈值
-            "no_speech_threshold": 0.5,  # 降低无语音阈值
+            "temperature": 0.0,
         }
         
         # 语言特定的优化
@@ -1006,28 +1004,29 @@ class OptimizedTranscriber:
             return False
     
     def _filter_noise_segments(self, segments: List[Dict]) -> List[Dict]:
-        """过滤环境噪声片段"""
         filtered_segments = []
         
         for segment in segments:
             text = segment.get("text", "").strip()
+            duration = segment["end"] - segment["start"]
             
-            # 跳过空文本
-            if not text:
+            # 跳过过短的片段
+            if duration < 0.3:  # 小于0.3秒的片段
                 continue
-                
-            # 计算语音时长
-            speech_duration = segment["end"] - segment["start"]
             
-            # 过滤规则
-            if len(text) < 2 and speech_duration < 0.5:
+            # 跳过只有单个字符的片段
+            if len(text) <= 1 and duration < 1.0:
                 continue
-                
-            # 日语特定噪声过滤
-            if self.language == "ja":
-                japanese_noise = ["え", "あ", "う", "い", "お", "ん", "は", "ふ", "へ", "ほ"]
-                if text in japanese_noise and speech_duration < 1.0:
-                    continue
+            
+            # 跳过常见的噪声文本（日语）
+            noise_patterns = ["あ", "え", "う", "い", "お", "ん", "はあ", "ふん"]
+            if text in noise_patterns and duration < 0.8:
+                continue
+            
+            # 检查VAD置信度（如果有）
+            vad_score = segment.get("vad_score", 0.5)
+            if vad_score < 0.2:  # 低置信度的片段
+                continue
             
             filtered_segments.append(segment)
         
@@ -1148,9 +1147,9 @@ def main():
                        help="分块重叠时长（秒），避免语句被切断 (默认: 2.0)")
     parser.add_argument("--no-silero-vad", action="store_true",
                        help="禁用Silero VAD，使用faster-whisper内置VAD")
-    parser.add_argument("--vad-threshold", type=float, default=0.5,
+    parser.add_argument("--vad-threshold", type=float, default=0.3,
                        help="VAD检测阈值 (0.0-1.0，越低越敏感) (默认: 0.5)")
-    parser.add_argument("--min-speech-duration", type=int, default=250,
+    parser.add_argument("--min-speech-duration", type=int, default=400,
                        help="最小语音时长（毫秒）(默认: 250)")
     
     args = parser.parse_args()
