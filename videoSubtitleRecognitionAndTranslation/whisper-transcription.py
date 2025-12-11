@@ -16,6 +16,15 @@ try:
 except ImportError:
     torch = None
 
+# 尝试导入 faster-whisper
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+    print("警告: 未安装faster-whisper，将使用标准whisper库")
+    print("建议安装: pip install faster-whisper")
+
 # 虚拟环境管理类
 class VirtualEnvironmentManager:
     """管理虚拟环境的激活和退出"""
@@ -166,6 +175,9 @@ class SegmentTranscriber:
         
         # 懒加载状态
         self.model_loaded = model is not None
+        
+        # 使用faster-whisper的标记
+        self.use_faster_whisper = FASTER_WHISPER_AVAILABLE
     
     def split_audio(self, audio_file, segment_duration=600):
         """将音频分割成多个片段（默认10分钟一个片段）"""
@@ -200,18 +212,34 @@ class SegmentTranscriber:
         model_start = time.time()
         
         try:
-            # 延迟导入whisper模块
-            if self.whisper_module is None:
-                self.whisper_module = import_whisper()
+            # 优先使用faster-whisper
+            if self.use_faster_whisper:
+                print(f"使用faster-whisper加载模型: {self.model_size}")
+                
+                # 设置设备
+                device = "cuda" if torch and hasattr(torch, 'cuda') and torch.cuda.is_available() else "cpu"
+                compute_type = "float16" if device == "cuda" else "int8"
+                
+                # 加载faster-whisper模型
+                self.model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+                
+                print(f"faster-whisper模型加载完成，使用设备: {device}")
+            else:
+                # 使用标准whisper库
+                print(f"使用标准whisper加载模型: {self.model_size}")
+                
+                # 延迟导入whisper模块
                 if self.whisper_module is None:
-                    print("错误: 无法导入whisper模块")
-                    return False
-            
-            # 使用正确的模型大小进行加载
-            self.model = self.whisper_module.load_model(self.model_size)
+                    self.whisper_module = import_whisper()
+                    if self.whisper_module is None:
+                        print("错误: 无法导入whisper模块")
+                        return False
+                
+                # 使用正确的模型大小进行加载
+                self.model = self.whisper_module.load_model(self.model_size)
             
             # 记录内存使用情况
-            if hasattr(torch, 'cuda') and torch.cuda.is_available():
+            if torch and hasattr(torch, 'cuda') and torch.cuda.is_available():
                 memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                 memory_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
                 print(f"GPU内存使用: 已分配 {memory_allocated:.2f}GB, 已保留 {memory_reserved:.2f}GB")
@@ -237,24 +265,47 @@ class SegmentTranscriber:
                 print("错误: Whisper模型加载失败")
                 return []
             
-            # 加载音频
-            audio = self.whisper_module.load_audio(str(segment_file))
-            
-            # 转录当前片段
-            result = self.model.transcribe(
-                audio,
-                language=self.language,
-                task="transcribe",
-                fp16=False,
-                condition_on_previous_text=True  # 保持上下文连贯性
-            )
-            
-            # 调整时间戳，加上片段起始时间
-            for segment in result['segments']:
-                segment['start'] += start_time
-                segment['end'] += start_time
-            
-            return result['segments']
+            if self.use_faster_whisper:
+                # 使用faster-whisper进行转录
+                segments, info = self.model.transcribe(
+                    str(segment_file),
+                    language=self.language,
+                    beam_size=5,
+                    best_of=5,
+                    temperature=0.0,
+                    vad_filter=False
+                )
+                
+                # 转换faster-whisper的segments格式为标准格式
+                result_segments = []
+                for segment in segments:
+                    result_segments.append({
+                        'start': segment.start + start_time,
+                        'end': segment.end + start_time,
+                        'text': segment.text.strip()
+                    })
+                
+                return result_segments
+            else:
+                # 使用标准whisper进行转录
+                # 加载音频
+                audio = self.whisper_module.load_audio(str(segment_file))
+                
+                # 转录当前片段
+                result = self.model.transcribe(
+                    audio,
+                    language=self.language,
+                    task="transcribe",
+                    fp16=False,
+                    condition_on_previous_text=True  # 保持上下文连贯性
+                )
+                
+                # 调整时间戳，加上片段起始时间
+                for segment in result['segments']:
+                    segment['start'] += start_time
+                    segment['end'] += start_time
+                
+                return result['segments']
         except Exception as e:
             print(f"片段 {segment_index} 转录失败: {e}")
             return []
@@ -478,12 +529,15 @@ class WhisperTranscriber:
         # 计算每个片段的时长（用于时间戳调整）
         segment_duration = self.state["audio_duration"] / total_segments
         
+        failed_segments = []  # 记录失败的片段
+        
         for i in range(start_from, total_segments):
             segment_file = Path(self.state["segment_files"][i])
             segment_index = i + 1
             
             if not segment_file.exists():
                 print(f"片段文件不存在: {segment_file}")
+                failed_segments.append(segment_index)
                 continue
             
             # 计算片段在原始音频中的起始时间
@@ -516,10 +570,22 @@ class WhisperTranscriber:
                 print(f"片段 {segment_index} 完成，耗时: {format_timedelta(segment_time)}，累计耗时: {format_timedelta(cumulative_time)}")
             else:
                 print(f"片段 {segment_index} 转录失败")
-                return False
+                failed_segments.append(segment_index)
+                # 继续处理下一个片段，而不是立即返回False
+                continue
             
             # 更新总转录时间
             self.timestamps["transcription_time"] = time.time() - transcribe_start
+        
+        # 检查是否所有片段都失败了
+        if len(failed_segments) == total_segments - start_from:
+            print("所有片段转录失败，转录过程终止")
+            return False
+        
+        # 如果有失败的片段，但至少成功了一些，则继续
+        if failed_segments:
+            print(f"警告: 有 {len(failed_segments)} 个片段转录失败: {failed_segments}")
+            print(f"成功转录了 {len(self.state['segments'])}/{total_segments} 个片段")
         
         return True
     
@@ -528,15 +594,48 @@ class WhisperTranscriber:
         # 按时间戳排序所有片段
         all_segments = sorted(self.state["segments"], key=lambda x: x['start'])
         
+        # 去重逻辑：合并相邻的重复字幕
+        deduplicated_segments = []
+        last_text = ""
+        last_segment = None
+        
+        for segment in all_segments:
+            current_text = segment['text'].strip()
+            
+            # 跳过空文本
+            if not current_text:
+                continue
+                
+            # 如果当前文本与上一个相同，且时间间隔小于5秒，合并时间范围
+            if (current_text == last_text and last_segment and 
+                segment['start'] - last_segment['end'] < 5.0):
+                # 扩展上一个片段的结束时间
+                last_segment['end'] = segment['end']
+            else:
+                # 添加新片段
+                deduplicated_segments.append(segment)
+                last_text = current_text
+                last_segment = segment
+        
+        # 统计去重效果
+        original_count = len(all_segments)
+        deduplicated_count = len(deduplicated_segments)
+        
+        if original_count > deduplicated_count:
+            print(f"去重处理: 从 {original_count} 个片段减少到 {deduplicated_count} 个片段")
+            print(f"移除了 {original_count - deduplicated_count} 个重复片段")
+        
         with open(self.output_file, 'w', encoding='utf-8') as f:
             f.write(f"视频: {self.video_path.name}\n")
             f.write(f"模型: {self.model_size}\n")
             f.write(f"语言: {self.language}\n")
             f.write(f"转录时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"音频时长: {format_timedelta(self.state['audio_duration'])}\n")
+            f.write(f"原始片段数: {original_count}\n")
+            f.write(f"去重后片段数: {deduplicated_count}\n")
             f.write("=" * 60 + "\n\n")
             
-            for segment in all_segments:
+            for segment in deduplicated_segments:
                 start = format_timedelta(segment['start'])
                 end = format_timedelta(segment['end'])
                 text = segment['text'].strip()
@@ -609,6 +708,15 @@ class WhisperTranscriber:
         """执行转录过程"""
         print(f"开始转录视频: {self.video_path.name}")
         print(f"使用模型: {self.model_size}, 语言: {self.language}")
+        
+        # 显示使用的库信息
+        if FASTER_WHISPER_AVAILABLE:
+            print("使用库: faster-whisper (高性能版本)")
+        else:
+            print("使用库: 标准whisper")
+            print("提示: 安装faster-whisper可显著提高转录速度")
+            print("      pip install faster-whisper")
+        
         print(f"临时文件目录: {self.temp_base}")
         
         # 如果指定了cleanup，先清理临时文件
@@ -638,17 +746,21 @@ class WhisperTranscriber:
             # 阶段4: 转录所有片段
             transcription_success = self._transcribe_segments()
             
-            # 阶段5: 保存结果（仅在全部成功时保存）
-            if transcription_success and self.state["segments"]:
+            # 阶段5: 保存结果（即使部分成功也保存可用内容）
+            if self.state["segments"]:
                 self._save_final_transcription()
-                print(f"\n转录完成！结果保存在: {self.output_file}")
-            elif self.state["segments"]:
-                # 部分转录完成，但不保存文件
-                print(f"\n转录失败！已转录 {len(self.state['segments'])}/{self.state['total_segments']} 个片段")
-                print("注意：由于转录未全部完成，未生成最终转录文件")
+                if transcription_success:
+                    print(f"\n转录完成！结果保存在: {self.output_file}")
+                else:
+                    print(f"\n转录部分完成！已转录 {len(self.state['segments'])}/{self.state['total_segments']} 个片段")
+                    print(f"部分转录结果已保存: {self.output_file}")
+            else:
+                # 没有任何片段转录成功
+                print("\n转录失败！没有成功转录任何片段")
             
-            if not transcription_success:
-                return False
+            # 即使部分失败，只要成功转录了内容就返回True
+            if self.state["segments"]:
+                transcription_success = True
             
             # 阶段6: 计算总时间
             self.timestamps["total_time"] = time.time() - self.timestamps["start_time"]

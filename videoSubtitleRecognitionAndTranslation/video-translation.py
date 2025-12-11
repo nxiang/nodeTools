@@ -61,7 +61,7 @@ class VideoTranslator:
         初始化视频翻译器
         
         Args:
-            whisper_model: Whisper模型大小 (tiny, base, small, medium, large, large-v1, lage-v2, large-v3, larrge-v3-turbo, turbo)
+            whisper_model: Whisper模型大小 (tiny, base, small, medium, large, large-v1, lage-v2, large-v3, large-v3-turbo, turbo)
             device: 运行设备 (cpu, cuda)
             source_lang: 源语言代码 (ja=日语, en=英语等)
             target_lang: 目标语言代码 (zh-CN=简体中文)
