@@ -11,6 +11,8 @@ import hashlib
 from datetime import datetime
 import subprocess
 import re
+import warnings
+warnings.filterwarnings("ignore")
 
 # 导入torch
 import torch
@@ -101,8 +103,8 @@ class PerformanceTracker:
             print(f"  {stage}: {duration}")
         print("="*50)
 
-class EnhancedVADProcessor:
-    """增强版VAD处理器，专注减少幻觉文本"""
+class WhisperVADProcessor:
+    """Whisper专用VAD处理器，针对弱人声优化"""
     
     def __init__(self, device: str = None):
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -172,43 +174,193 @@ class EnhancedVADProcessor:
             logging.error(f"加载Silero VAD失败: {e}")
             self.available = False
     
-    def detect_speech_with_filters(self, audio: np.ndarray, sr: int = 16000, 
-                                  vad_threshold: float = 0.4,  # 提高阈值减少误检
-                                  min_speech_duration_ms: int = 400,  # 增加最小时长
-                                  max_speech_duration_s: float = 8.0,  # 添加最大时长限制
-                                  frequency_filter: bool = True) -> List[Dict[str, float]]:
-        """检测语音段，带多种过滤器减少幻觉"""
+    def enhance_weak_voice(self, audio: np.ndarray, sr: int = 16000) -> np.ndarray:
+        """增强弱人声，特别针对耳语、轻声等"""
+        try:
+            import scipy.signal as signal
+            
+            # 1. 确保音频是float32类型
+            if audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            
+            # 2. 计算RMS能量
+            rms = np.sqrt(np.mean(audio**2))
+            if rms < 1e-6:
+                return audio  # 静音，直接返回
+            
+            # 3. 标准化到-1到1范围（保持相对动态范围）
+            max_val = np.max(np.abs(audio))
+            if max_val > 0:
+                audio = audio / max_val
+            
+            # 4. 多频段动态均衡 - 特别增强人声频率范围
+            nyquist = sr // 2
+            
+            # 定义人声关键频率带
+            frequency_bands = [
+                (80, 300, 2.0),   # 低频共振区（男性声音基础频率）- 中等增强
+                (300, 1000, 3.0), # 主要元音区 - 强增强
+                (1000, 3000, 2.5), # 辅音和语音清晰度 - 强增强
+                (3000, 5000, 1.5), # 高音和细节 - 轻微增强
+            ]
+            
+            enhanced_bands = []
+            for lowcut, highcut, gain in frequency_bands:
+                if highcut < nyquist:
+                    # 设计带通滤波器
+                    b, a = signal.butter(
+                        4, 
+                        [lowcut/nyquist, highcut/nyquist], 
+                        btype='band'
+                    )
+                    
+                    # 应用滤波器
+                    filtered = signal.filtfilt(b, a, audio)
+                    
+                    # 动态压缩：对弱信号部分增强更多
+                    # 使用soft knee压缩曲线
+                    threshold = 0.05  # 低阈值，更多信号被增强
+                    ratio = 3.0  # 压缩比
+                    
+                    # 计算压缩量
+                    abs_filtered = np.abs(filtered)
+                    gain_reduction = np.where(
+                        abs_filtered > threshold,
+                        1.0 / ratio,  # 超过阈值部分压缩
+                        1.0 + (1.0 - abs_filtered/threshold) * (gain - 1.0)  # 弱信号线性增强
+                    )
+                    
+                    # 应用压缩
+                    compressed = filtered * gain_reduction
+                    
+                    enhanced_bands.append(compressed)
+            
+            # 5. 合并所有频段
+            if enhanced_bands:
+                # 加权合并，重点增强中频段
+                weights = [0.7, 1.0, 0.9, 0.6]  # 对应上面的频段
+                weighted_sum = np.zeros_like(audio)
+                total_weight = 0
+                
+                for i, band in enumerate(enhanced_bands):
+                    if i < len(weights):
+                        weighted_sum += band * weights[i]
+                        total_weight += weights[i]
+                
+                if total_weight > 0:
+                    enhanced_audio = weighted_sum / total_weight
+                else:
+                    enhanced_audio = np.sum(enhanced_bands, axis=0) / len(enhanced_bands)
+            else:
+                enhanced_audio = audio
+            
+            # 6. 自适应噪声门
+            # 计算短期能量
+            frame_length = int(0.02 * sr)  # 20ms帧
+            hop_length = frame_length // 2
+            
+            energy = []
+            for i in range(0, len(enhanced_audio) - frame_length, hop_length):
+                frame = enhanced_audio[i:i+frame_length]
+                energy.append(np.mean(frame**2))
+            
+            if energy:
+                energy = np.array(energy)
+                energy_db = 10 * np.log10(energy + 1e-10)
+                
+                # 自适应阈值
+                mean_db = np.mean(energy_db)
+                std_db = np.std(energy_db)
+                
+                # 对于非常安静的内容，使用更低的阈值
+                if mean_db < -40:
+                    threshold_db = mean_db + std_db * 0.5
+                else:
+                    threshold_db = mean_db - std_db * 1.0
+                
+                # 应用噪声门（软阈值）
+                threshold_linear = 10**(threshold_db/10)
+                
+                gated_audio = enhanced_audio.copy()
+                for i in range(0, len(gated_audio) - frame_length, hop_length):
+                    frame_start = i
+                    frame_end = i + frame_length
+                    frame = gated_audio[frame_start:frame_end]
+                    
+                    frame_energy = np.mean(frame**2)
+                    
+                    if frame_energy < threshold_linear * 0.1:
+                        # 完全静音
+                        gated_audio[frame_start:frame_end] *= 0.01
+                    elif frame_energy < threshold_linear:
+                        # 软过渡
+                        attenuation = (frame_energy / threshold_linear) ** 0.5
+                        gated_audio[frame_start:frame_end] *= attenuation
+            
+            # 7. 最终标准化，避免削波
+            max_val = np.max(np.abs(gated_audio))
+            if max_val > 0:
+                gated_audio = gated_audio / max_val * 0.95  # 保留5%的headroom
+            
+            return gated_audio
+            
+        except Exception as e:
+            logging.warning(f"弱人声增强失败: {e}")
+            return audio
+    
+    def detect_weak_speech(self, audio: np.ndarray, sr: int = 16000, 
+                          vad_threshold: float = 0.2,  # 更低的阈值以检测弱语音
+                          min_speech_duration_ms: int = 200,  # 更短的最小时长
+                          aggressive_mode: bool = True) -> List[Dict[str, float]]:
+        """专门检测弱人声，针对成人内容中的轻声、耳语优化"""
         if not self.available or self.model is None:
             return []
         
         try:
-            # 确保音频是单声道
-            if len(audio.shape) > 1:
-                audio = audio.mean(axis=0) if audio.shape[0] > 1 else audio[0]
+            # 1. 增强弱人声
+            enhanced_audio = self.enhance_weak_voice(audio, sr)
             
-            # 确保音频是float32类型
-            audio = audio.astype(np.float32)
+            # 2. 确保音频是单声道
+            if len(enhanced_audio.shape) > 1:
+                enhanced_audio = enhanced_audio.mean(axis=0) if enhanced_audio.shape[0] > 1 else enhanced_audio[0]
             
-            # 1. 音频能量分析，过滤极低能量段
-            audio_energy = np.mean(np.abs(audio))
-            if audio_energy < 0.001:  # 能量太低，可能全是静音
-                logging.debug(f"音频能量过低 ({audio_energy:.6f})，跳过VAD检测")
-                return []
+            # 3. 确保音频是float32类型
+            enhanced_audio = enhanced_audio.astype(np.float32)
             
-            # 2. 转换为PyTorch张量并移动到设备
-            audio_tensor = torch.from_numpy(audio).to(self.device)
+            # 4. 转换为PyTorch张量并移动到设备
+            audio_tensor = torch.from_numpy(enhanced_audio).to(self.device)
             
-            # 3. 使用较严格的VAD参数检测语音时间戳
+            # 5. 根据模式选择VAD参数
+            if aggressive_mode:
+                # 激进模式：检测更多可能的语音段
+                vad_params = {
+                    "threshold": vad_threshold,  # 低阈值
+                    "min_speech_duration_ms": min_speech_duration_ms,
+                    "min_silence_duration_ms": 100,  # 较短的静音间隔
+                    "window_size_samples": 256,  # 更小的窗口，提高时间分辨率
+                    "speech_pad_ms": 100,
+                }
+            else:
+                # 保守模式
+                vad_params = {
+                    "threshold": max(vad_threshold, 0.3),  # 稍高的阈值
+                    "min_speech_duration_ms": 300,
+                    "min_silence_duration_ms": 200,
+                    "window_size_samples": 512,
+                    "speech_pad_ms": 100,
+                }
+            
+            # 6. 检测语音时间戳
             vad_start = time.time()
             
             timestamps = get_speech_timestamps(
                 audio_tensor, 
                 self.model,
-                threshold=vad_threshold,
-                min_speech_duration_ms=min_speech_duration_ms,
-                min_silence_duration_ms=200,  # 增加静音时长
-                window_size_samples=512,
-                speech_pad_ms=100,
+                threshold=vad_params["threshold"],
+                min_speech_duration_ms=vad_params["min_speech_duration_ms"],
+                min_silence_duration_ms=vad_params["min_silence_duration_ms"],
+                window_size_samples=vad_params["window_size_samples"],
+                speech_pad_ms=vad_params["speech_pad_ms"],
                 return_seconds=True
             )
             
@@ -217,46 +369,37 @@ class EnhancedVADProcessor:
             if not timestamps:
                 return []
             
-            # 4. 过滤过长的语音段（很可能是背景音乐/噪声）
+            # 7. 后处理：过滤可能的噪声段
             filtered_timestamps = []
             for ts in timestamps:
-                duration = ts['end'] - ts['start']
-                
-                # 过滤标准
-                if duration > max_speech_duration_s:
-                    logging.debug(f"过滤过长的语音段: {duration:.2f}s > {max_speech_duration_s}s")
-                    continue
-                
-                if duration < 0.4:  # 小于400ms的片段
-                    logging.debug(f"过滤过短的语音段: {duration:.2f}s")
-                    continue
-                
-                # 5. 提取音频段进行进一步分析
+                # 提取原始音频段（使用原始音频进行能量分析）
                 start_sample = int(ts['start'] * sr)
                 end_sample = int(ts['end'] * sr)
                 segment_audio = audio[start_sample:end_sample]
                 
-                # 计算段内特征
+                # 计算能量特征
                 segment_energy = np.mean(np.abs(segment_audio))
-                segment_std = np.std(segment_audio)
+                total_energy = np.mean(np.abs(audio))
                 
-                # 过滤能量太低或变化太小的段（可能是恒定噪声）
-                if segment_energy < audio_energy * 0.3:
-                    logging.debug(f"过滤低能量语音段: {segment_energy:.6f}")
+                # 跳过能量过低的段（可能是VAD误检）
+                if segment_energy < total_energy * 0.1 and segment_energy < 0.001:
+                    logging.debug(f"过滤低能量段: {ts['start']:.2f}-{ts['end']:.2f}s, 能量比: {segment_energy/total_energy:.3f}")
                     continue
                 
-                if segment_std < 0.01:  # 变化太小
-                    logging.debug(f"过滤低变化语音段: {segment_std:.6f}")
+                # 计算过零率（人声通常较低）
+                zero_crossings = np.sum(np.abs(np.diff(np.sign(segment_audio)))) / len(segment_audio)
+                if zero_crossings > 0.4:  # 过零率太高，可能是噪声
+                    logging.debug(f"过滤高过零率段: {ts['start']:.2f}-{ts['end']:.2f}s, 过零率: {zero_crossings:.3f}")
                     continue
                 
                 filtered_timestamps.append(ts)
             
-            logging.debug(f"VAD检测: 原始 {len(timestamps)} 个，过滤后 {len(filtered_timestamps)} 个，耗时 {vad_time:.3f}秒")
+            logging.debug(f"弱人声检测: 原始 {len(timestamps)} 个，过滤后 {len(filtered_timestamps)} 个，耗时 {vad_time:.3f}秒")
             
             return filtered_timestamps
             
         except Exception as e:
-            logging.error(f"VAD检测失败: {e}")
+            logging.error(f"弱人声检测失败: {e}")
             return []
 
 class AudioProcessor:
@@ -592,14 +735,17 @@ class ProgressManager:
         self.state["end_time"] = datetime.now().isoformat()
         self.save_progress()
 
-class AntiHallucinationTranscriber:
-    """抗幻觉转录器 - 专门解决幻觉文本问题"""
+class WeakVoiceTranscriber:
+    """弱人声转录器 - 专门针对成人内容中的轻声、耳语优化"""
     
     def __init__(self, input_file: str, model_name: str, language: str = "ja", 
                  overlap_seconds: float = 2.0, use_silero_vad: bool = True,
-                 vad_threshold: float = 0.4, min_speech_duration_ms: int = 400,
-                 max_speech_duration_s: float = 8.0,
-                 adult_mode: bool = True, filter_hallucinations: bool = True):
+                 vad_threshold: float = 0.2, min_speech_duration_ms: int = 200,
+                 aggressive_vad: bool = True,  # 激进VAD模式，检测更多弱语音
+                 whisper_temperature: float = 0.0,  # 使用确定性采样
+                 whisper_beam_size: int = 5,
+                 adult_mode: bool = True,
+                 filter_hallucinations: bool = True):
         self.input_file = os.path.abspath(input_file)
         self.model_name = model_name
         self.language = language
@@ -607,33 +753,19 @@ class AntiHallucinationTranscriber:
         self.use_silero_vad = use_silero_vad
         self.vad_threshold = vad_threshold
         self.min_speech_duration_ms = min_speech_duration_ms
-        self.max_speech_duration_s = max_speech_duration_s
+        self.aggressive_vad = aggressive_vad
+        self.whisper_temperature = whisper_temperature
+        self.whisper_beam_size = whisper_beam_size
         self.adult_mode = adult_mode
         self.filter_hallucinations = filter_hallucinations
         
-        # 幻觉文本黑名单（日语）
+        # 幻觉文本黑名单
         self.hallucination_patterns = [
-            # 常见的结束语幻觉
             r'ご視聴ありがとうございました[。.]*$',
             r'ご視聴ありがとうございます[。.]*$',
-            r'ありがとうございました[。.]*$',
-            r'ご覧いただきありがとうございました[。.]*$',
-            r'本日の放送はこれで終了です[。.]*$',
-            r'お楽しみいただけましたでしょうか[。.]*$',
-            
-            # 常见的开场白幻觉
             r'これは日本語の音声です[。.]*$',
-            r'こんにちは[。.]*$',
-            r'よろしくお願いします[。.]*$',
-            
-            # 其他常见幻觉
-            r'お疲れ様でした[。.]*$',
-            r'失礼します[。.]*$',
-            r'どうもありがとうございました[。.]*$',
+            r'音声です[。.]*$',
             r'以上です[。.]*$',
-            
-            # 成人内容特定幻觉（根据您的数据）
-            r'音声です[。.]*$',  # 您的数据中有"音声です"
         ]
         
         # 创建临时目录
@@ -651,23 +783,24 @@ class AntiHallucinationTranscriber:
         self.model = None
         self.vad_processor = None
         
-        # 初始化Silero VAD
+        # 初始化VAD处理器
         if self.use_silero_vad and SILERO_VAD_AVAILABLE:
-            self.performance.start_stage("VAD模型加载")
-            self.vad_processor = EnhancedVADProcessor()
+            self.performance.start_stage("弱人声VAD模型加载")
+            self.vad_processor = WhisperVADProcessor()
             if self.vad_processor.available:
-                logging.info("成功启用增强版VAD，专注减少幻觉")
+                logging.info("成功启用弱人声VAD，专注检测轻声、耳语")
                 self.use_silero_vad = True
             else:
-                logging.warning("Silero VAD不可用，将回退到faster-whisper内置VAD")
+                logging.warning("VAD不可用，将回退到faster-whisper内置VAD")
                 self.use_silero_vad = False
             self.performance.end_stage()
         else:
             logging.info("使用faster-whisper内置VAD")
         
         logging.info(f"初始化完成: 输入={self.input_file}, 模型={model_name}, 语言={language}")
-        logging.info(f"抗幻觉模式: {filter_hallucinations}")
-        logging.info(f"VAD设置: 阈值={vad_threshold}, 最小语音时长={min_speech_duration_ms}ms, 最大语音时长={max_speech_duration_s}s")
+        logging.info(f"VAD模式: {'激进' if aggressive_vad else '保守'}, 阈值={vad_threshold}")
+        logging.info(f"Whisper参数: temperature={whisper_temperature}, beam_size={whisper_beam_size}")
+        logging.info(f"成人模式: {adult_mode}, 抗幻觉: {filter_hallucinations}")
         logging.info(f"临时目录: {self.temp_dir}")
     
     def _setup_logging(self):
@@ -713,55 +846,64 @@ class AntiHallucinationTranscriber:
             raise
     
     def _get_transcription_options(self, use_external_vad: bool = False):
-        """获取转录参数 - 针对抗幻觉优化"""
+        """获取转录参数 - 针对弱人声优化"""
         options = {
             "language": self.language,
-            "beam_size": 3,  # 降低束搜索宽度，减少幻觉
-            "best_of": 3,    # 减少采样次数
-            "temperature": 0.0,  # 只使用确定性采样
+            "beam_size": self.whisper_beam_size,
+            "best_of": 3,
+            "temperature": self.whisper_temperature,
             "patience": 1.0,
-            "condition_on_previous_text": False,  # 关闭上下文依赖，减少重复幻觉
+            "condition_on_previous_text": False,  # 关闭上下文依赖，减少幻觉
             "word_timestamps": False,
-            "compression_ratio_threshold": 1.8,  # 降低压缩比阈值，过滤长文本
-            "no_speech_threshold": 0.7,  # 提高无语音阈值，减少在静音上的幻觉
-            "suppress_tokens": [-1],  # 不抑制特定token
+            "compression_ratio_threshold": 2.0,
+            "no_speech_threshold": 0.4,  # 降低无语音阈值，转录更多可能包含语音的段
+            "suppress_tokens": [-1],
         }
         
-        # 关键：根据是否使用外部VAD设置vad_filter
+        # 根据是否使用外部VAD设置vad_filter
         if use_external_vad:
             options["vad_filter"] = False  # 使用外部VAD时关闭内置VAD
         else:
             options["vad_filter"] = True  # 使用内置VAD
             
-        # 关键：使用抗幻觉提示词
-        if self.language == "ja":
-            # 使用更中性的提示词，避免引导模型产生特定内容
+        # 针对日语成人内容优化提示词
+        if self.language == "ja" and self.adult_mode:
+            # 使用中性的提示词，避免引导
             options["initial_prompt"] = "音声を正確に書き起こしてください。"
         
         return options
     
-    def _transcribe_with_enhanced_vad(self, audio: np.ndarray, chunk_start_time: float, 
-                                     chunk_id: int, sr: int = 16000) -> Dict:
-        """使用增强版VAD进行转录 - 专注抗幻觉"""
+    def _transcribe_weak_voice(self, audio: np.ndarray, chunk_start_time: float, 
+                              chunk_id: int, sr: int = 16000) -> Dict:
+        """转录弱人声 - 专门针对轻声、耳语优化"""
         try:
-            # 使用增强版VAD检测语音段
+            # 使用弱人声VAD检测语音段
             vad_start = time.time()
             
-            speech_timestamps = self.vad_processor.detect_speech_with_filters(
+            speech_timestamps = self.vad_processor.detect_weak_speech(
                 audio, sr=sr,
                 vad_threshold=self.vad_threshold,
                 min_speech_duration_ms=self.min_speech_duration_ms,
-                max_speech_duration_s=self.max_speech_duration_s,
-                frequency_filter=True
+                aggressive_mode=self.aggressive_vad
             )
             
             vad_time = time.time() - vad_start
             
             if not speech_timestamps:
-                logging.info(f"chunk {chunk_id}: 未检测到有效语音段")
-                return self._create_empty_result(chunk_id, chunk_start_time, audio, sr)
+                logging.info(f"chunk {chunk_id}: 未检测到语音段")
+                return {
+                    "chunk_id": chunk_id,
+                    "chunk_start": chunk_start_time,
+                    "chunk_end": chunk_start_time + len(audio)/sr,
+                    "segments": [],
+                    "language": self.language,
+                    "vad_type": "weak_voice",
+                    "vad_time": vad_time,
+                    "speech_segments": 0,
+                    "transcribed_segments": 0,
+                }
             
-            logging.info(f"chunk {chunk_id}: 检测到 {len(speech_timestamps)} 个有效语音段")
+            logging.info(f"chunk {chunk_id}: 检测到 {len(speech_timestamps)} 个语音段")
             
             # 转录每个语音段
             all_segments = []
@@ -778,12 +920,34 @@ class AntiHallucinationTranscriber:
                 absolute_end = chunk_start_time + ts['end']
                 duration = ts['end'] - ts['start']
                 
+                # 跳过极短的段
+                if duration < 0.15:  # 小于150ms
+                    continue
+                
+                # 对弱语音段进行额外增强
+                try:
+                    import scipy.signal as signal
+                    
+                    # 计算段内能量
+                    segment_energy = np.mean(np.abs(segment_audio))
+                    
+                    # 如果能量很低，进行额外增强
+                    if segment_energy < 0.05:
+                        # 应用额外的动态范围压缩
+                        compressed = np.sign(segment_audio) * np.log1p(np.abs(segment_audio) * 10)
+                        max_val = np.max(np.abs(compressed))
+                        if max_val > 0:
+                            compressed = compressed / max_val
+                        segment_audio = compressed
+                except:
+                    pass  # 增强失败也没关系
+                
                 # 转录
                 segment_start = time.time()
                 try:
                     segments, info = self.model.transcribe(
                         segment_audio,
-                        **transcription_options  # 已包含vad_filter=False
+                        **transcription_options
                     )
                     
                     segment_time = time.time() - segment_start
@@ -793,10 +957,10 @@ class AntiHallucinationTranscriber:
                     for segment in segments:
                         text = segment.text.strip()
                         
-                        # 关键：应用抗幻觉过滤
+                        # 应用抗幻觉过滤
                         filtered_text = self._filter_hallucination_text(text, duration)
                         
-                        if filtered_text:  # 只有非空文本才保留
+                        if filtered_text:
                             segment_dict = {
                                 "start": absolute_start + segment.start,
                                 "end": absolute_start + segment.end,
@@ -804,9 +968,10 @@ class AntiHallucinationTranscriber:
                                 "chunk_id": chunk_id,
                                 "segment_index": i,
                                 "duration": duration,
-                                "original_text": text,  # 保留原始文本用于调试
+                                "original_text": text,
                                 "confidence": segment.avg_logprob if hasattr(segment, 'avg_logprob') else 0.0,
                                 "no_speech_prob": segment.no_speech_prob if hasattr(segment, 'no_speech_prob') else 0.0,
+                                "is_weak_voice": "true" if segment_energy < 0.1 and 'segment_energy' in locals() else "false",
                             }
                             all_segments.append(segment_dict)
                             segment_texts.append(filtered_text)
@@ -818,7 +983,7 @@ class AntiHallucinationTranscriber:
                     logging.warning(f"语音段 {i+1} 转录失败: {e}")
                     continue
             
-            # 关键：后处理，移除重复和相似的片段
+            # 后处理：合并相邻的相似片段
             filtered_segments = self._post_process_segments(all_segments)
             
             return {
@@ -827,7 +992,7 @@ class AntiHallucinationTranscriber:
                 "chunk_end": chunk_start_time + len(audio)/sr,
                 "segments": filtered_segments,
                 "language": self.language,
-                "vad_type": "enhanced",
+                "vad_type": "weak_voice",
                 "vad_time": vad_time,
                 "speech_segments": len(speech_timestamps),
                 "transcribed_segments": len(filtered_segments),
@@ -835,7 +1000,7 @@ class AntiHallucinationTranscriber:
             }
             
         except Exception as e:
-            logging.error(f"增强版VAD转录失败: {e}")
+            logging.error(f"弱人声转录失败: {e}")
             return None
     
     def _filter_hallucination_text(self, text: str, duration: float) -> str:
@@ -843,40 +1008,35 @@ class AntiHallucinationTranscriber:
         if not text or len(text.strip()) == 0:
             return ""
         
-        # 0. 如果是非常长的文本（可能是一大段幻觉）
-        if len(text) > 100:  # 超过100字符的文本
-            logging.debug(f"过滤过长的文本: {text[:50]}...")
-            return ""
-        
-        # 1. 检查是否是幻觉模式
+        # 幻觉模式匹配
         if self.filter_hallucinations:
             for pattern in self.hallucination_patterns:
                 if re.match(pattern, text.strip()):
                     logging.debug(f"过滤幻觉文本: {text}")
                     return ""
         
-        # 2. 过滤成人内容中的特定模式（如有需要）
+        # 成人内容特定过滤
         if self.adult_mode:
-            # 可以根据需要添加成人内容特定的过滤
+            # 可以根据需要添加
             pass
         
-        # 3. 检查文本是否与duration匹配
-        # 日语平均语速约为5-7字符/秒
+        # 检查文本长度是否合理
+        # 日语平均语速：4-7字符/秒
         chars_per_second = len(text) / duration if duration > 0 else 0
         
-        # 如果语速异常（太慢或太快），可能是幻觉
-        if duration > 2.0 and chars_per_second < 1.0:  # 超过2秒但少于1字符/秒
-            logging.debug(f"过滤语速异常文本: {text} (语速: {chars_per_second:.1f}字符/秒)")
+        # 如果语速异常慢或异常快，可能是幻觉
+        if duration > 3.0 and chars_per_second < 0.5:  # 超过3秒但少于0.5字符/秒
+            logging.debug(f"过滤语速异常慢文本: {text} ({chars_per_second:.1f}字符/秒)")
             return ""
         
-        if chars_per_second > 15.0:  # 超过15字符/秒，异常快
-            logging.debug(f"过滤语速异常文本: {text} (语速: {chars_per_second:.1f}字符/秒)")
+        if chars_per_second > 12.0:  # 超过12字符/秒，异常快
+            logging.debug(f"过滤语速异常快文本: {text} ({chars_per_second:.1f}字符/秒)")
             return ""
         
         return text.strip()
     
     def _post_process_segments(self, segments: List[Dict]) -> List[Dict]:
-        """后处理：移除重复和相似的片段"""
+        """后处理：合并相邻的相似片段"""
         if not segments:
             return []
         
@@ -889,54 +1049,45 @@ class AntiHallucinationTranscriber:
         for segment in segments:
             current_text = segment["text"]
             
-            # 跳过空文本
             if not current_text:
                 continue
             
-            # 如果是第一个片段，直接添加
             if not last_segment:
                 filtered.append(segment)
                 last_segment = segment
                 continue
             
-            # 检查是否与上一个片段重叠太多
+            # 检查时间重叠
             overlap = min(last_segment["end"], segment["end"]) - max(last_segment["start"], segment["start"])
-            if overlap > 0.5:  # 重叠超过0.5秒
-                # 选择置信度更高的片段
+            gap = segment["start"] - last_segment["end"]
+            
+            # 如果重叠或间隔很短，且文本相似，合并
+            if (overlap > 0.1 or gap < 0.3) and self._texts_are_similar(last_segment["text"], current_text):
+                # 合并
+                last_segment["end"] = segment["end"]
+                # 合并文本（选择更长的或置信度更高的）
                 last_confidence = last_segment.get("confidence", 0)
                 current_confidence = segment.get("confidence", 0)
                 
                 if current_confidence > last_confidence:
-                    # 用当前片段替换上一个片段
-                    filtered[-1] = segment
-                    last_segment = segment
-                # 否则保持上一个片段
+                    last_segment["text"] = current_text
+                    last_segment["confidence"] = current_confidence
+                
                 continue
             
-            # 检查文本是否相似（可能是重复的幻觉）
-            if self._texts_are_similar(last_segment["text"], current_text):
-                # 合并相似的片段
-                last_segment["end"] = segment["end"]
-                last_segment["text"] = last_segment["text"]  # 保持第一个文本
-                # 更新置信度为平均值
-                if "confidence" in last_segment and "confidence" in segment:
-                    last_segment["confidence"] = (last_segment["confidence"] + segment["confidence"]) / 2
-                continue
-            
-            # 否则添加新片段
             filtered.append(segment)
             last_segment = segment
         
         return filtered
     
-    def _texts_are_similar(self, text1: str, text2: str, threshold: float = 0.8) -> bool:
+    def _texts_are_similar(self, text1: str, text2: str, threshold: float = 0.7) -> bool:
         """判断两个文本是否相似"""
-        # 简单的文本相似度检查
+        import difflib
+        
         if text1 == text2:
             return True
         
         # 去除标点
-        import difflib
         clean1 = re.sub(r'[、。,!?]', '', text1)
         clean2 = re.sub(r'[、。,!?]', '', text2)
         
@@ -945,20 +1096,6 @@ class AntiHallucinationTranscriber:
         
         return similarity > threshold
     
-    def _create_empty_result(self, chunk_id: int, chunk_start_time: float, 
-                            audio: np.ndarray, sr: int) -> Dict:
-        """创建空结果"""
-        return {
-            "chunk_id": chunk_id,
-            "chunk_start": chunk_start_time,
-            "chunk_end": chunk_start_time + len(audio)/sr,
-            "segments": [],
-            "language": self.language,
-            "vad_type": "enhanced",
-            "speech_segments": 0,
-            "transcribed_segments": 0,
-        }
-    
     def _transcribe_with_builtin_vad(self, audio: np.ndarray, chunk_start_time: float,
                                     chunk_id: int, sr: int = 16000) -> Dict:
         """使用faster-whisper内置VAD进行转录"""
@@ -966,12 +1103,12 @@ class AntiHallucinationTranscriber:
             # 转录参数
             transcription_options = self._get_transcription_options(use_external_vad=False)
             
-            # 内置VAD参数 - 使用更严格的参数减少幻觉
+            # 内置VAD参数 - 针对弱人声优化
             vad_params = {
-                "threshold": 0.2,  # 提高阈值
-                "min_speech_duration_ms": 200,
-                "max_speech_duration_s": self.max_speech_duration_s,  # 使用配置的最大时长
-                "min_silence_duration_ms": 300,  # 增加静音时长
+                "threshold": 0.15,  # 低阈值
+                "min_speech_duration_ms": 150,
+                "max_speech_duration_s": 30,
+                "min_silence_duration_ms": 150,
                 "speech_pad_ms": 100,
             }
             
@@ -979,7 +1116,7 @@ class AntiHallucinationTranscriber:
             segments, info = self.model.transcribe(
                 audio,
                 vad_parameters=vad_params,
-                **transcription_options  # 已包含vad_filter=True
+                **transcription_options
             )
             
             # 处理结果
@@ -991,13 +1128,13 @@ class AntiHallucinationTranscriber:
                 # 应用抗幻觉过滤
                 filtered_text = self._filter_hallucination_text(text, duration)
                 
-                if filtered_text:  # 只保留非空文本
+                if filtered_text:
                     segment_dict = {
                         "start": chunk_start_time + segment.start,
                         "end": chunk_start_time + segment.end,
                         "text": filtered_text,
                         "chunk_id": chunk_id,
-                        "original_text": text,  # 保留原始文本用于调试
+                        "original_text": text,
                         "confidence": segment.avg_logprob if hasattr(segment, 'avg_logprob') else 0.0,
                         "no_speech_prob": segment.no_speech_prob if hasattr(segment, 'no_speech_prob') else 0.0,
                     }
@@ -1018,19 +1155,15 @@ class AntiHallucinationTranscriber:
             }
             
         except Exception as e:
-            logging.error(f"使用内置VAD转录chunk {chunk_id}失败: {e}")
+            logging.error(f"使用内置VAD转录失败: {e}")
             return None
     
     def transcribe_chunk(self, chunk_id: int, chunk_path: str, chunk_start_time: float) -> Dict:
         """转录单个chunk"""
         try:
-            # 检查chunk文件是否存在且有效
-            if not os.path.exists(chunk_path):
-                logging.error(f"chunk文件不存在: {chunk_path}")
-                return None
-                
-            if os.path.getsize(chunk_path) == 0:
-                logging.error(f"chunk文件为空: {chunk_path}")
+            # 检查chunk文件
+            if not os.path.exists(chunk_path) or os.path.getsize(chunk_path) == 0:
+                logging.error(f"chunk文件无效: {chunk_path}")
                 return None
             
             # 加载chunk音频
@@ -1038,9 +1171,9 @@ class AntiHallucinationTranscriber:
             try:
                 audio, sr = librosa.load(chunk_path, sr=16000, mono=True)
                 
-                # 检查音频数据是否有效
-                if len(audio) == 0 or np.max(np.abs(audio)) < 0.001:
-                    logging.warning(f"chunk {chunk_id} 音频数据过小或无效")
+                # 检查音频数据
+                if len(audio) == 0 or np.max(np.abs(audio)) < 0.0001:
+                    logging.warning(f"chunk {chunk_id} 音频数据过小")
                     return {
                         "chunk_id": chunk_id,
                         "chunk_start": chunk_start_time,
@@ -1054,7 +1187,7 @@ class AntiHallucinationTranscriber:
             
             # 根据VAD设置选择转录方法
             if self.use_silero_vad and self.vad_processor and self.vad_processor.available:
-                result = self._transcribe_with_enhanced_vad(audio, chunk_start_time, chunk_id, sr)
+                result = self._transcribe_weak_voice(audio, chunk_start_time, chunk_id, sr)
             else:
                 result = self._transcribe_with_builtin_vad(audio, chunk_start_time, chunk_id, sr)
             
@@ -1097,8 +1230,8 @@ class AntiHallucinationTranscriber:
             # 4. 转录处理
             self.performance.start_stage("转录处理")
             
-            # 统计幻觉文本过滤情况
             total_hallucinations_filtered = 0
+            total_weak_voice_segments = 0
             
             for chunk_id, chunk_path, start_time in chunks:
                 # 跳过已完成的chunk
@@ -1127,7 +1260,12 @@ class AntiHallucinationTranscriber:
                     filtered_hallucinations = result.get("filtered_hallucinations", 0)
                     total_hallucinations_filtered += filtered_hallucinations
                     
-                    logging.info(f"完成chunk {chunk_id}，VAD: {vad_type}, 语音段: {speech_segments}, 转录段: {transcribed_segments}, 过滤幻觉: {filtered_hallucinations}, 耗时: {TimeFormatter.format_seconds(chunk_time)}")
+                    # 统计弱人声片段
+                    segments = result.get("segments", [])
+                    weak_segments = sum(1 for seg in segments if seg.get("is_weak_voice", False))
+                    total_weak_voice_segments += weak_segments
+                    
+                    logging.info(f"完成chunk {chunk_id}，VAD: {vad_type}, 语音段: {speech_segments}, 转录段: {transcribed_segments}, 弱人声: {weak_segments}, 过滤幻觉: {filtered_hallucinations}, 耗时: {TimeFormatter.format_seconds(chunk_time)}")
                 else:
                     logging.warning(f"chunk {chunk_id} 转录失败，跳过")
             
@@ -1149,7 +1287,7 @@ class AntiHallucinationTranscriber:
             audio_duration = self.audio_processor.audio_info['duration']
             
             print("\n" + "="*70)
-            print(f"转录完成!")
+            print(f"弱人声转录完成!")
             print("="*70)
             print(f"音频时长: {TimeFormatter.format_seconds(audio_duration)}")
             print(f"总处理时间: {TimeFormatter.format_seconds(total_time)}")
@@ -1157,16 +1295,15 @@ class AntiHallucinationTranscriber:
             if audio_duration > 0:
                 real_time_factor = total_time / audio_duration
                 print(f"实时因子: {real_time_factor:.2f}x")
-            else:
-                print("实时因子: 无法计算（音频时长为0）")
             
-            print(f"\n抗幻觉统计:")
+            print(f"\n弱人声检测统计:")
             print(f"  过滤幻觉文本总数: {total_hallucinations_filtered}")
+            print(f"  检测到弱人声片段: {total_weak_voice_segments}")
             print(f"  最终有效片段数: {final_result.get('info', {}).get('total_segments', 0)}")
-            print(f"  VAD类型: {'增强版VAD' if self.use_silero_vad else '内置VAD'}")
+            print(f"  VAD类型: {'弱人声专用VAD' if self.use_silero_vad else '内置VAD'}")
+            print(f"  VAD模式: {'激进' if self.aggressive_vad else '保守'}")
             print(f"  VAD阈值: {self.vad_threshold}")
             print(f"  最小语音时长: {self.min_speech_duration_ms}ms")
-            print(f"  最大语音时长: {self.max_speech_duration_s}s")
             
             print(f"\n临时文件位置: {self.temp_dir}")
             print("="*70)
@@ -1195,7 +1332,7 @@ class AntiHallucinationTranscriber:
         # 按开始时间排序
         all_segments.sort(key=lambda x: x["start"])
         
-        # 最终过滤：移除过于相似的相邻片段
+        # 最终过滤：移除重复片段
         filtered_segments = []
         last_segment = None
         
@@ -1222,10 +1359,12 @@ class AntiHallucinationTranscriber:
                 "total_segments": len(filtered_segments),
                 "original_segments": len(all_segments),
                 "filtered_segments": len(all_segments) - len(filtered_segments),
-                "vad_type": "enhanced" if self.use_silero_vad else "builtin",
+                "vad_type": "weak_voice" if self.use_silero_vad else "builtin",
                 "vad_threshold": self.vad_threshold,
                 "min_speech_duration_ms": self.min_speech_duration_ms,
-                "max_speech_duration_s": self.max_speech_duration_s,
+                "aggressive_vad": self.aggressive_vad,
+                "whisper_temperature": self.whisper_temperature,
+                "whisper_beam_size": self.whisper_beam_size,
                 "adult_mode": self.adult_mode,
                 "filter_hallucinations": self.filter_hallucinations,
                 "overlap_seconds": self.overlap_seconds,
@@ -1240,7 +1379,7 @@ class AntiHallucinationTranscriber:
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         
-        # TXT格式（包含时间信息）
+        # TXT格式
         txt_path = os.path.join(self.temp_dir, "transcription.txt")
         with open(txt_path, 'w', encoding='utf-8') as f:
             # 写入文件头信息
@@ -1248,7 +1387,7 @@ class AntiHallucinationTranscriber:
             f.write(f"模型: {result.get('info', {}).get('model', 'Unknown')}\n")
             f.write(f"语言: {result.get('language', 'Unknown')}\n")
             f.write(f"VAD类型: {result.get('info', {}).get('vad_type', 'Unknown')}\n")
-            f.write(f"抗幻觉模式: {'启用' if self.filter_hallucinations else '禁用'}\n")
+            f.write(f"弱人声优化: 启用\n")
             f.write(f"总片段数: {result.get('info', {}).get('total_segments', 0)}\n")
             f.write("=" * 50 + "\n\n")
             
@@ -1260,7 +1399,8 @@ class AntiHallucinationTranscriber:
                 text = segment.get("text", "").strip()
                 
                 if text:
-                    f.write(f"[{start_time} - {end_time}] {text}\n")
+                    weak_mark = "[弱]" if segment.get("is_weak_voice", False) else ""
+                    f.write(f"[{start_time} - {end_time}] {weak_mark}{text}\n")
         
         # SRT格式
         srt_path = os.path.join(self.temp_dir, "transcription.srt")
@@ -1279,7 +1419,7 @@ class AntiHallucinationTranscriber:
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="日语视频转录工具 - 抗幻觉版")
+    parser = argparse.ArgumentParser(description="日语弱人声转录工具 - 专为轻声、耳语优化")
     parser.add_argument("input_file", type=str, help="输入音频/视频文件路径")
     parser.add_argument("--model", type=str, default="large-v3-turbo",
                        choices=["tiny", "base", "small", "medium", "large-v2", "large-v3-turbo"],
@@ -1290,12 +1430,16 @@ def main():
                        help="分块重叠时长（秒），避免语句被切断 (默认: 2.0)")
     parser.add_argument("--no-silero-vad", action="store_true",
                        help="禁用Silero VAD，使用faster-whisper内置VAD")
-    parser.add_argument("--vad-threshold", type=float, default=0.4,
-                       help="VAD检测阈值 (0.2-0.6，越高越严格) (默认: 0.4)")
-    parser.add_argument("--min-speech-duration", type=int, default=400,
-                       help="最小语音时长（毫秒）(默认: 400)")
-    parser.add_argument("--max-speech-duration", type=float, default=8.0,
-                       help="最大语音时长（秒）(默认: 8.0)")
+    parser.add_argument("--vad-threshold", type=float, default=0.2,
+                       help="VAD检测阈值 (0.1-0.3，越低越敏感) (默认: 0.2)")
+    parser.add_argument("--min-speech-duration", type=int, default=200,
+                       help="最小语音时长（毫秒）(默认: 200)")
+    parser.add_argument("--conservative-vad", action="store_true",
+                       help="使用保守VAD模式（默认: 激进模式）")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                       help="Whisper温度参数 (默认: 0.0，确定性采样)")
+    parser.add_argument("--beam-size", type=int, default=5,
+                       help="Whisper束搜索大小 (默认: 5)")
     parser.add_argument("--no-filter-hallucinations", action="store_true",
                        help="禁用幻觉文本过滤")
     
@@ -1336,9 +1480,10 @@ def main():
     
     # 创建转录器并开始处理
     use_silero_vad = not args.no_silero_vad
+    aggressive_vad = not args.conservative_vad
     filter_hallucinations = not args.no_filter_hallucinations
     
-    transcriber = AntiHallucinationTranscriber(
+    transcriber = WeakVoiceTranscriber(
         args.input_file, 
         args.model, 
         args.language, 
@@ -1346,26 +1491,29 @@ def main():
         use_silero_vad,
         args.vad_threshold,
         args.min_speech_duration,
-        args.max_speech_duration,
+        aggressive_vad,
+        args.temperature,
+        args.beam_size,
         adult_mode=True,
         filter_hallucinations=filter_hallucinations
     )
     
     print("\n" + "="*70)
-    print(f"开始转录: {args.input_file}")
+    print(f"开始弱人声转录: {args.input_file}")
     print(f"使用模型: {args.model}")
-    print(f"使用VAD: {'增强版VAD' if use_silero_vad else '内置VAD'}")
-    print(f"抗幻觉模式: {'启用' if filter_hallucinations else '禁用'}")
-    print(f"VAD阈值: {args.vad_threshold} (越高越严格)")
+    print(f"使用VAD: {'弱人声专用VAD' if use_silero_vad else '内置VAD'}")
+    print(f"VAD模式: {'激进' if aggressive_vad else '保守'}")
+    print(f"VAD阈值: {args.vad_threshold} (越低越敏感)")
     print(f"最小语音时长: {args.min_speech_duration}ms")
-    print(f"最大语音时长: {args.max_speech_duration}s")
+    print(f"Whisper温度: {args.temperature}")
+    print(f"抗幻觉模式: {'启用' if filter_hallucinations else '禁用'}")
     print(f"重叠时长: {args.overlap}秒")
     print("="*70 + "\n")
     
     success = transcriber.process()
     
     if success:
-        print("任务完成!")
+        print("弱人声转录任务完成!")
         sys.exit(0)
     else:
         print("任务失败，请检查日志文件")
