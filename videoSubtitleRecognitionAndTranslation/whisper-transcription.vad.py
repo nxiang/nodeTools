@@ -23,13 +23,15 @@ except ImportError:
     print("错误: 请安装 faster-whisper: pip install faster-whisper")
     sys.exit(1)
 
-# 尝试导入Silero VAD
+# 检查Silero VAD的可用性
+SILERO_VAD_AVAILABLE = False
 try:
-    from silero_vad import load_silero_vad, get_speech_timestamps, read_audio, save_audio
+    import torch.hub
+    # 尝试直接通过torch.hub加载，这是最兼容的方式
     SILERO_VAD_AVAILABLE = True
+    print("Silero VAD 可用")
 except ImportError:
-    SILERO_VAD_AVAILABLE = False
-    print("提示: 如需使用更准确的Silero VAD，请安装: pip install silero-vad")
+    print("提示: 如需使用更准确的Silero VAD，请确保PyTorch已安装")
 
 class TimeFormatter:
     """时间格式化工具类"""
@@ -100,52 +102,84 @@ class PerformanceTracker:
             print(f"  {stage}: {duration}")
         print("="*50)
 
-class SileroVADProcessor:
-    """Silero VAD处理器（比内置VAD更准确）"""
+class UniversalVADProcessor:
+    """通用VAD处理器，兼容各种版本的Silero VAD"""
     
-    def __init__(self, device: str = None, model_path: str = None):
+    def __init__(self, device: str = None):
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
         self.available = False
-        self._init_time = time.time()
+        self.get_speech_timestamps_fn = None
         
         if not SILERO_VAD_AVAILABLE:
-            logging.warning("Silero VAD不可用，请安装: pip install silero-vad")
+            logging.warning("Silero VAD不可用")
             return
         
         try:
-            self.performance_start = time.time()
             logging.info(f"正在加载Silero VAD模型 (设备: {self.device})...")
             
-            # 加载Silero VAD模型
-            self.model, utils = load_silero_vad(
-                model_path=model_path,
-                torchscript=False  # 不使用TorchScript以保持灵活性
-            )
-            
-            # 将模型移动到指定设备
-            self.model = self.model.to(self.device)
-            self.model.eval()  # 设置为评估模式
-            
-            # 获取工具函数
-            self.get_speech_timestamps_fn = utils[0]
-            
-            self.available = True
-            load_time = time.time() - self.performance_start
-            logging.info(f"Silero VAD加载成功，耗时: {load_time:.2f}秒")
+            # 尝试多种加载方式以适应不同版本的silero_vad
+            try:
+                # 方法1: 直接使用torch.hub加载（最兼容的方式）
+                model, utils = torch.hub.load(
+                    repo_or_dir='snakers4/silero-vad',
+                    model='silero_vad',
+                    force_reload=False,
+                    trust_repo=True
+                )
+                
+                # 将模型移动到指定设备
+                self.model = model.to(self.device)
+                self.model.eval()
+                
+                # 工具函数
+                (get_speech_timestamps, _, read_audio, _, _) = utils
+                self.get_speech_timestamps_fn = get_speech_timestamps
+                self.available = True
+                
+                logging.info("Silero VAD加载成功 (使用torch.hub)")
+                
+            except Exception as hub_error:
+                logging.warning(f"torch.hub加载失败，尝试其他方式: {hub_error}")
+                
+                # 方法2: 尝试导入silero_vad模块
+                try:
+                    from silero_vad import load_silero_vad
+                    
+                    # 尝试不同的参数组合
+                    try:
+                        # 无参数
+                        model, utils = load_silero_vad()
+                    except TypeError:
+                        try:
+                            # 带torchscript参数
+                            model, utils = load_silero_vad(torchscript=False)
+                        except TypeError:
+                            # 带model_path参数
+                            model, utils = load_silero_vad(model_path=None)
+                    
+                    self.model = model.to(self.device)
+                    self.model.eval()
+                    (get_speech_timestamps, _, read_audio, _, _) = utils
+                    self.get_speech_timestamps_fn = get_speech_timestamps
+                    self.available = True
+                    
+                    logging.info("Silero VAD加载成功 (使用silero_vad模块)")
+                    
+                except Exception as module_error:
+                    logging.error(f"所有Silero VAD加载方式均失败: {module_error}")
+                    self.available = False
             
         except Exception as e:
             logging.error(f"加载Silero VAD失败: {e}")
-            import traceback
-            traceback.print_exc()
+            self.available = False
     
-    def get_speech_timestamps(self, audio: np.ndarray, sr: int = 16000, 
-                             threshold: float = 0.3, min_speech_duration_ms: int = 400,
-                             min_silence_duration_ms: int = 200, window_size_samples: int = 512,
-                             speech_pad_ms: int = 100) -> List[Dict[str, float]]:
-        """使用Silero VAD检测语音时间戳"""
-        if not self.available or self.model is None:
-            logging.warning("Silero VAD不可用，返回空时间戳")
+    def detect_speech_segments(self, audio: np.ndarray, sr: int = 16000, 
+                              vad_threshold: float = 0.3,
+                              min_speech_duration_ms: int = 300,
+                              min_silence_duration_ms: int = 150) -> List[Dict[str, float]]:
+        """检测语音段"""
+        if not self.available or self.model is None or self.get_speech_timestamps_fn is None:
             return []
         
         try:
@@ -162,65 +196,26 @@ class SileroVADProcessor:
             # 检测语音时间戳
             vad_start = time.time()
             
-            timestamps = get_speech_timestamps(
+            # 使用检测到的函数
+            timestamps = self.get_speech_timestamps_fn(
                 audio_tensor, 
                 self.model,
-                threshold=threshold,
+                threshold=vad_threshold,
                 min_speech_duration_ms=min_speech_duration_ms,
                 min_silence_duration_ms=min_silence_duration_ms,
-                window_size_samples=window_size_samples,
-                speech_pad_ms=speech_pad_ms,
+                window_size_samples=512,
+                speech_pad_ms=100,
                 return_seconds=True
             )
             
             vad_time = time.time() - vad_start
-            logging.debug(f"Silero VAD检测完成，耗时: {vad_time:.3f}秒，检测到 {len(timestamps)} 个语音段")
+            logging.debug(f"VAD检测完成，耗时: {vad_time:.3f}秒，检测到 {len(timestamps)} 个语音段")
             
             return timestamps
             
         except Exception as e:
-            logging.error(f"Silero VAD检测失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logging.error(f"VAD检测失败: {e}")
             return []
-    
-    def preprocess_audio_for_vad(self, audio: np.ndarray, sr: int = 16000) -> np.ndarray:
-        """VAD前音频预处理：增强人声，抑制噪声"""
-        try:
-            import scipy.signal as signal
-            
-            # 1. 标准化音量
-            max_abs = np.max(np.abs(audio))
-            if max_abs > 0:
-                audio = audio / max_abs
-            
-            # 2. 人声频率增强（300Hz-3400Hz是语音主要频率）
-            nyquist = sr // 2
-            lowcut = 80  # 更低频，捕捉低音
-            highcut = 3800  # 更高频，捕捉清音
-            
-            # 设计带通滤波器
-            b, a = signal.butter(
-                4, 
-                [lowcut/nyquist, highcut/nyquist], 
-                btype='band'
-            )
-            filtered_audio = signal.filtfilt(b, a, audio)
-            
-            # 3. 动态范围压缩（增强弱语音）
-            # 使用对数压缩，增强低音量部分
-            compressed_audio = np.sign(filtered_audio) * np.log1p(np.abs(filtered_audio) * 2)
-            
-            # 4. 再次标准化
-            max_abs = np.max(np.abs(compressed_audio))
-            if max_abs > 0:
-                compressed_audio = compressed_audio / max_abs
-            
-            return compressed_audio
-            
-        except Exception as e:
-            logging.warning(f"音频预处理失败: {e}, 返回原始音频")
-            return audio
 
 class AudioProcessor:
     """音频处理器"""
@@ -556,11 +551,12 @@ class ProgressManager:
         self.save_progress()
 
 class OptimizedTranscriber:
-    """优化转录器"""
+    """优化转录器 - 专为日语成人向内容优化"""
     
     def __init__(self, input_file: str, model_name: str, language: str = "ja", 
                  overlap_seconds: float = 2.0, use_silero_vad: bool = True,
-                 vad_threshold: float = 0.3, min_speech_duration_ms: int = 250):
+                 vad_threshold: float = 0.3, min_speech_duration_ms: int = 300,
+                 adult_mode: bool = True, filter_moan: bool = True):
         self.input_file = os.path.abspath(input_file)
         self.model_name = model_name
         self.language = language
@@ -568,6 +564,8 @@ class OptimizedTranscriber:
         self.use_silero_vad = use_silero_vad
         self.vad_threshold = vad_threshold
         self.min_speech_duration_ms = min_speech_duration_ms
+        self.adult_mode = adult_mode
+        self.filter_moan = filter_moan
         
         # 创建临时目录
         audio_name = Path(self.input_file).stem
@@ -586,10 +584,11 @@ class OptimizedTranscriber:
         
         # 初始化Silero VAD
         if self.use_silero_vad and SILERO_VAD_AVAILABLE:
-            self.performance.start_stage("VAD模型加载")
-            self.vad_processor = SileroVADProcessor()
+            self.performance.start_stage("Silero VAD模型加载")
+            self.vad_processor = UniversalVADProcessor()
             if self.vad_processor.available:
-                logging.info("成功启用Silero VAD，将获得更准确的语音检测")
+                logging.info("成功启用Silero VAD")
+                self.use_silero_vad = True
             else:
                 logging.warning("Silero VAD不可用，将回退到faster-whisper内置VAD")
                 self.use_silero_vad = False
@@ -598,6 +597,7 @@ class OptimizedTranscriber:
             logging.info("使用faster-whisper内置VAD")
         
         logging.info(f"初始化完成: 输入={self.input_file}, 模型={model_name}, 语言={language}, 重叠={overlap_seconds}秒")
+        logging.info(f"成人模式: {adult_mode}, 过滤呻吟声: {filter_moan}")
         logging.info(f"VAD设置: Silero={self.use_silero_vad}, 阈值={vad_threshold}, 最小语音时长={min_speech_duration_ms}ms")
         logging.info(f"临时目录: {self.temp_dir}")
     
@@ -643,70 +643,70 @@ class OptimizedTranscriber:
             logging.error(f"加载模型失败: {e}")
             raise
     
-    def _get_transcription_options(self):
+    def _get_transcription_options(self, use_external_vad: bool = False):
         """获取转录参数"""
-        # 基础参数
         options = {
             "language": self.language,
-            "beam_size": 3,  # 降低束搜索宽度
-            "no_speech_threshold": 0.6,  # 提高无语音阈值
-            "compression_ratio_threshold": 1.8,  # 降低压缩比阈值
-            "condition_on_previous_text": True,  # 启用上下文依赖
-            "word_timestamps": False,
-            "temperature": 0.0,
+            "beam_size": 5,
+            "best_of": 5,
+            "temperature": [0.0, 0.2, 0.4, 0.6, 0.8],
+            "patience": 1.0,
+            "condition_on_previous_text": True,
+            "word_timestamps": False,  # 暂时禁用词级时间戳以提高兼容性
+            "compression_ratio_threshold": 2.0,
+            "no_speech_threshold": 0.6,
+            "suppress_tokens": [-1],
         }
         
-        # 语言特定的优化
-        if self.language == "ja":
-            options["initial_prompt"] = "これは日本語の音声です。"
-        elif self.language == "zh":
-            options["initial_prompt"] = "这是中文语音。"
-        elif self.language == "en":
-            options["initial_prompt"] = "This is English speech."
+        # 关键：根据是否使用外部VAD设置vad_filter
+        if use_external_vad:
+            # 使用外部VAD时，完全禁用内置VAD
+            options["vad_filter"] = False
+        else:
+            # 不使用外部VAD时，使用内置VAD
+            options["vad_filter"] = True
+        
+        # 日语成人内容专用提示词
+        if self.language == "ja" and self.adult_mode:
+            options["initial_prompt"] = "これは日本語の音声です。会話や語りを正確に書き起こしてください。"
         
         return options
     
     def _transcribe_with_silero_vad(self, audio: np.ndarray, chunk_start_time: float, 
                                    chunk_id: int, sr: int = 16000) -> Dict:
-        """使用Silero VAD进行语音检测和转录"""
+        """使用Silero VAD进行转录"""
         try:
-            # 1. 音频预处理
-            preprocessed_audio = self.vad_processor.preprocess_audio_for_vad(audio, sr)
-            
-            # 2. 使用Silero VAD检测语音段
+            # 使用Silero VAD检测语音段
             vad_start = time.time()
-            speech_timestamps = self.vad_processor.get_speech_timestamps(
-                preprocessed_audio, sr=sr,
-                threshold=self.vad_threshold,
-                min_speech_duration_ms=self.min_speech_duration_ms,
-                min_silence_duration_ms=100,
-                window_size_samples=512,
-                speech_pad_ms=100
+            
+            speech_timestamps = self.vad_processor.detect_speech_segments(
+                audio, sr=sr,
+                vad_threshold=self.vad_threshold,
+                min_speech_duration_ms=self.min_speech_duration_ms
             )
+            
             vad_time = time.time() - vad_start
             
             if not speech_timestamps:
-                logging.warning(f"chunk {chunk_id} 未检测到语音")
                 return {
                     "chunk_id": chunk_id,
                     "chunk_start": chunk_start_time,
                     "chunk_end": chunk_start_time + len(audio)/sr,
                     "segments": [],
                     "language": self.language,
-                    "language_probability": 0.0,
                     "vad_type": "silero",
                     "vad_time": vad_time,
                     "speech_segments": 0
                 }
             
-            logging.info(f"chunk {chunk_id}: Silero VAD检测到 {len(speech_timestamps)} 个语音段，耗时 {vad_time:.2f}秒")
+            logging.info(f"chunk {chunk_id}: Silero VAD检测到 {len(speech_timestamps)} 个语音段")
             
-            # 3. 转录每个语音段
+            # 转录每个语音段
             all_segments = []
-            transcription_options = self._get_transcription_options()
+            transcription_options = self._get_transcription_options(use_external_vad=True)
             
             for i, ts in enumerate(speech_timestamps):
-                # 提取语音段音频
+                # 提取音频段
                 start_sample = int(ts['start'] * sr)
                 end_sample = int(ts['end'] * sr)
                 segment_audio = audio[start_sample:end_sample]
@@ -717,49 +717,46 @@ class OptimizedTranscriber:
                 
                 # 检查音频段是否太短
                 if len(segment_audio) < sr * 0.1:  # 小于0.1秒
-                    logging.debug(f"跳过过短语音段: {i+1}/{len(speech_timestamps)}, 时长: {ts['end']-ts['start']:.2f}s")
                     continue
                 
-                # 转录该语音段（关闭内置VAD，因为我们已经检测过了）
+                # 转录该语音段（关闭内置VAD）
                 segment_start = time.time()
                 try:
                     segments, info = self.model.transcribe(
                         segment_audio,
-                        vad_filter=False,  # 关闭内置VAD
-                        **transcription_options
+                        **transcription_options  # 已包含vad_filter=False
                     )
                     
                     segment_time = time.time() - segment_start
                     
                     # 处理转录结果
-                    segment_texts = []
                     for segment in segments:
-                        segment_dict = {
-                            "start": absolute_start + segment.start,
-                            "end": absolute_end,
-                            "text": segment.text.strip(),
-                            "chunk_id": chunk_id,
-                            "segment_index": i,
-                            "vad_score": ts.get('confidence', 0.0),
-                        }
-                        all_segments.append(segment_dict)
-                        segment_texts.append(segment.text.strip())
-                    
-                    if segment_texts:
-                        logging.debug(f"语音段 {i+1}/{len(speech_timestamps)} 转录完成: {' '.join(segment_texts)[:50]}... (耗时: {segment_time:.2f}s)")
+                        text = segment.text.strip()
+                        
+                        # 成人内容后处理
+                        if self.adult_mode and self.filter_moan:
+                            text = self._filter_adult_content_text(text)
+                        
+                        if text:  # 只有非空文本才保留
+                            segment_dict = {
+                                "start": absolute_start + segment.start,
+                                "end": absolute_start + segment.end,
+                                "text": text,
+                                "chunk_id": chunk_id,
+                                "segment_index": i,
+                            }
+                            all_segments.append(segment_dict)
                     
                 except Exception as e:
                     logging.warning(f"语音段 {i+1} 转录失败: {e}")
                     continue
             
-            # 4. 返回结果
             return {
                 "chunk_id": chunk_id,
                 "chunk_start": chunk_start_time,
                 "chunk_end": chunk_start_time + len(audio)/sr,
                 "segments": all_segments,
                 "language": self.language,
-                "language_probability": 0.95 if all_segments else 0.0,
                 "vad_type": "silero",
                 "vad_time": vad_time,
                 "speech_segments": len(speech_timestamps),
@@ -768,20 +765,44 @@ class OptimizedTranscriber:
             
         except Exception as e:
             logging.error(f"使用Silero VAD转录chunk {chunk_id}失败: {e}")
-            import traceback
-            traceback.print_exc()
             return None
+    
+    def _filter_adult_content_text(self, text: str) -> str:
+        """过滤成人内容中的非语音文本"""
+        if not text or len(text.strip()) == 0:
+            return ""
+        
+        # 日语呻吟声/呼吸声模式
+        import re
+        moan_patterns = [
+            r'^[あいうえおん]{1,3}ん?$',
+            r'^[あーー]{2,}$',
+            r'^[うぅ]{2,}$',
+            r'^[はっふ]{2,}$',
+            r'^[くっ]{2,}$',
+        ]
+        
+        for pattern in moan_patterns:
+            if re.match(pattern, text):
+                logging.debug(f"过滤呻吟声/呼吸声: {text}")
+                return ""
+        
+        # 过滤过短的文本
+        if len(text) <= 1 and len(text.replace(' ', '')) == 1:
+            return ""
+        
+        return text.strip()
     
     def _transcribe_with_builtin_vad(self, audio: np.ndarray, chunk_start_time: float,
                                     chunk_id: int, sr: int = 16000) -> Dict:
         """使用faster-whisper内置VAD进行转录"""
         try:
             # 转录参数
-            options = self._get_transcription_options()
+            transcription_options = self._get_transcription_options(use_external_vad=False)
             
             # 内置VAD参数
             vad_params = {
-                "threshold": 0.1,  # 较低阈值提高灵敏度
+                "threshold": 0.1,
                 "min_speech_duration_ms": 100,
                 "max_speech_duration_s": 60,
                 "min_silence_duration_ms": 200,
@@ -791,22 +812,27 @@ class OptimizedTranscriber:
             # 执行转录
             segments, info = self.model.transcribe(
                 audio,
-                vad_filter=True,
                 vad_parameters=vad_params,
-                **options
+                **transcription_options  # 已包含vad_filter=True
             )
             
             # 处理结果
             chunk_segments = []
             for segment in segments:
-                segment_dict = {
-                    "start": chunk_start_time + segment.start,
-                    "end": chunk_start_time + segment.end,
-                    "text": segment.text.strip(),
-                    "chunk_id": chunk_id,
-                    "vad_score": getattr(segment, 'vad_probability', 0.0),
-                }
-                chunk_segments.append(segment_dict)
+                text = segment.text.strip()
+                
+                # 成人内容后处理
+                if self.adult_mode and self.filter_moan:
+                    text = self._filter_adult_content_text(text)
+                
+                if text:  # 只保留非空文本
+                    segment_dict = {
+                        "start": chunk_start_time + segment.start,
+                        "end": chunk_start_time + segment.end,
+                        "text": text,
+                        "chunk_id": chunk_id,
+                    }
+                    chunk_segments.append(segment_dict)
             
             return {
                 "chunk_id": chunk_id,
@@ -960,39 +986,12 @@ class OptimizedTranscriber:
                 print("实时因子: 无法计算（音频时长为0）")
                 
             print(f"VAD类型: {'Silero VAD' if self.use_silero_vad else '内置VAD'}")
+            print(f"成人模式: {'启用' if self.adult_mode else '禁用'}")
+            print(f"过滤呻吟声: {'启用' if self.filter_moan else '禁用'}")
             print(f"临时文件位置: {self.temp_dir}")
             print("="*60)
             
-            # 详细耗时统计
-            print("\n" + "="*50)
-            print("详细耗时统计")
-            print("="*50)
-            
-            # 获取性能追踪器的数据
-            performance_data = self.performance.get_summary()
-            
-            # 打印各阶段耗时
-            print("各阶段耗时详情:")
-            for stage, duration in performance_data["各阶段耗时"].items():
-                print(f"  {stage}: {duration}")
-            
-            # 计算并打印累计耗时
-            cumulative_time = 0
-            print("\n累计耗时分析:")
-            for stage, duration_str in performance_data["各阶段耗时"].items():
-                # 将时间字符串转换回秒数
-                time_parts = duration_str.split(':')
-                if len(time_parts) == 3:
-                    hours, minutes, seconds = map(int, time_parts)
-                    stage_seconds = hours * 3600 + minutes * 60 + seconds
-                    cumulative_time += stage_seconds
-                    print(f"  {stage}: {TimeFormatter.format_seconds(cumulative_time)}")
-            
-            print(f"\n总累计耗时: {performance_data['总耗时']}")
-            print(f"实时因子: {performance_data['实时因子']}")
-            print("="*50)
-            
-            # 性能摘要（保持原有格式）
+            # 性能摘要
             self.performance.print_summary()
             
             return True
@@ -1004,29 +1003,35 @@ class OptimizedTranscriber:
             return False
     
     def _filter_noise_segments(self, segments: List[Dict]) -> List[Dict]:
+        """过滤噪声片段"""
         filtered_segments = []
         
         for segment in segments:
             text = segment.get("text", "").strip()
             duration = segment["end"] - segment["start"]
             
-            # 跳过过短的片段
-            if duration < 0.3:  # 小于0.3秒的片段
+            # 基本过滤
+            if not text or duration < 0.2:
                 continue
             
-            # 跳过只有单个字符的片段
-            if len(text) <= 1 and duration < 1.0:
-                continue
-            
-            # 跳过常见的噪声文本（日语）
-            noise_patterns = ["あ", "え", "う", "い", "お", "ん", "はあ", "ふん"]
-            if text in noise_patterns and duration < 0.8:
-                continue
-            
-            # 检查VAD置信度（如果有）
-            vad_score = segment.get("vad_score", 0.5)
-            if vad_score < 0.2:  # 低置信度的片段
-                continue
+            # 日语成人内容特定过滤
+            if self.language == "ja" and self.adult_mode:
+                # 过滤常见的非语音文本
+                japanese_noise = [
+                    "あ", "え", "う", "い", "お", "ん",
+                    "はあ", "ふん", "うん", "あっ", "えっ",
+                    "はっ", "ふっ", "くっ", "んん", "ああ",
+                    "うう", "いい", "おお", "ええ",
+                ]
+                
+                # 完全匹配噪声词
+                if text in japanese_noise and duration < 1.0:
+                    continue
+                
+                # 部分匹配
+                noise_count = sum(1 for noise in japanese_noise if noise in text)
+                if noise_count >= 2 and len(text) <= 5:
+                    continue
             
             filtered_segments.append(segment)
         
@@ -1063,6 +1068,8 @@ class OptimizedTranscriber:
                 "original_segments": len(all_segments),
                 "filtered_segments": len(all_segments) - len(filtered_segments),
                 "vad_type": "silero" if self.use_silero_vad else "builtin",
+                "adult_mode": self.adult_mode,
+                "filter_moan": self.filter_moan,
                 "overlap_seconds": self.overlap_seconds,
                 "processing_time": datetime.now().isoformat(),
             }
@@ -1075,7 +1082,7 @@ class OptimizedTranscriber:
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         
-        # TXT格式（包含时间信息）
+        # TXT格式
         txt_path = os.path.join(self.temp_dir, "transcription.txt")
         with open(txt_path, 'w', encoding='utf-8') as f:
             # 写入文件头信息
@@ -1083,6 +1090,7 @@ class OptimizedTranscriber:
             f.write(f"模型: {result.get('info', {}).get('model', 'Unknown')}\n")
             f.write(f"语言: {result.get('language', 'Unknown')}\n")
             f.write(f"VAD类型: {result.get('info', {}).get('vad_type', 'Unknown')}\n")
+            f.write(f"成人模式: {result.get('info', {}).get('adult_mode', 'Unknown')}\n")
             f.write(f"总片段数: {result.get('info', {}).get('total_segments', 0)}\n")
             f.write("=" * 50 + "\n\n")
             
@@ -1098,41 +1106,18 @@ class OptimizedTranscriber:
         
         # SRT格式
         srt_path = os.path.join(self.temp_dir, "transcription.srt")
-        srt_success = self._save_as_srt(result["segments"], srt_path)
-        
-        logging.info(f"结果已保存到: {self.temp_dir}")
-        logging.info(f"  - JSON: {json_path}")
-        logging.info(f"  - TXT: {txt_path}")
-        if srt_success:
-            logging.info(f"  - SRT: {srt_path}")
-        else:
-            logging.warning(f"  - SRT: 生成失败，请检查日志")
-    
-    def _save_as_srt(self, segments: List[Dict], output_path: str):
-        """保存为SRT格式"""
-        try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                for i, segment in enumerate(segments, 1):
-                    start = TimeFormatter.format_timestamp(segment["start"])
-                    end = TimeFormatter.format_timestamp(segment["end"])
-                    text = segment.get("text", "").strip()
-                    
-                    # 跳过空文本的片段
-                    if not text:
-                        continue
-                        
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            for i, segment in enumerate(result.get("segments", []), 1):
+                start = TimeFormatter.format_timestamp(segment["start"])
+                end = TimeFormatter.format_timestamp(segment["end"])
+                text = segment.get("text", "").strip()
+                
+                if text:
                     f.write(f"{i}\n")
                     f.write(f"{start} --> {end}\n")
                     f.write(f"{text}\n\n")
-            
-            logging.info(f"SRT文件已成功生成: {output_path}")
-            return True
-            
-        except Exception as e:
-            logging.error(f"生成SRT文件失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+        
+        logging.info(f"结果已保存到: {self.temp_dir}")
 
 def main():
     """主函数"""
@@ -1148,9 +1133,13 @@ def main():
     parser.add_argument("--no-silero-vad", action="store_true",
                        help="禁用Silero VAD，使用faster-whisper内置VAD")
     parser.add_argument("--vad-threshold", type=float, default=0.3,
-                       help="VAD检测阈值 (0.0-1.0，越低越敏感) (默认: 0.5)")
-    parser.add_argument("--min-speech-duration", type=int, default=400,
-                       help="最小语音时长（毫秒）(默认: 250)")
+                       help="VAD检测阈值 (0.1-0.5，越低越敏感) (默认: 0.3)")
+    parser.add_argument("--min-speech-duration", type=int, default=300,
+                       help="最小语音时长（毫秒）(默认: 300)")
+    parser.add_argument("--no-adult-mode", action="store_true",
+                       help="禁用成人内容优化模式")
+    parser.add_argument("--no-filter-moan", action="store_true",
+                       help="不禁用呻吟声过滤")
     
     args = parser.parse_args()
     
@@ -1164,12 +1153,6 @@ def main():
         print("请先安装 faster-whisper:")
         print("  pip install faster-whisper")
         sys.exit(1)
-    
-    # 检查Silero VAD
-    if not args.no_silero_vad and not SILERO_VAD_AVAILABLE:
-        print("提示: Silero VAD未安装，将使用内置VAD")
-        print("如需更准确的语音检测，请安装: pip install silero-vad")
-        args.no_silero_vad = True
     
     # 检查其他依赖
     try:
@@ -1189,6 +1172,9 @@ def main():
     
     # 创建转录器并开始处理
     use_silero_vad = not args.no_silero_vad
+    adult_mode = not args.no_adult_mode
+    filter_moan = not args.no_filter_moan
+    
     transcriber = OptimizedTranscriber(
         args.input_file, 
         args.model, 
@@ -1196,13 +1182,17 @@ def main():
         args.overlap,
         use_silero_vad,
         args.vad_threshold,
-        args.min_speech_duration
+        args.min_speech_duration,
+        adult_mode,
+        filter_moan
     )
     
     print("\n" + "="*60)
     print(f"开始转录: {args.input_file}")
     print(f"使用模型: {args.model}")
     print(f"使用VAD: {'Silero VAD' if use_silero_vad else '内置VAD'}")
+    print(f"成人模式: {'启用' if adult_mode else '禁用'}")
+    print(f"过滤呻吟声: {'启用' if filter_moan else '禁用'}")
     print(f"重叠时长: {args.overlap}秒")
     print("="*60 + "\n")
     
