@@ -311,7 +311,7 @@ class SegmentTranscriber:
             return []
 
 class WhisperTranscriber:
-    def __init__(self, video_path, model_size="base", language="ja", segment_duration=60, cleanup=False):
+    def __init__(self, video_path, model_size="base", language="ja", segment_duration=60, cleanup=False, test_percentage=0):
         """
         初始化转录器
         
@@ -321,12 +321,14 @@ class WhisperTranscriber:
             language: 音频语言代码 (默认: ja - 日语)
             segment_duration: 音频分段时长（秒），默认60秒
             cleanup: 是否在程序开始前清理临时文件，默认False
+            test_percentage: 测试模式，仅转录前百分之N的音频 (默认: 0 - 转录全部音频)
         """
         self.video_path = Path(video_path)
         self.model_size = model_size
         self.language = language
         self.segment_duration = segment_duration
         self.cleanup = cleanup
+        self.test_percentage = test_percentage
         
         # 基础信息
         self.video_name = self.video_path.stem
@@ -478,6 +480,25 @@ class WhisperTranscriber:
             self.state["segment_files"] and
             all(Path(f).exists() for f in self.state["segment_files"])):
             
+            # 测试模式：限制处理的片段数量
+            if self.test_percentage > 0:
+                original_total = self.state["total_segments"]
+                max_segments = int(original_total * self.test_percentage / 100)
+                if max_segments < 1:
+                    max_segments = 1
+                
+                # 限制片段数量
+                self.state["segment_files"] = self.state["segment_files"][:max_segments]
+                self.state["total_segments"] = max_segments
+                
+                # 如果已处理的片段超过限制，重置为0
+                if self.state["processed_segments"] > max_segments:
+                    self.state["processed_segments"] = 0
+                    self.state["current_segment"] = 0
+                    self.state["segments"] = []
+                
+                print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
+            
             print(f"使用现有的 {self.state['total_segments']} 个音频片段")
             # 即使使用现有片段，也需要初始化分段器
             self.segment_transcriber = SegmentTranscriber(
@@ -500,6 +521,17 @@ class WhisperTranscriber:
         
         if not segment_files:
             return False
+        
+        # 测试模式：限制处理的片段数量
+        if self.test_percentage > 0:
+            original_total = len(segment_files)
+            max_segments = int(original_total * self.test_percentage / 100)
+            if max_segments < 1:
+                max_segments = 1
+            
+            # 限制片段数量
+            segment_files = segment_files[:max_segments]
+            print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
         
         # 保存片段信息，包括当前的segment_duration
         self.state["segment_files"] = [str(f) for f in segment_files]
@@ -820,6 +852,8 @@ def main():
     parser.add_argument("--venv-path", help="虚拟环境路径（可选，默认自动检测）")
     parser.add_argument("--cleanup", action="store_true",
                        help="在程序开始前清理临时文件（默认不清理）")
+    parser.add_argument("--test", type=int, default=0,
+                       help="测试模式，仅转录前百分之N的音频 (默认: 0 - 转录全部音频)")
     
     args = parser.parse_args()
     
@@ -838,7 +872,8 @@ def main():
             model_size=args.model,
             language=args.language,
             segment_duration=args.segment_duration,
-            cleanup=args.cleanup
+            cleanup=args.cleanup,
+            test_percentage=args.test
         )
         
         success = transcriber.transcribe()

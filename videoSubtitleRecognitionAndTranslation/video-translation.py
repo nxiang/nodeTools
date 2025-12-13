@@ -170,7 +170,7 @@ class VideoTranslator:
         print(f"   ✗ 未找到可复用的转录文件")
         return None
     
-    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False) -> Optional[str]:
+    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False, test_percentage: int = 0) -> Optional[str]:
         """
         运行Whisper转录，生成SRT字幕文件
         
@@ -225,6 +225,9 @@ class VideoTranslator:
                     '--model', self.whisper_model,
                     '--language', self.source_lang
                 ]
+                # 添加测试参数
+                if test_percentage > 0:
+                    cmd.extend(['--test', str(test_percentage)])
             else:
                 # whisper-transcription.py 的参数
                 cmd = [
@@ -234,6 +237,9 @@ class VideoTranslator:
                     '--language', self.source_lang,
                     '--segment-duration', str(max_chunk_duration)
                 ]
+                # 添加测试参数
+                if test_percentage > 0:
+                    cmd.extend(['--test', str(test_percentage)])
             
             # 执行转录，实时显示输出
             result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
@@ -452,8 +458,14 @@ class VideoTranslator:
                         srt_start = convert_time_format(start_time.strip())
                         srt_end = convert_time_format(end_time.strip())
                         
+                        # 过滤掉文本中的[弱]标记
+                        cleaned_text = text_part.strip()
+                        # 移除开头的[弱]标记
+                        if cleaned_text.startswith("[弱]"):
+                            cleaned_text = cleaned_text[3:].strip()
+                        
                         # 创建SRT条目
-                        srt_entry = f"{entry_index}\n{srt_start} --> {srt_end}\n{text_part.strip()}\n"
+                        srt_entry = f"{entry_index}\n{srt_start} --> {srt_end}\n{cleaned_text}\n"
                         srt_entries.append(srt_entry)
                         entry_index += 1
             
@@ -518,7 +530,7 @@ class VideoTranslator:
             print(f"❌ 运行SRT翻译时出错: {e}")
             return False
     
-    def translate_video(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False) -> Dict:
+    def translate_video(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False, test_percentage: int = 0) -> Dict:
         """
         完整的视频翻译流程
         
@@ -568,7 +580,7 @@ class VideoTranslator:
             print(f"   转录模式: 标准模式")
         print("=" * 60)
         
-        srt_file = self.run_whisper_transcription(video_path, output_dir, enable_memory_optimization, max_chunk_duration, use_vad)
+        srt_file = self.run_whisper_transcription(video_path, output_dir, enable_memory_optimization, max_chunk_duration, use_vad, test_percentage)
         time_tracker.checkpoint("Whisper转录")
         
         if not srt_file:
@@ -644,6 +656,10 @@ def main():
     parser.add_argument("--vad", action="store_true",
                        help="使用VAD（语音活动检测）模式进行转录，使用whisper-transcription.vad.py脚本")
     
+    # 测试参数
+    parser.add_argument("--test", type=int, default=0,
+                       help="测试模式：仅转录前百分之N的音频 (默认: 0=禁用，10=转录前10%)")
+    
     args = parser.parse_args()
     
     # 验证视频文件存在
@@ -670,7 +686,8 @@ def main():
         output_dir=args.output_dir,
         enable_memory_optimization=args.enable_memory_optimization,
         max_chunk_duration=args.max_chunk_duration,
-        use_vad=args.vad
+        use_vad=args.vad,
+        test_percentage=args.test
     )
     
     if result["success"]:
