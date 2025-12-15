@@ -470,6 +470,35 @@ class WhisperTranscriber:
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
                     state = json.load(f)
+                    
+                    # 检查并修复状态数据
+                    total_segments = state.get("total_segments", 0)
+                    processed_segments = state.get("processed_segments", 0)
+                    current_segment = state.get("current_segment", 0)
+                    
+                    # 确保索引在有效范围内
+                    if processed_segments > total_segments:
+                        print(f"修复状态数据: processed_segments({processed_segments}) > total_segments({total_segments})")
+                        state["processed_segments"] = 0
+                        
+                    if current_segment > total_segments:
+                        print(f"修复状态数据: current_segment({current_segment}) > total_segments({total_segments})")
+                        state["current_segment"] = 0
+                    
+                    # 检查片段文件是否存在
+                    segment_files = state.get("segment_files", [])
+                    if segment_files and total_segments > 0:
+                        existing_files = [f for f in segment_files if Path(f).exists()]
+                        if len(existing_files) != len(segment_files):
+                            print(f"警告: {len(segment_files) - len(existing_files)} 个片段文件丢失")
+                            state["segment_files"] = existing_files
+                            state["total_segments"] = len(existing_files)
+                            # 重新调整索引
+                            if state["processed_segments"] > len(existing_files):
+                                state["processed_segments"] = 0
+                            if state["current_segment"] > len(existing_files):
+                                state["current_segment"] = 0
+                    
                     print(f"发现之前的状态: {state.get('processed_segments', 0)}/{state.get('total_segments', 0)} 个片段")
                     return state
             except Exception as e:
@@ -509,15 +538,25 @@ class WhisperTranscriber:
         """从视频中提取音频（内存优化版本）"""
         print(f"开始提取音频...")
         
-        # 如果音频已提取且文件存在，直接使用
+        # 如果音频已提取且文件存在，检查是否有效
         if self.state["audio_extracted"] and self.audio_file.exists():
-            audio_duration = get_audio_duration(self.audio_file)
-            if audio_duration > 0:
-                print(f"使用已提取的音频 (时长: {format_timedelta(audio_duration)})")
-                self.state["audio_duration"] = audio_duration
-                return True
+            # 检查是否是内存优化方案（只有片段文件，没有完整音频文件）
+            if self.state.get("segment_files") and len(self.state["segment_files"]) > 0:
+                # 内存优化方案：检查片段文件是否都存在
+                if all(Path(f).exists() for f in self.state["segment_files"]):
+                    print(f"使用已提取的音频片段 (共 {len(self.state['segment_files'])} 个片段)")
+                    return True
+                else:
+                    print("部分音频片段文件丢失，重新提取...")
             else:
-                print("音频文件损坏，重新提取...")
+                # 传统方案：检查完整的音频文件
+                audio_duration = get_audio_duration(self.audio_file)
+                if audio_duration > 0:
+                    print(f"使用已提取的音频 (时长: {format_timedelta(audio_duration)})")
+                    self.state["audio_duration"] = audio_duration
+                    return True
+                else:
+                    print("音频文件损坏，重新提取...")
         
         start_time = time.time()
         
@@ -654,6 +693,7 @@ class WhisperTranscriber:
             self.state["processed_segments"] = 0
             self.state["current_segment"] = 0
             self.state["segments"] = []
+            self._save_state()  # 立即保存状态变更
         
         # 如果已经有片段信息且文件都存在，直接使用
         if (self.state["total_segments"] > 0 and 
@@ -678,6 +718,7 @@ class WhisperTranscriber:
                     self.state["segments"] = []
                 
                 print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
+                self._save_state()  # 保存测试模式的状态变更
             
             print(f"使用现有的 {self.state['total_segments']} 个音频片段")
             # 即使使用现有片段，也需要初始化分段器（模型将在需要时懒加载）
@@ -711,7 +752,11 @@ class WhisperTranscriber:
                 self.state["segment_files"] = [str(f) for f in existing_segments]
                 self.state["total_segments"] = len(existing_segments)
                 self.state["segment_duration"] = self.segment_duration
-                self.state["current_segment"] = self.state["processed_segments"]
+                # 确保current_segment不超过总片段数
+                if self.state["current_segment"] >= len(existing_segments):
+                    self.state["current_segment"] = 0
+                if self.state["processed_segments"] >= len(existing_segments):
+                    self.state["processed_segments"] = 0
                 self._save_state()
                 
                 # 初始化分段器
@@ -725,47 +770,91 @@ class WhisperTranscriber:
                 print(f"使用已存在的音频片段，共 {self.state['total_segments']} 个片段")
                 return True
         
-        # 如果音频文件已提取，使用传统分割方式
-        if self.audio_file.exists() and self.audio_file.stat().st_size > 1000:
-            print("使用已提取的音频文件进行分割...")
-            
-            # 创建分段器并分割音频（模型将在需要时懒加载）
-            self.segment_transcriber = SegmentTranscriber(
-                self.temp_base, 
-                None,  # 模型将在需要时懒加载
-                self.language,
-                self.model_size  # 传递模型大小参数
-            )
-            
-            segment_files = self.segment_transcriber.split_audio(self.audio_file, self.segment_duration)
-            
-            if not segment_files:
-                return False
-            
-            # 测试模式：限制处理的片段数量
-            if self.test_percentage > 0:
-                original_total = len(segment_files)
-                max_segments = int(original_total * self.test_percentage / 100)
-                if max_segments < 1:
-                    max_segments = 1
+        # 检查音频文件状态
+        if self.audio_file.exists():
+            # 检查是否是内存优化方案的空标记文件
+            if self.audio_file.stat().st_size == 0:
+                # 这是内存优化方案的空标记文件，需要检查片段文件
+                segments_dir = self.temp_base / "segments"
+                if segments_dir.exists():
+                    existing_segments = sorted(list(segments_dir.glob("segment_*.wav")))
+                    if existing_segments:
+                        print(f"发现内存优化方案的音频片段 (共 {len(existing_segments)} 个片段)")
+                        
+                        # 保存片段信息
+                        self.state["segment_files"] = [str(f) for f in existing_segments]
+                        self.state["total_segments"] = len(existing_segments)
+                        self.state["segment_duration"] = self.segment_duration
+                        # 确保索引在有效范围内
+                        if self.state["current_segment"] >= len(existing_segments):
+                            self.state["current_segment"] = 0
+                        if self.state["processed_segments"] >= len(existing_segments):
+                            self.state["processed_segments"] = 0
+                        self._save_state()
+                        
+                        # 初始化分段器
+                        self.segment_transcriber = SegmentTranscriber(
+                            self.temp_base, 
+                            None,  # 模型将在需要时懒加载
+                            self.language,
+                            self.model_size
+                        )
+                        
+                        print(f"使用内存优化方案的音频片段，共 {self.state['total_segments']} 个片段")
+                        return True
+                    else:
+                        print("内存优化方案的片段文件不存在，需要重新提取...")
+                else:
+                    print("内存优化方案的片段目录不存在，需要重新提取...")
+            elif self.audio_file.stat().st_size > 1000:
+                # 传统方案：使用完整的音频文件进行分割
+                print("使用已提取的音频文件进行分割...")
                 
-                # 限制片段数量
-                segment_files = segment_files[:max_segments]
-                print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
-            
-            # 保存片段信息，包括当前的segment_duration
-            self.state["segment_files"] = [str(f) for f in segment_files]
-            self.state["total_segments"] = len(segment_files)
-            self.state["segment_duration"] = self.segment_duration  # 保存当前参数值
-            self.state["current_segment"] = self.state["processed_segments"]
-            self._save_state()
-            
-            print(f"将音频分割成 {self.segment_duration} 秒的片段...")
-            print(f"音频分割完成，共 {self.state['total_segments']} 个片段")
-            return True
+                # 创建分段器并分割音频（模型将在需要时懒加载）
+                self.segment_transcriber = SegmentTranscriber(
+                    self.temp_base, 
+                    None,  # 模型将在需要时懒加载
+                    self.language,
+                    self.model_size  # 传递模型大小参数
+                )
+                
+                segment_files = self.segment_transcriber.split_audio(self.audio_file, self.segment_duration)
+                
+                if not segment_files:
+                    return False
+                
+                # 测试模式：限制处理的片段数量
+                if self.test_percentage > 0:
+                    original_total = len(segment_files)
+                    max_segments = int(original_total * self.test_percentage / 100)
+                    if max_segments < 1:
+                        max_segments = 1
+                    
+                    # 限制片段数量
+                    segment_files = segment_files[:max_segments]
+                    print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
+                
+                # 保存片段信息，包括当前的segment_duration
+                self.state["segment_files"] = [str(f) for f in segment_files]
+                self.state["total_segments"] = len(segment_files)
+                self.state["segment_duration"] = self.segment_duration  # 保存当前参数值
+                # 确保索引在有效范围内
+                if self.state["current_segment"] >= len(segment_files):
+                    self.state["current_segment"] = 0
+                if self.state["processed_segments"] >= len(segment_files):
+                    self.state["processed_segments"] = 0
+                self._save_state()
+                
+                print(f"将音频分割成 {self.segment_duration} 秒的片段...")
+                print(f"音频分割完成，共 {self.state['total_segments']} 个片段")
+                return True
+            else:
+                # 音频文件存在但大小异常（可能损坏）
+                print("音频文件存在但大小异常，可能已损坏，需要重新提取...")
+                return False
         else:
-            # 音频文件不存在或损坏，需要重新提取
-            print("音频文件不存在或损坏，需要重新提取...")
+            # 音频文件不存在，需要重新提取
+            print("音频文件不存在，需要重新提取...")
             return False
     
     def _transcribe_segments(self):
@@ -776,11 +865,16 @@ class WhisperTranscriber:
         total_segments = self.state["total_segments"]
         start_from = self.state["processed_segments"]
         
+        # 确保索引在有效范围内
         if start_from >= total_segments:
             print("所有片段已处理完成")
             return True
         
-        print(f"从第 {start_from + 1} 个片段开始，共 {total_segments} 个片段")
+        # 如果start_from为0，说明是新的转录任务
+        if start_from == 0:
+            print(f"开始处理所有 {total_segments} 个片段")
+        else:
+            print(f"从第 {start_from + 1} 个片段开始，共 {total_segments} 个片段")
         
         # 计算每个片段的时长（用于时间戳调整）
         segment_duration = self.state["audio_duration"] / total_segments
@@ -812,6 +906,7 @@ class WhisperTranscriber:
             if segment_results:
                 # 保存片段结果
                 self.state["segments"].extend(segment_results)
+                # 更新已处理片段数为下一个要处理的片段索引
                 self.state["processed_segments"] = segment_index
                 self.state["current_segment"] = i
                 self._save_state()
