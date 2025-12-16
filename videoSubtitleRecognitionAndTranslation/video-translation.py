@@ -451,9 +451,14 @@ class VideoTranslator:
                         
                         # 将时间格式转换为SRT格式（HH:MM:SS,mmm）
                         def convert_time_format(time_str):
-                            # transcription.txt文件中的时间戳已经是正确格式：00:00:02,719
-                            # 直接返回原始时间戳，不需要额外转换
-                            return time_str.strip()
+                            # transcription.txt文件中的时间戳格式：HH:MM:SS（没有毫秒）
+                            # 需要转换为SRT标准格式：HH:MM:SS,mmm
+                            time_str = time_str.strip()
+                            # 如果时间戳已经包含毫秒（有逗号分隔），直接返回
+                            if ',' in time_str:
+                                return time_str
+                            # 否则添加毫秒部分（默认000毫秒）
+                            return f"{time_str},000"
                         
                         srt_start = convert_time_format(start_time.strip())
                         srt_end = convert_time_format(end_time.strip())
