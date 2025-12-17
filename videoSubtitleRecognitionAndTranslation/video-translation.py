@@ -374,15 +374,15 @@ class VideoTranslator:
             
             # 执行转录
             print(f"[转录] 运行转录命令...")
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', cwd=self.script_dir)
+            result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
             
             print(f"[转录] 转录命令执行完成，返回码: {result.returncode}")
             
             # 检查是否成功
             if result.returncode != 0:
                 print(f"[转录] ✗ 转录脚本返回错误代码: {result.returncode}")
-                print(f"[转录] 标准输出: {result.stdout[:500]}...")
-                print(f"[转录] 错误输出: {result.stderr[:500]}...")
+                # 由于capture_output=False，无法获取stdout和stderr内容
+                print(f"[转录] ℹ️ 请查看转录脚本的实时输出了解详细错误信息")
                 
                 # 检查返回码是否为内存访问冲突（常见于Windows）
                 if result.returncode == 3221225620:
