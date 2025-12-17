@@ -92,85 +92,93 @@ class VideoTranslator:
         if not self.srt_translation_script.exists():
             raise FileNotFoundError(f"SRT翻译脚本不存在: {self.srt_translation_script}")
     
-    def _check_existing_transcription(self, video_path: str) -> Optional[Path]:
+    def _check_existing_transcription(self, video_path: str) -> Dict:
         """
-        检查是否已有转录文件可以复用
+        检查是否已有转录文件或转录状态
         
         Args:
             video_path: 视频文件路径
             
         Returns:
-            如果找到可复用的转录文件，返回SRT文件路径，否则返回None
+            返回包含状态信息的字典
         """
         video_name = Path(video_path).stem
         temp_dir = Path("temp")
         
         if not temp_dir.exists():
-            return None
+            return {"should_continue": False, "reason": "temp目录不存在"}
         
-        print(f"[复用检查] 检查已有转录文件...")
+        print(f"[状态检查] 检查已有转录状态...")
         print(f"   视频名称: {video_name}")
         print(f"   模型: {self.whisper_model}")
         
-        # 查找匹配的转录文件
-        txt_files = []
+        # 查找匹配的状态文件
+        state_files = []
         for subdir in temp_dir.iterdir():
             if subdir.is_dir() and video_name in subdir.name and self.whisper_model in subdir.name:
-                txt_file = subdir / "transcription.txt"
-                if txt_file.exists():
-                    txt_files.append(txt_file)
-                    print(f"   ✓ 找到转录文件: {txt_file}")
-                    break  # 找到第一个匹配的就退出
+                state_file = subdir / "transcription_state.json"
+                if state_file.exists():
+                    state_files.append(state_file)
+                    print(f"   ✓ 找到转录状态文件: {state_file}")
         
-        # 如果找不到，尝试使用双下划线分隔符的格式查找
-        if not txt_files:
-            expected_dir_name = f"{video_name}__{self.whisper_model}"
-            for subdir in temp_dir.iterdir():
-                if subdir.is_dir() and subdir.name == expected_dir_name:
-                    txt_file = subdir / "transcription.txt"
-                    if txt_file.exists():
-                        txt_files.append(txt_file)
-                        print(f"   ✓ 找到转录文件（双下划线格式）: {txt_file}")
-                        break
+        if not state_files:
+            return {"should_continue": False, "reason": "未找到转录状态文件"}
         
-        if txt_files:
-            txt_file = txt_files[0]
+        # 使用最新的状态文件
+        state_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        state_file = state_files[0]
+        
+        try:
+            # 读取状态文件
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
             
-            # 检查转录文件是否完整（有足够的内容）
-            try:
-                with open(txt_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
+            processed_segments = state.get("processed_segments", 0)
+            total_segments = state.get("total_segments", 0)
+            segments = state.get("segments", [])
+            
+            print(f"   ✓ 转录进度: {processed_segments}/{total_segments} 个片段")
+            print(f"   ✓ 已转录有效片段: {len(segments)} 个")
+            
+            # 检查是否已经完成
+            if processed_segments >= total_segments:
+                print(f"   ✓ 所有片段已处理完成")
                 
-                # 检查是否有实际转录内容（排除文件头信息）
-                lines_with_content = [line for line in content.split('\n') 
-                                    if line.strip() and '=' not in line 
-                                    and not line.startswith('视频:') 
-                                    and not line.startswith('模型:') 
-                                    and line.startswith('[') and ']' in line]
-                
-                if len(lines_with_content) > 0:
-                    print(f"   ✓ 转录文件包含 {len(lines_with_content)} 个有效字幕块")
-                    
-                    # 将txt文件转换为SRT格式
-                    srt_file = self._convert_txt_to_srt(txt_file)
-                    if srt_file:
-                        print(f"   ✓ 成功转换为SRT格式: {srt_file.name}")
-                        return srt_file
-                    else:
-                        print(f"   ✗ SRT转换失败")
-                        return None
+                # 检查是否有最终的转录文本文件
+                transcription_txt = state_file.parent / "transcription.txt"
+                if transcription_txt.exists():
+                    print(f"   ✓ 找到完整转录文件: {transcription_txt}")
+                    return {
+                        "completed": True,
+                        "reason": "转录已完成",
+                        "transcription_file": transcription_txt,
+                        "state_file": state_file
+                    }
                 else:
-                    print(f"   ✗ 转录文件为空或格式不正确")
-                    return None
-                    
-            except Exception as e:
-                print(f"   ✗ 检查转录文件时出错: {e}")
-                return None
-        
-        print(f"   ✗ 未找到可复用的转录文件")
-        return None
+                    print(f"   ℹ️ 转录已标记完成但未生成transcription.txt文件")
+                    return {
+                        "completed": False,
+                        "reason": "转录状态异常",
+                        "state_file": state_file
+                    }
+            else:
+                print(f"   ℹ️ 发现未完成的转录工作")
+                print(f"   ℹ️ 将继续从第 {processed_segments + 1} 个片段开始")
+                return {
+                    "should_continue": True,
+                    "reason": "继续未完成的转录",
+                    "current_segment": processed_segments,
+                    "total_segments": total_segments,
+                    "state_file": state_file
+                }
+                
+        except Exception as e:
+            print(f"   ✗ 处理状态文件时出错: {e}")
+            return {"should_continue": False, "reason": f"状态文件错误: {str(e)}"}
     
-    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False, test_percentage: int = 0) -> Optional[str]:
+    def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, 
+                              enable_memory_optimization: bool = False, max_chunk_duration: int = 180, 
+                              use_vad: bool = False, test_percentage: int = 0) -> Optional[str]:
         """
         运行Whisper转录，生成SRT字幕文件
         
@@ -184,52 +192,53 @@ class VideoTranslator:
             SRT文件路径，失败返回None
         """
         try:
-            # 首先检查是否有可复用的转录文件
-            existing_srt = self._check_existing_transcription(video_path)
-            if existing_srt:
-                print(f"[复用] ✓ 复用已有转录文件，跳过转录过程")
-                
-                # 将SRT文件移动到输出目录
-                if output_dir:
-                    output_path = Path(output_dir)
-                    output_path.mkdir(exist_ok=True)
-                    video_name = Path(video_path).stem
-                    final_srt_file = output_path / f"{video_name}.srt"
-                    
-                    # 如果目标文件已存在，先删除它
-                    if final_srt_file.exists():
-                        final_srt_file.unlink()
-                        print(f"[复用] 删除已存在的目标文件: {final_srt_file.name}")
-                    
-                    existing_srt.rename(final_srt_file)
-                    print(f"[复用] 转录完成: {final_srt_file.name}")
-                    return str(final_srt_file)
-                else:
-                    print(f"[复用] 转录完成: {existing_srt.name}")
-                    return str(existing_srt)
+            # 首先检查转录状态
+            status = self._check_existing_transcription(video_path)
             
-            # 如果没有可复用的文件，执行转录
-            print(f"[Whisper] 开始转录...")
+            if status.get("completed"):
+                print(f"[转录] ✓ 转录已完成，复用现有转录文件")
+                transcription_file = status["transcription_file"]
+                
+                # 将转录文件转换为SRT
+                srt_file = self._convert_txt_to_srt(transcription_file)
+                if srt_file:
+                    # 移动到输出目录
+                    if output_dir:
+                        output_path = Path(output_dir)
+                        output_path.mkdir(exist_ok=True)
+                        video_name = Path(video_path).stem
+                        final_srt_file = output_path / f"{video_name}.srt"
+                        
+                        if final_srt_file.exists():
+                            final_srt_file.unlink()
+                        srt_file.rename(final_srt_file)
+                        print(f"[转录]   转录完成: {final_srt_file.name}")
+                        return str(final_srt_file)
+                    else:
+                        print(f"[转录]   转录完成: {srt_file.name}")
+                        return str(srt_file)
+                else:
+                    print(f"[转录] ✗ 转录文件转换失败，将重新转录")
+            
+            # 执行转录（无论是否发现未完成的工作，都运行转录脚本，它会自动从断点继续）
+            print(f"[转录] 开始转录...")
             print(f"   视频文件: {Path(video_path).name}")
             print(f"   模型: {self.whisper_model}")
             print(f"   语言: {self.source_lang}")
             print(f"   分段时长: {max_chunk_duration}秒")
             print(f"   转录脚本: {'whisper-transcription.vad.py (VAD模式)' if use_vad else 'whisper-transcription.py (标准模式)'}")
             
-            # 构建命令行参数 - 根据use_vad选择不同的脚本和参数
+            # 构建命令行参数
             if self.use_vad:
-                # whisper-transcription.vad.py 的参数（只支持基本参数）
                 cmd = [
                     sys.executable, 'whisper-transcription.vad.py',
                     video_path,
                     '--model', self.whisper_model,
                     '--language', self.source_lang
                 ]
-                # 添加测试参数
                 if test_percentage > 0:
                     cmd.extend(['--test', str(test_percentage)])
             else:
-                # whisper-transcription.py 的参数
                 cmd = [
                     sys.executable, 'whisper-transcription.py',
                     video_path,
@@ -237,179 +246,106 @@ class VideoTranslator:
                     '--language', self.source_lang,
                     '--segment-duration', str(max_chunk_duration)
                 ]
-                # 添加测试参数
                 if test_percentage > 0:
                     cmd.extend(['--test', str(test_percentage)])
             
-            # 执行转录，实时显示输出
+            # 执行转录
+            print(f"[转录] 运行转录命令...")
             result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
             
-            if result.returncode == 0:
-                # whisper-transcription.py生成的文件路径格式: temp/{video_name}_{model}/transcription.txt
-                video_name = Path(video_path).stem
+            print(f"[转录] 转录命令执行完成，返回码: {result.returncode}")
+            
+            # 转录完成后，查找结果
+            video_name = Path(video_path).stem
+            
+            # 清理文件名
+            safe_video_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in video_name)
+            safe_video_name = safe_video_name[:50]
+            
+            # 查找转录结果文件
+            transcription_txt = None
+            video_hash = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
+            
+            # 尝试多种目录格式
+            possible_dirs = [
+                Path("temp") / f"{safe_video_name}_{video_hash}_{self.whisper_model}",
+                Path("temp") / f"{safe_video_name}_{self.whisper_model}",
+                Path("temp") / f"{safe_video_name}__{self.whisper_model}",
+            ]
+            
+            for temp_dir in possible_dirs:
+                if temp_dir.exists():
+                    candidate_txt = temp_dir / "transcription.txt"
+                    if candidate_txt.exists():
+                        transcription_txt = candidate_txt
+                        print(f"[转录] 找到转录文件: {transcription_txt}")
+                        break
+            
+            # 如果找不到，使用通配符搜索
+            if transcription_txt is None:
+                temp_dir = Path("temp")
+                if temp_dir.exists():
+                    pattern = f"*{safe_video_name}*{self.whisper_model}*"
+                    for model_dir in temp_dir.glob(pattern):
+                        if model_dir.is_dir():
+                            candidate_txt = model_dir / "transcription.txt"
+                            if candidate_txt.exists():
+                                transcription_txt = candidate_txt
+                                print(f"[转录] 找到转录文件（通配符）: {transcription_txt}")
+                                break
+            
+            if transcription_txt is None:
+                print(f"[转录] ✗ 未找到转录文件")
                 
-                # 清理文件名中的特殊字符，只保留字母数字和下划线
-                safe_video_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in video_name)
-                # 限制文件名长度，避免路径过长
-                safe_video_name = safe_video_name[:50]
-                
-                # 查找转录文件 - 尝试多种目录格式
-                txt_file = None
-                
-                # 格式1: 单下划线分隔符（不含哈希值）
-                temp_dir1 = Path("temp") / f"{safe_video_name}_{self.whisper_model}"
-                if temp_dir1.exists():
-                    txt_file1 = temp_dir1 / "transcription.txt"
-                    if txt_file1.exists():
-                        txt_file = txt_file1
-                        print(f"[Whisper] 找到转录文件（单下划线格式）: {txt_file}")
-                
-                # 格式2: 双下划线分隔符（不含哈希值）
-                if txt_file is None:
-                    temp_dir2 = Path("temp") / f"{safe_video_name}__{self.whisper_model}"
-                    if temp_dir2.exists():
-                        txt_file2 = temp_dir2 / "transcription.txt"
-                        if txt_file2.exists():
-                            txt_file = txt_file2
-                            print(f"[Whisper] 找到转录文件（双下划线格式）: {txt_file}")
-                
-                # 格式3: 包含哈希值的格式（实际生成的格式）
-                if txt_file is None:
-                    # 计算视频文件的哈希值
-                    video_hash = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
-                    temp_dir3 = Path("temp") / f"{safe_video_name}_{video_hash}_{self.whisper_model}"
-                    if temp_dir3.exists():
-                        txt_file3 = temp_dir3 / "transcription.txt"
-                        if txt_file3.exists():
-                            txt_file = txt_file3
-                            print(f"[Whisper] 找到转录文件（哈希格式）: {txt_file}")
-                
-                # 格式4: 通配符搜索（最通用的方法）
-                if txt_file is None:
-                    temp_dir = Path("temp")
+                # 检查是否转录被中断
+                # 查找状态文件检查进度
+                state_file = None
+                for temp_dir in possible_dirs:
                     if temp_dir.exists():
-                        # 查找所有包含视频名和模型名的目录
-                        pattern = f"*{safe_video_name}*{self.whisper_model}*"
-                        for model_dir in temp_dir.glob(pattern):
-                            if model_dir.is_dir():
-                                txt_file_candidate = model_dir / "transcription.txt"
-                                if txt_file_candidate.exists():
-                                    txt_file = txt_file_candidate
-                                    print(f"[Whisper] 找到转录文件（通配符搜索）: {txt_file}")
-                                    break
+                        candidate_state = temp_dir / "transcription_state.json"
+                        if candidate_state.exists():
+                            state_file = candidate_state
+                            break
                 
-                if txt_file is None:
-                    print(f"[Whisper] 转录文件未找到，尝试了以下目录格式:")
-                    print(f"   格式1（单下划线）: {temp_dir1}")
-                    print(f"   格式2（双下划线）: {temp_dir2}")
-                    print(f"   格式3（哈希值）: {temp_dir3}")
-                    print(f"   格式4（通配符）: temp/*{safe_video_name}*{self.whisper_model}*")
-                    return None
+                if state_file:
+                    try:
+                        with open(state_file, 'r', encoding='utf-8') as f:
+                            state = json.load(f)
+                        
+                        processed = state.get("processed_segments", 0)
+                        total = state.get("total_segments", 0)
+                        
+                        if processed < total:
+                            print(f"[转录] ℹ️ 转录被中断，进度: {processed}/{total}")
+                            print(f"[转录] ℹ️ 请重新运行命令以继续转录")
+                        elif processed >= total:
+                            print(f"[转录] ℹ️ 转录已完成但未生成transcription.txt文件")
+                    except:
+                        pass
                 
-                # 将txt文件转换为SRT格式
-                if txt_file.exists():
-                    # 将txt文件转换为SRT格式
-                    srt_file = self._convert_txt_to_srt(txt_file)
-                    if srt_file:
-                        # 将SRT文件移动到输出目录
-                        if output_dir:
-                            output_path = Path(output_dir)
-                            output_path.mkdir(exist_ok=True)
-                            final_srt_file = output_path / f"{video_name}.srt"
-                            
-                            # 如果目标文件已存在，先删除它
-                            if final_srt_file.exists():
-                                final_srt_file.unlink()
-                                print(f"[Whisper] 删除已存在的目标文件: {final_srt_file.name}")
-                            
-                            srt_file.rename(final_srt_file)
-                            print(f"[Whisper] 转录完成: {final_srt_file.name}")
-                            return str(final_srt_file)
-                        else:
-                            print(f"[Whisper] 转录完成: {srt_file.name}")
-                            return str(srt_file)
-                    else:
-                        print(f"[Whisper] SRT文件转换失败")
-                        return None
-                else:
-                    print(f"[Whisper] 转录文件未找到: {txt_file}")
-                    return None
+                return None
+            
+            # 将转录文件转换为SRT
+            srt_file = self._convert_txt_to_srt(transcription_txt)
+            if not srt_file:
+                print(f"[转录] ✗ 转录文件转换失败")
+                return None
+            
+            # 移动到输出目录
+            if output_dir:
+                output_path = Path(output_dir)
+                output_path.mkdir(exist_ok=True)
+                final_srt_file = output_path / f"{video_name}.srt"
+                
+                if final_srt_file.exists():
+                    final_srt_file.unlink()
+                
+                srt_file.rename(final_srt_file)
+                print(f"[转录] SRT文件已保存: {final_srt_file.name}")
+                return str(final_srt_file)
             else:
-                # 由于capture_output=False，stderr不会被捕获，显示通用错误信息
-                print(f"[Whisper] 转录过程出现错误，但可能已有部分转录内容")
-                print(f"[Whisper] 返回码: {result.returncode}")
-                
-                # 检查是否已经生成了部分转录文件
-                video_name = Path(video_path).stem
-                
-                # 清理文件名中的特殊字符，只保留字母数字和下划线
-                safe_video_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in video_name)
-                # 限制文件名长度，避免路径过长
-                safe_video_name = safe_video_name[:50]
-                
-                # 查找转录文件 - 尝试两种目录格式
-                txt_file = None
-                
-                # 格式1: 单下划线分隔符
-                temp_dir1 = Path("temp") / f"{safe_video_name}_{self.whisper_model}"
-                if temp_dir1.exists():
-                    txt_file1 = temp_dir1 / "transcription.txt"
-                    if txt_file1.exists():
-                        txt_file = txt_file1
-                        print(f"[Whisper] 找到部分转录文件（单下划线格式）: {txt_file}")
-                
-                # 格式2: 双下划线分隔符
-                if txt_file is None:
-                    temp_dir2 = Path("temp") / f"{safe_video_name}__{self.whisper_model}"
-                    if temp_dir2.exists():
-                        txt_file2 = temp_dir2 / "transcription.txt"
-                        if txt_file2.exists():
-                            txt_file = txt_file2
-                            print(f"[Whisper] 找到部分转录文件（双下划线格式）: {txt_file}")
-                
-                if txt_file is None:
-                    print(f"[Whisper] 部分转录文件未找到，尝试了以下目录:")
-                    print(f"   格式1: {temp_dir1}")
-                    print(f"   格式2: {temp_dir2}")
-                    return None
-                
-                if txt_file.exists():
-                    print(f"[Whisper] 发现部分转录文件，可能仍有可用内容")
-                    srt_file = self._convert_txt_to_srt(txt_file)
-                    if srt_file:
-                        # 重命名为partial.srt以表示部分转录
-                        partial_srt = srt_file.with_name(f"{video_name}_partial.srt")
-                        
-                        # 如果目标文件已存在，先删除它
-                        if partial_srt.exists():
-                            partial_srt.unlink()
-                            print(f"[Whisper] 删除已存在的部分转录文件: {partial_srt.name}")
-                        
-                        srt_file.rename(partial_srt)
-                        print(f"[Whisper] 部分转录转换完成: {partial_srt.name}")
-                        
-                        # 将SRT文件移动到输出目录
-                        if output_dir:
-                            output_path = Path(output_dir)
-                            output_path.mkdir(exist_ok=True)
-                            final_srt_file = output_path / f"{video_name}_partial.srt"
-                            
-                            # 如果目标文件已存在，先删除它
-                            if final_srt_file.exists():
-                                final_srt_file.unlink()
-                                print(f"[Whisper] 删除已存在的目标文件: {final_srt_file.name}")
-                            
-                            partial_srt.rename(final_srt_file)
-                            print(f"[Whisper] 已生成部分转录文件: {final_srt_file.name}")
-                        else:
-                            print(f"[Whisper] 已生成部分转录文件: {partial_srt.name}")
-                            return str(partial_srt)
-                    else:
-                        print("[Whisper] 部分转录转换失败")
-                        return None
-                else:
-                    print(f"[Whisper] 转录失败，返回码: {result.returncode}")
-                    return None
+                print(f"[转录] SRT文件已保存: {srt_file.name}")
+                return str(srt_file)
                 
         except Exception as e:
             print(f"❌ 运行Whisper转录时出错: {e}")
@@ -535,7 +471,9 @@ class VideoTranslator:
             print(f"❌ 运行SRT翻译时出错: {e}")
             return False
     
-    def translate_video(self, video_path: str, output_dir: Optional[str] = None, enable_memory_optimization: bool = False, max_chunk_duration: int = 180, use_vad: bool = False, test_percentage: int = 0) -> Dict:
+    def translate_video(self, video_path: str, output_dir: Optional[str] = None, 
+                    enable_memory_optimization: bool = False, max_chunk_duration: int = 180, 
+                    use_vad: bool = False, test_percentage: int = 0) -> Dict:
         """
         完整的视频翻译流程
         
@@ -577,15 +515,23 @@ class VideoTranslator:
         print(f"[开始] 开始视频翻译流程")
         print(f"   视频: {video_file.name}")
         print(f"   输出目录: {output_path}")
-        if enable_memory_optimization:
-            print(f"   内存优化: 已启用，分块时长: {max_chunk_duration}秒")
         if use_vad:
             print(f"   转录模式: VAD（语音活动检测）模式")
         else:
             print(f"   转录模式: 标准模式")
+        if test_percentage > 0:
+            print(f"   测试模式: 仅处理前 {test_percentage}%")
         print("=" * 60)
         
-        srt_file = self.run_whisper_transcription(video_path, output_dir, enable_memory_optimization, max_chunk_duration, use_vad, test_percentage)
+        # 检查转录状态
+        status = self._check_existing_transcription(video_path)
+        if status.get("should_continue"):
+            print(f"[转录] ℹ️ 发现未完成的转录工作")
+            print(f"[转录] ℹ️ 将继续从第 {status['current_segment'] + 1}/{status['total_segments']} 个片段开始")
+        
+        srt_file = self.run_whisper_transcription(video_path, output_dir, 
+                                                enable_memory_optimization, max_chunk_duration, 
+                                                use_vad, test_percentage)
         time_tracker.checkpoint("Whisper转录")
         
         if not srt_file:
@@ -632,7 +578,6 @@ class VideoTranslator:
         result["processing_time"] = time.time() - time_tracker.start_time
         
         return result
-
 
 def main():
     """主函数 - 命令行接口"""
