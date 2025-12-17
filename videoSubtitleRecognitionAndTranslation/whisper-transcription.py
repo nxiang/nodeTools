@@ -342,6 +342,72 @@ class SegmentTranscriber:
         # 使用faster-whisper的标记
         self.use_faster_whisper = FASTER_WHISPER_AVAILABLE
     
+    def _extract_limited_segments(self, video_path, segment_duration=600, max_segments=1):
+        """提取指定数量的音频片段（用于测试模式）"""
+        print(f"提取前 {max_segments} 个音频片段...")
+        
+        try:
+            # 先获取视频总时长
+            duration_cmd = [
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(video_path)
+            ]
+            
+            result = subprocess.run(duration_cmd, capture_output=True, text=True, encoding='utf-8')
+            if result.returncode == 0:
+                video_duration = float(result.stdout.strip())
+            else:
+                print("无法获取视频时长，使用默认值")
+                video_duration = 3600  # 默认1小时
+            
+            # 计算最大片段数（不超过实际可能的片段数）
+            max_possible_segments = int(video_duration // segment_duration) + 1
+            num_segments = min(max_segments, max_possible_segments)
+            
+            segment_files = []
+            
+            # 逐个提取片段
+            for i in range(num_segments):
+                start_time = i * segment_duration
+                segment_file = self.segments_dir / f"segment_{i:03d}.wav"
+                
+                # 如果文件已存在且大小合理，跳过
+                if segment_file.exists() and segment_file.stat().st_size > 1000:
+                    segment_files.append(segment_file)
+                    print(f"片段 {i+1}/{num_segments} 已存在")
+                    continue
+                
+                # 提取当前片段
+                cmd = [
+                    'ffmpeg', '-ss', str(start_time), '-i', str(video_path),
+                    '-t', str(min(segment_duration, video_duration - start_time)),
+                    '-ac', '1', '-ar', '16000',  # 单声道，16kHz采样率
+                    '-acodec', 'pcm_s16le',      # PCM编码
+                    '-y',  # 覆盖已存在文件
+                    str(segment_file)
+                ]
+                
+                print(f"提取片段 {i+1}/{num_segments} (开始时间: {start_time}s)")
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = process.communicate(timeout=300)  # 5分钟超时
+                
+                if process.returncode == 0:
+                    segment_files.append(segment_file)
+                else:
+                    error_msg = stderr.decode('utf-8', errors='ignore')
+                    print(f"片段 {i+1} 提取失败: {error_msg}")
+                    # 创建空文件标记失败
+                    segment_file.touch()
+            
+            print(f"提取完成，共 {len(segment_files)} 个片段")
+            return segment_files
+            
+        except Exception as e:
+            print(f"提取指定片段出错: {e}")
+            return False
+    
     def _preprocess_audio(self, audio_file):
         """对音频进行预处理，增强轻声语音"""
         try:
@@ -383,7 +449,7 @@ class SegmentTranscriber:
             print(f"音频预处理出错: {e}")
             return audio_file
     
-    def split_audio(self, audio_file, segment_duration=600):
+    def split_audio(self, audio_file, segment_duration=600, max_segments=None):
         """将音频分割成多个片段（默认10分钟一个片段）"""
         print(f"将音频分割成 {segment_duration} 秒的片段...")
         
@@ -405,13 +471,26 @@ class SegmentTranscriber:
         
         # 获取所有片段文件
         segment_files = sorted(list(self.segments_dir.glob("segment_*.wav")))
+        
+        # 应用测试模式限制
+        if max_segments is not None and len(segment_files) > max_segments:
+            segment_files = segment_files[:max_segments]
+            print(f"测试模式: 只保留前 {max_segments} 个片段")
+        
         return segment_files
     
-    def split_audio_from_video(self, video_path, segment_duration=600):
+    def split_audio_from_video(self, video_path, segment_duration=600, max_segments=None):
         """直接从视频文件分割音频，避免生成巨大的中间文件"""
         print(f"直接从视频分割音频成 {segment_duration} 秒的片段...")
         
         try:
+            # 如果指定了最大片段数，使用不同的分割策略
+            if max_segments is not None:
+                print(f"测试模式: 只分割前 {max_segments} 个片段")
+                
+                # 方法3: 逐个提取指定数量的片段
+                return self._extract_limited_segments(video_path, segment_duration, max_segments)
+            
             # 方法1: 使用ffmpeg的segment功能直接分割视频音频
             cmd = [
                 'ffmpeg', '-i', str(video_path),
@@ -433,7 +512,7 @@ class SegmentTranscriber:
                 print(f"直接视频分割失败: {error_msg}")
                 
                 # 方法2: 回退到逐段提取
-                return self._split_audio_sequential(video_path, segment_duration)
+                return self._split_audio_sequential(video_path, segment_duration, max_segments)
             
             # 获取所有片段文件
             segment_files = sorted(list(self.segments_dir.glob("segment_*.wav")))
@@ -442,12 +521,12 @@ class SegmentTranscriber:
             
         except subprocess.TimeoutExpired:
             print("直接视频分割超时，尝试逐段提取...")
-            return self._split_audio_sequential(video_path, segment_duration)
+            return self._split_audio_sequential(video_path, segment_duration, max_segments)
         except Exception as e:
             print(f"直接视频分割出错: {e}")
-            return self._split_audio_sequential(video_path, segment_duration)
+            return self._split_audio_sequential(video_path, segment_duration, max_segments)
     
-    def _split_audio_sequential(self, video_path, segment_duration=600):
+    def _split_audio_sequential(self, video_path, segment_duration=600, max_segments=None):
         """逐段提取音频，内存占用更小但速度较慢"""
         print(f"使用逐段提取方式分割音频...")
         
@@ -467,8 +546,14 @@ class SegmentTranscriber:
                 print("无法获取视频时长，使用默认值")
                 video_duration = 3600  # 默认1小时
             
-            # 计算片段数量
-            num_segments = int(video_duration // segment_duration) + 1
+            # 计算片段数量，考虑max_segments限制
+            total_segments = int(video_duration // segment_duration) + 1
+            if max_segments is not None:
+                num_segments = min(max_segments, total_segments)
+                print(f"测试模式: 只提取前 {num_segments} 个片段")
+            else:
+                num_segments = total_segments
+            
             segment_files = []
             
             # 逐段提取音频
@@ -484,7 +569,7 @@ class SegmentTranscriber:
                 # 提取当前片段
                 cmd = [
                     'ffmpeg', '-ss', str(start_time), '-i', str(video_path),
-                    '-t', str(segment_duration),
+                    '-t', str(min(segment_duration, video_duration - start_time)),
                     '-ac', '1', '-ar', '16000',  # 单声道，16kHz采样率
                     '-acodec', 'pcm_s16le',      # PCM编码
                     '-y',  # 覆盖已存在文件
@@ -913,6 +998,13 @@ class WhisperTranscriber:
         if segments_dir.exists():
             segment_files = sorted(list(segments_dir.glob("segment_*.wav")))
             if segment_files:
+                # 应用测试模式限制
+                if self.test_percentage > 0:
+                    original_total = len(segment_files)
+                    max_segments = max(1, min(original_total, int(original_total * self.test_percentage / 100)))
+                    segment_files = segment_files[:max_segments]
+                    print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({len(segment_files)}/{original_total} 个片段)")
+                
                 # 检查前几个片段文件
                 valid_count = 0
                 for i, seg_file in enumerate(segment_files[:5]):
@@ -939,35 +1031,26 @@ class WhisperTranscriber:
                         self.state["audio_duration"] = video_duration
                         print(f"视频总时长: {format_timedelta(video_duration)}")
                     
-                    # 测试模式：限制处理的片段数量
-                    if self.test_percentage > 0:
-                        original_total = len(segment_files)
-                        max_segments = max(1, min(original_total, int(original_total * self.test_percentage / 100)))
-                        self.state["segment_files"] = [str(f) for f in segment_files[:max_segments]]
-                        self.state["total_segments"] = max_segments
-                        print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
-                    
                     self._save_state()
                     return True
         
         # 2. 检查状态文件中的片段信息
         if self.state.get("segment_files") and self.state.get("audio_extracted"):
-            # 检查第一个和最后一个片段文件是否存在
+            # 应用测试模式限制
             segment_files = self.state["segment_files"]
+            if self.test_percentage > 0:
+                original_total = len(segment_files)
+                max_segments = max(1, min(original_total, int(original_total * self.test_percentage / 100)))
+                segment_files = segment_files[:max_segments]
+                print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({len(segment_files)}/{original_total} 个片段)")
+            
             if segment_files:
                 first_segment = Path(segment_files[0])
                 if first_segment.exists() and first_segment.stat().st_size > 1000:
                     print(f"使用已提取的音频片段 (共 {len(segment_files)} 个片段)")
-                    
-                    # 测试模式：限制处理的片段数量
-                    if self.test_percentage > 0:
-                        original_total = len(segment_files)
-                        max_segments = max(1, min(original_total, int(original_total * self.test_percentage / 100)))
-                        self.state["segment_files"] = segment_files[:max_segments]
-                        self.state["total_segments"] = max_segments
-                        print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
-                        self._save_state()
-                    
+                    self.state["segment_files"] = segment_files
+                    self.state["total_segments"] = len(segment_files)
+                    self._save_state()
                     return True
         
         # 3. 如果没有找到有效的片段文件，执行音频提取
@@ -1003,15 +1086,27 @@ class WhisperTranscriber:
                 self.preprocess_audio
             )
             
+            # 计算测试模式需要的最大片段数
+            max_segments = None
+            if self.test_percentage > 0:
+                # 根据视频时长和segment_duration计算总片段数
+                total_segments_estimate = int(video_duration // self.segment_duration) + 1
+                max_segments = max(1, min(total_segments_estimate, int(total_segments_estimate * self.test_percentage / 100)))
+                print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 (大约 {max_segments} 个片段)")
+            
             # 直接分割视频，避免生成extracted_audio.wav
             segment_files = self.segment_transcriber.split_audio_from_video(
-                self.video_path, self.segment_duration
+                self.video_path, self.segment_duration, max_segments
             )
             
             if not segment_files:
                 print("直接分割视频失败，回退到传统方法...")
                 # 回退到传统方法
                 return self._extract_audio_fallback()
+            
+            # 应用测试模式限制（如果split_audio_from_video没有应用）
+            if self.test_percentage > 0 and max_segments and len(segment_files) > max_segments:
+                segment_files = segment_files[:max_segments]
             
             # 保存片段信息
             self.state["segment_files"] = [str(f) for f in segment_files]
@@ -1022,14 +1117,6 @@ class WhisperTranscriber:
             self.state["processed_segments"] = 0
             self.state["current_segment"] = 0
             self.state["segments"] = []
-            
-            # 测试模式：限制处理的片段数量
-            if self.test_percentage > 0:
-                original_total = len(segment_files)
-                max_segments = max(1, min(original_total, int(original_total * self.test_percentage / 100)))
-                self.state["segment_files"] = [str(f) for f in segment_files[:max_segments]]
-                self.state["total_segments"] = max_segments
-                print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 ({max_segments}/{original_total} 个片段)")
             
             self._save_state()
             
@@ -1044,6 +1131,7 @@ class WhisperTranscriber:
             print("回退到传统方法...")
             return self._extract_audio_fallback()
     
+
     def _extract_audio_fallback(self):
         """传统音频提取方法（回退方案）"""
         print("使用传统音频提取方法...")
@@ -1093,6 +1181,44 @@ class WhisperTranscriber:
             self.timestamps["audio_extraction_time"] = audio_time
             print(f"音频提取完成，时长: {format_timedelta(audio_duration)}，耗时: {format_timedelta(audio_time)}")
             
+            # 分割音频
+            print("分割音频...")
+            self.segment_transcriber = SegmentTranscriber(
+                self.temp_base, 
+                None,  # 模型将在需要时懒加载
+                self.language,
+                self.model_size,
+                self.preprocess_audio
+            )
+            
+            # 计算测试模式需要的最大片段数
+            max_segments = None
+            if self.test_percentage > 0:
+                total_segments_estimate = int(audio_duration // self.segment_duration) + 1
+                max_segments = max(1, min(total_segments_estimate, int(total_segments_estimate * self.test_percentage / 100)))
+                print(f"测试模式: 仅处理前 {self.test_percentage}% 的音频 (大约 {max_segments} 个片段)")
+            
+            segment_files = self.segment_transcriber.split_audio(self.audio_file, self.segment_duration)
+            
+            # 应用测试模式限制
+            if max_segments is not None and len(segment_files) > max_segments:
+                segment_files = segment_files[:max_segments]
+            
+            if not segment_files:
+                return False
+            
+            # 保存片段信息，包括当前的segment_duration
+            self.state["segment_files"] = [str(f) for f in segment_files]
+            self.state["total_segments"] = len(segment_files)
+            self.state["segment_duration"] = self.segment_duration  # 保存当前参数值
+            # 确保索引在有效范围内
+            if self.state["current_segment"] >= len(segment_files):
+                self.state["current_segment"] = 0
+            if self.state["processed_segments"] >= len(segment_files):
+                self.state["processed_segments"] = 0
+            self._save_state()
+            
+            print(f"音频分割完成，共 {self.state['total_segments']} 个片段")
             return True
             
         except subprocess.TimeoutExpired:
@@ -1101,7 +1227,7 @@ class WhisperTranscriber:
         except Exception as e:
             print(f"传统音频提取出错: {e}")
             return False
-    
+
     def _prepare_segments(self):
         """准备音频片段（简化断点续传逻辑）"""
         # 检查是否已经有有效的分段器
