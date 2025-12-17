@@ -10,6 +10,7 @@ import sys
 import time
 import subprocess
 import hashlib
+import json  # 添加json导入
 from pathlib import Path
 from typing import Dict, Optional
 import send2trash  # 新增导入，用于将文件移动到回收站
@@ -176,9 +177,131 @@ class VideoTranslator:
             print(f"   ✗ 处理状态文件时出错: {e}")
             return {"should_continue": False, "reason": f"状态文件错误: {str(e)}"}
     
+    def _convert_txt_to_srt(self, txt_file: Path) -> Optional[Path]:
+        """
+        将whisper-transcription.py生成的txt文件转换为SRT格式
+        
+        Args:
+            txt_file: 输入的txt文件路径
+            
+        Returns:
+            转换后的SRT文件路径，失败返回None
+        """
+        try:
+            # 读取txt文件内容
+            with open(txt_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 检查内容是否为空
+            if not content.strip():
+                print(f"   ✗ 转录文件内容为空")
+                return None
+            
+            # 解析文件，支持两种格式：
+            # 1. 带有时间戳的行：[00:01:23 - 00:01:45] 文本内容
+            # 2. 直接是分段文本
+            
+            lines = content.split('\n')
+            srt_entries = []
+            entry_index = 1
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 跳过文件头信息行
+                if any(line.startswith(prefix) for prefix in ['视频:', '模型:', '语言:', '音频预处理:', '转录时间:', '音频时长:', '原始片段数:', '过滤后片段数:', '去重后片段数:', '=']):
+                    continue
+                
+                # 尝试解析时间戳行
+                if line.startswith('[') and ']' in line:
+                    try:
+                        # 解析时间戳行，如: [00:01:23 - 00:01:45] 文本内容
+                        time_part, text_part = line.split(']', 1)
+                        time_part = time_part[1:]  # 去掉开头的[
+                        
+                        if ' - ' in time_part:
+                            start_time, end_time = time_part.split(' - ', 1)
+                            
+                            # 将时间格式转换为SRT格式（HH:MM:SS,mmm）
+                            def convert_time_format(time_str):
+                                time_str = time_str.strip()
+                                # 如果已经是SRT格式（有逗号），直接返回
+                                if ',' in time_str:
+                                    return time_str
+                                # 否则添加毫秒部分
+                                # 处理可能的毫秒部分（如00:01:23.456）
+                                if '.' in time_str:
+                                    parts = time_str.split('.')
+                                    time_part = parts[0]
+                                    millis = parts[1][:3].ljust(3, '0')
+                                    return f"{time_part},{millis}"
+                                # 没有毫秒的情况
+                                return f"{time_str},000"
+                            
+                            srt_start = convert_time_format(start_time.strip())
+                            srt_end = convert_time_format(end_time.strip())
+                            
+                            # 获取文本内容
+                            cleaned_text = text_part.strip()
+                            
+                            # 移除开头的[弱]标记
+                            if cleaned_text.startswith("[弱]"):
+                                cleaned_text = cleaned_text[3:].strip()
+                            
+                            # 创建SRT条目
+                            if cleaned_text:  # 确保文本不为空
+                                srt_entry = f"{entry_index}\n{srt_start} --> {srt_end}\n{cleaned_text}\n"
+                                srt_entries.append(srt_entry)
+                                entry_index += 1
+                                
+                    except Exception as e:
+                        print(f"   警告: 解析行失败 '{line[:50]}...': {e}")
+                        continue
+            
+            # 如果没有找到时间戳格式，尝试其他格式
+            if not srt_entries:
+                # 尝试直接使用所有非空行作为字幕
+                for i, line in enumerate(lines, 1):
+                    line = line.strip()
+                    if line and not any(line.startswith(prefix) for prefix in ['视频:', '模型:', '语言:', '音频预处理:', '转录时间:', '音频时长:']):
+                        # 为每行创建简单的时间戳（每行1秒）
+                        start_seconds = i - 1
+                        end_seconds = i
+                        
+                        def seconds_to_srt(seconds):
+                            hours = int(seconds // 3600)
+                            minutes = int((seconds % 3600) // 60)
+                            secs = int(seconds % 60)
+                            millis = int((seconds - int(seconds)) * 1000)
+                            return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+                        
+                        srt_start = seconds_to_srt(start_seconds)
+                        srt_end = seconds_to_srt(end_seconds)
+                        
+                        srt_entry = f"{i}\n{srt_start} --> {srt_end}\n{line}\n"
+                        srt_entries.append(srt_entry)
+            
+            # 生成SRT文件
+            if srt_entries:
+                srt_file = txt_file.with_suffix('.srt')
+                with open(srt_file, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(srt_entries))
+                
+                print(f"   ✓ 成功转换 {len(srt_entries)} 个字幕块")
+                return srt_file
+            else:
+                print(f"   ✗ 没有找到可转换的字幕内容")
+                return None
+                
+        except Exception as e:
+            print(f"❌ 转换txt到SRT时出错: {e}")
+            return None
+    
     def run_whisper_transcription(self, video_path: str, output_dir: Optional[str] = None, 
-                              enable_memory_optimization: bool = False, max_chunk_duration: int = 180, 
-                              use_vad: bool = False, test_percentage: int = 0) -> Optional[str]:
+                                  enable_memory_optimization: bool = False, max_chunk_duration: int = 180, 
+                                  use_vad: bool = False, test_percentage: int = 0) -> Optional[str]:
         """
         运行Whisper转录，生成SRT字幕文件
         
@@ -197,7 +320,7 @@ class VideoTranslator:
             
             if status.get("completed"):
                 print(f"[转录] ✓ 转录已完成，复用现有转录文件")
-                transcription_file = status["transcription_file"]
+                transcription_file = Path(status["transcription_file"])
                 
                 # 将转录文件转换为SRT
                 srt_file = self._convert_txt_to_srt(transcription_file)
@@ -251,9 +374,23 @@ class VideoTranslator:
             
             # 执行转录
             print(f"[转录] 运行转录命令...")
-            result = subprocess.run(cmd, capture_output=False, text=True, encoding='utf-8', cwd=self.script_dir)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', cwd=self.script_dir)
             
             print(f"[转录] 转录命令执行完成，返回码: {result.returncode}")
+            
+            # 检查是否成功
+            if result.returncode != 0:
+                print(f"[转录] ✗ 转录脚本返回错误代码: {result.returncode}")
+                print(f"[转录] 标准输出: {result.stdout[:500]}...")
+                print(f"[转录] 错误输出: {result.stderr[:500]}...")
+                
+                # 检查返回码是否为内存访问冲突（常见于Windows）
+                if result.returncode == 3221225620:
+                    print(f"[转录] ✗ 检测到内存访问冲突，可能是内存不足或模型太大")
+                    print(f"[转录] ✗ 建议: 使用更小的模型，或增加系统内存")
+                
+                # 即使失败，也尝试查找是否生成了部分结果
+                print(f"[转录] ℹ️ 尝试查找已生成的部分转录文件...")
             
             # 转录完成后，查找结果
             video_name = Path(video_path).stem
@@ -349,76 +486,8 @@ class VideoTranslator:
                 
         except Exception as e:
             print(f"❌ 运行Whisper转录时出错: {e}")
-            return None
-    
-    def _convert_txt_to_srt(self, txt_file: Path) -> Optional[Path]:
-        """
-        将whisper-transcription.py生成的txt文件转换为SRT格式
-        
-        Args:
-            txt_file: 输入的txt文件路径
-            
-        Returns:
-            转换后的SRT文件路径，失败返回None
-        """
-        try:
-            # 读取txt文件内容
-            with open(txt_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            # 跳过文件头信息（前几行）
-            content_lines = []
-            for line in lines:
-                if line.strip() and '=' not in line and not line.startswith('视频:') and not line.startswith('模型:'):
-                    content_lines.append(line.strip())
-            
-            # 解析时间戳和文本
-            srt_entries = []
-            entry_index = 1
-            
-            for line in content_lines:
-                if line.startswith('[') and ']' in line:
-                    # 解析时间戳行，如: [00:01:23 - 00:01:45] 文本内容
-                    time_part, text_part = line.split(']', 1)
-                    time_part = time_part[1:]  # 去掉开头的[
-                    
-                    if ' - ' in time_part:
-                        start_time, end_time = time_part.split(' - ', 1)
-                        
-                        # 将时间格式转换为SRT格式（HH:MM:SS,mmm）
-                        def convert_time_format(time_str):
-                            # transcription.txt文件中的时间戳格式：HH:MM:SS（没有毫秒）
-                            # 需要转换为SRT标准格式：HH:MM:SS,mmm
-                            time_str = time_str.strip()
-                            # 如果时间戳已经包含毫秒（有逗号分隔），直接返回
-                            if ',' in time_str:
-                                return time_str
-                            # 否则添加毫秒部分（默认000毫秒）
-                            return f"{time_str},000"
-                        
-                        srt_start = convert_time_format(start_time.strip())
-                        srt_end = convert_time_format(end_time.strip())
-                        
-                        # 过滤掉文本中的[弱]标记
-                        cleaned_text = text_part.strip()
-                        # 移除开头的[弱]标记
-                        if cleaned_text.startswith("[弱]"):
-                            cleaned_text = cleaned_text[3:].strip()
-                        
-                        # 创建SRT条目
-                        srt_entry = f"{entry_index}\n{srt_start} --> {srt_end}\n{cleaned_text}\n"
-                        srt_entries.append(srt_entry)
-                        entry_index += 1
-            
-            # 生成SRT文件
-            srt_file = txt_file.with_suffix('.srt')
-            with open(srt_file, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(srt_entries))
-            
-            return srt_file
-            
-        except Exception as e:
-            print(f"❌ 转换txt到SRT时出错: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def run_srt_translation(self, srt_path: str) -> bool:
@@ -472,8 +541,8 @@ class VideoTranslator:
             return False
     
     def translate_video(self, video_path: str, output_dir: Optional[str] = None, 
-                    enable_memory_optimization: bool = False, max_chunk_duration: int = 180, 
-                    use_vad: bool = False, test_percentage: int = 0) -> Dict:
+                        enable_memory_optimization: bool = False, max_chunk_duration: int = 180, 
+                        use_vad: bool = False, test_percentage: int = 0) -> Dict:
         """
         完整的视频翻译流程
         
@@ -530,8 +599,8 @@ class VideoTranslator:
             print(f"[转录] ℹ️ 将继续从第 {status['current_segment'] + 1}/{status['total_segments']} 个片段开始")
         
         srt_file = self.run_whisper_transcription(video_path, output_dir, 
-                                                enable_memory_optimization, max_chunk_duration, 
-                                                use_vad, test_percentage)
+                                                  enable_memory_optimization, max_chunk_duration, 
+                                                  use_vad, test_percentage)
         time_tracker.checkpoint("Whisper转录")
         
         if not srt_file:
@@ -578,6 +647,7 @@ class VideoTranslator:
         result["processing_time"] = time.time() - time_tracker.start_time
         
         return result
+
 
 def main():
     """主函数 - 命令行接口"""
