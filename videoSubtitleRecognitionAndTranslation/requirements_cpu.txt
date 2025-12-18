@@ -1,0 +1,17 @@
+# requirements_cpu_fixed.txt
+# Python 3.11 兼容版本 (核心转录包)
+
+# PyTorch (CPU版本)
+torch==2.1.0
+torchvision==0.16.0
+torchaudio==2.1.0
+--index-url https://download.pytorch.org/whl/cpu
+
+# 音频处理与工具
+psutil>=5.9.0  # 不锁定过旧的小版本
+tqdm>=4.66.0   # 使用可用的新版本
+numpy==1.24.3
+
+# 选择安装：优先使用 faster-whisper（如果安装失败，再尝试下一行的 openai-whisper）
+faster-whisper>=0.10.0
+# openai-whisper>=20231117

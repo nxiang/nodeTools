@@ -1,4 +1,5 @@
 whisperx_env/
+whisper_cpu_env/
 vosk-models/
 __pycache__/
 *.ass
