@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 import numpy as np
 import wave
 import contextlib
+import psutil
+import gc
 
 def format_timedelta(seconds):
     """格式化时间差为易读的字符串"""
@@ -969,6 +971,13 @@ class WhisperTranscriber:
         
         # 模型将在需要时懒加载
         self.model = None
+        
+        # 添加内存监控
+        self.max_memory_usage = 0
+        self.memory_warning_threshold = 0.9  # 90% 内存使用阈值
+        
+        # 添加分段大小自适应
+        self.adaptive_segment_duration = segment_duration
     
     def _cleanup_gpu_cache(self):
         """清理GPU缓存（如果有的话）"""
@@ -1073,6 +1082,17 @@ class WhisperTranscriber:
     def _extract_audio(self):
         """从视频中提取音频（优化断点续传）"""
         print(f"开始提取音频...")
+        
+        # 添加内存检查
+        memory_info = psutil.virtual_memory()
+        available_memory_gb = memory_info.available / (1024**3)
+        print(f"可用内存: {available_memory_gb:.2f} GB")
+        
+        # 根据可用内存调整分段大小
+        if available_memory_gb < 2.0:  # 内存小于2GB
+            original_segment = self.segment_duration
+            self.segment_duration = min(30, self.segment_duration)  # 减小分段大小
+            print(f"内存较低，将分段大小从 {original_segment}秒 调整为 {self.segment_duration}秒")
         
         # 首先检查是否有有效的片段文件
         segments_dir = self.temp_base / "segments"
@@ -1327,8 +1347,24 @@ class WhisperTranscriber:
     def _transcribe_segments(self):
         """转录所有音频片段（立即开始转录）"""
         print("开始转录音频片段...")
-        transcribe_start = time.time()
         
+        # 添加内存监控
+        def check_memory_usage():
+            process = psutil.Process()
+            memory_gb = process.memory_info().rss / (1024**3)
+            self.max_memory_usage = max(self.max_memory_usage, memory_gb)
+            
+            # 如果内存使用过高，清理并警告
+            memory_info = psutil.virtual_memory()
+            if memory_info.percent > 85:
+                print(f"警告: 内存使用率高达 {memory_info.percent}%")
+                gc.collect()
+                if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return True
+            return False
+        
+        transcribe_start = time.time()
         total_segments = self.state["total_segments"]
         start_from = self.state["processed_segments"]
         
@@ -1337,15 +1373,14 @@ class WhisperTranscriber:
             print("所有片段已处理完成")
             return True
         
-        # 如果start_from为0，说明是新的转录任务
-        if start_from == 0:
-            print(f"开始处理所有 {total_segments} 个片段")
-        else:
-            print(f"从第 {start_from + 1} 个片段开始，共 {total_segments} 个片段")
-        
         failed_segments = []  # 记录失败的片段
         
         for i in range(start_from, total_segments):
+            # 每次循环前检查内存
+            if check_memory_usage():
+                print("内存使用过高，暂停转录...")
+                time.sleep(5)  # 暂停5秒让系统回收内存
+            
             segment_file = Path(self.state["segment_files"][i])
             segment_index = i + 1
             
@@ -1364,43 +1399,53 @@ class WhisperTranscriber:
             print(f"\n处理片段 {segment_index}/{total_segments}...")
             segment_start = time.time()
             
-            # 每处理3个片段清理一次GPU缓存（如果有的话）
-            if i > 0 and i % 3 == 0:
-                self._cleanup_gpu_cache()
+            # 每处理1个片段清理一次内存
+            if i > 0:
+                gc.collect()
             
             # 计算片段在原始音频中的起始时间
             segment_start_time = i * self.segment_duration
             
-            segment_results = self.segment_transcriber.transcribe_segment(
-                segment_file, 
-                segment_index,
-                segment_start_time
-            )
-            
-            if segment_results:
-                # 保存片段结果
-                self.state["segments"].extend(segment_results)
-                # 更新已处理片段数为下一个要处理的片段索引
-                self.state["processed_segments"] = segment_index
-                self.state["current_segment"] = i
-                self._save_state()
+            try:
+                segment_results = self.segment_transcriber.transcribe_segment(
+                    segment_file, 
+                    segment_index,
+                    segment_start_time
+                )
                 
-                # 更新进度文件
                 if segment_results:
-                    segment_text = "\n".join([f"[{format_timedelta(s['start'])}] {s['text'].strip()}" 
-                                            for s in segment_results])
-                    self._save_progress(segment_text)
+                    # 保存片段结果
+                    self.state["segments"].extend(segment_results)
+                    # 更新已处理片段数为下一个要处理的片段索引
+                    self.state["processed_segments"] = segment_index
+                    self.state["current_segment"] = i
+                    self._save_state()
+                    
+                    # 更新进度文件
+                    if segment_results:
+                        segment_text = "\n".join([f"[{format_timedelta(s['start'])}] {s['text'].strip()}" 
+                                                for s in segment_results])
+                        self._save_progress(segment_text)
+                    
+                    segment_time = time.time() - segment_start
+                    cumulative_time = time.time() - transcribe_start
+                    print(f"片段 {segment_index} 完成，耗时: {format_timedelta(segment_time)}，累计耗时: {format_timedelta(cumulative_time)}")
+                    print(f"  转录到 {len(segment_results)} 个有效片段")
+                else:
+                    print(f"片段 {segment_index} 转录失败：空结果")
+                    failed_segments.append(segment_index)
                 
-                segment_time = time.time() - segment_start
-                cumulative_time = time.time() - transcribe_start
-                print(f"片段 {segment_index} 完成，耗时: {format_timedelta(segment_time)}，累计耗时: {format_timedelta(cumulative_time)}")
-                print(f"  转录到 {len(segment_results)} 个有效片段")
-            else:
-                print(f"片段 {segment_index} 转录失败：空结果")
+                # 更新总转录时间
+                self.timestamps["transcription_time"] = time.time() - transcribe_start
+                
+            except Exception as e:
+                print(f"片段 {segment_index} 处理异常: {e}")
+                import traceback
+                traceback.print_exc()
                 failed_segments.append(segment_index)
-            
-            # 更新总转录时间
-            self.timestamps["transcription_time"] = time.time() - transcribe_start
+        
+        # 清理内存
+        gc.collect()
         
         # 检查是否所有片段都失败了
         if len(failed_segments) == total_segments - start_from:
@@ -1530,42 +1575,143 @@ class WhisperTranscriber:
             print(f"清理临时文件时出错: {e}")
     
     def _lazy_load_whisper_model(self):
-        """懒加载Whisper模型"""
-        if self.model is not None:
+        """懒加载Whisper模型（修复断点续传问题）"""
+        # 如果模型已加载且不为None，直接返回
+        if self.model is not None and self.model_loaded:
             return True
         
         print("懒加载Whisper模型...")
+        
+        # 加载前检查内存
+        try:
+            import psutil
+            memory_info = psutil.virtual_memory()
+            available_gb = memory_info.available / (1024**3)
+            
+            # 根据模型大小检查内存
+            model_memory_requirements = {
+                "tiny": 0.5,
+                "base": 1.0,
+                "small": 2.0,
+                "medium": 5.0,
+                "large": 10.0
+            }
+            
+            required_memory = model_memory_requirements.get(self.model_size, 5.0)
+            
+            if available_gb < required_memory:
+                print(f"警告: 可用内存不足 ({available_gb:.1f}GB < {required_memory}GB)")
+                print("建议: 1. 关闭其他程序释放内存")
+                print("     2. 使用更小的模型 (tiny/base)")
+                print("     3. 增加虚拟内存")
+                
+                # 询问用户是否继续
+                response = input(f"内存不足，是否继续加载 {self.model_size} 模型? (y/n): ")
+                if response.lower() != 'y':
+                    return False
+        
+        except ImportError:
+            pass  # 如果没有psutil，跳过内存检查
+        
         model_start = time.time()
         
         try:
-            # 延迟导入whisper模块
-            if self.whisper_module is None:
-                self.whisper_module = import_whisper()
+            # 优先使用faster-whisper（内存效率更高）
+            if self.use_faster_whisper:
+                print(f"使用faster-whisper加载模型: {self.model_size}")
+                
+                # 设置设备
+                device = "cuda" if torch and hasattr(torch, 'cuda') and torch.cuda.is_available() else "cpu"
+                
+                # CPU环境下使用int8量化节省内存
+                compute_type = "int8" if device == "cpu" else "float16"
+                
+                # 根据内存选择模型大小
+                if device == "cpu" and self.model_size in ["medium", "large"]:
+                    print(f"警告: 在CPU上运行 {self.model_size} 模型需要大量内存")
+                    print("建议使用 smaller 模型或确保有足够内存")
+                
+                # 加载faster-whisper模型
+                self.model = WhisperModel(
+                    self.model_size, 
+                    device=device, 
+                    compute_type=compute_type,
+                    cpu_threads=4,  # 限制CPU线程数
+                    num_workers=1   # 减少工作线程数
+                )
+                
+                print(f"faster-whisper模型加载完成，使用设备: {device}, 计算类型: {compute_type}")
+            else:
+                # 使用标准whisper库
+                print(f"使用标准whisper加载模型: {self.model_size}")
+                
+                # 延迟导入whisper模块
                 if self.whisper_module is None:
-                    print("错误: 无法导入whisper模块")
-                    return False
-            
-            self.model = self.whisper_module.load_model(self.model_size)
+                    self.whisper_module = import_whisper()
+                    if self.whisper_module is None:
+                        print("错误: 无法导入whisper模块")
+                        return False
+                
+                # 在CPU环境下使用更保守的设置
+                if not torch.cuda.is_available():
+                    print("CPU环境下，优化模型加载以减少内存使用...")
+                    # 清除可能存在的缓存
+                    gc.collect()
+                
+                # 使用正确的模型大小进行加载
+                self.model = self.whisper_module.load_model(
+                    self.model_size,
+                    device="cuda" if torch.cuda.is_available() else "cpu"
+                )
             
             # 记录内存使用情况
-            if hasattr(torch, 'cuda') and torch.cuda.is_available():
+            if torch and hasattr(torch, 'cuda') and torch.cuda.is_available():
                 memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                 memory_reserved = torch.cuda.memory_reserved() / 1024**3  # GB
                 print(f"GPU内存使用: 已分配 {memory_allocated:.2f}GB, 已保留 {memory_reserved:.2f}GB")
+            else:
+                # CPU内存使用
+                try:
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / (1024**2)
+                    print(f"CPU内存使用: {memory_mb:.1f} MB")
+                except:
+                    pass
             
             model_time = time.time() - model_start
             print(f"模型加载完成，耗时: {format_timedelta(model_time)}")
+            self.model_loaded = True
             return True
             
         except Exception as e:
             print(f"模型加载失败: {e}")
             self.model = None
+            self.model_loaded = False
             return False
-
+    
     def transcribe(self):
         """执行转录过程"""
         print(f"开始转录视频: {self.video_path.name}")
         print(f"使用模型: {self.model_size}, 语言: {self.language}")
+        
+        # 添加系统信息
+        try:
+            import psutil
+            import platform
+            
+            print(f"系统: {platform.system()} {platform.release()}")
+            print(f"处理器: {platform.processor()}")
+            
+            memory = psutil.virtual_memory()
+            print(f"总内存: {memory.total/(1024**3):.1f} GB")
+            print(f"可用内存: {memory.available/(1024**3):.1f} GB")
+            
+            cpu_count = psutil.cpu_count()
+            print(f"CPU核心数: {cpu_count}")
+            
+        except ImportError:
+            print("安装psutil库可显示系统信息: pip install psutil")
+        
         print(f"智能过滤: {'启用' if self.filter_transcription else '禁用'}")
         print(f"音频预处理: {'启用' if self.preprocess_audio else '禁用'}")
         
@@ -1574,7 +1720,7 @@ class WhisperTranscriber:
             print("使用库: faster-whisper (高性能版本)")
         else:
             print("使用库: 标准whisper")
-            print("提示: 安装faster-whisper可显著提高转录速度")
+            print("提示: 安装faster-whisper可显著提高转录速度并减少内存使用")
             print("      pip install faster-whisper")
         
         print(f"临时文件目录: {self.temp_base}")
@@ -1641,23 +1787,49 @@ class WhisperTranscriber:
             # 打印时间统计
             self._print_timestamps()
             
+            # 打印内存使用统计
+            try:
+                process = psutil.Process()
+                final_memory_mb = process.memory_info().rss / (1024**2)
+                print(f"最终内存使用: {final_memory_mb:.1f} MB")
+                print(f"最大内存使用: {self.max_memory_usage:.1f} GB")
+            except:
+                pass
+            
             print(f"\n转录完成！结果保存在: {self.output_file}")
             print(f"临时文件保留在: {self.temp_base}")
             return True
+            
+        except MemoryError as e:
+            print(f"\n内存不足错误: {e}")
+            print("建议: 1. 使用更小的模型 (tiny/base)")
+            print("     2. 增加系统虚拟内存")
+            print("     3. 减小分段大小 (使用 --segment-duration 30)")
+            print("     4. 使用 faster-whisper (pip install faster-whisper)")
+            return False
             
         except KeyboardInterrupt:
             print("\n转录被用户中断")
             self._save_state()
             
-            # 不保存部分转录结果
+            # 保存部分转录结果
             if self.state["segments"]:
-                print(f"已转录 {len(self.state['segments'])}/{self.state['total_segments']} 个片段，但未生成最终转录文件")
+                print(f"已转录 {len(self.state['segments'])}/{self.state['total_segments']} 个片段")
+                self._save_final_transcription()
+                print(f"部分转录结果已保存到: {self.output_file}")
             
             return False
         except Exception as e:
             print(f"转录过程中出错: {e}")
             import traceback
             traceback.print_exc()
+            
+            # 尝试保存已有结果
+            if self.state["segments"]:
+                print("\n尝试保存已转录的内容...")
+                self._save_final_transcription()
+                print(f"部分结果已保存到: {self.output_file}")
+            
             return False
     
     def _print_timestamps(self):
